@@ -1,0 +1,4 @@
+RYUU_AUTH_CODE=api_key_here_change_me
+ADMIN_API_TOKEN=merlin-admin-local-dev
+JWT_SECRET=merlin-local-jwt-secret-change-me
+HUBCAP_TOKEN=api_key_here_change_me
