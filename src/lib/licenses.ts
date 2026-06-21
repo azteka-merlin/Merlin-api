@@ -20,7 +20,11 @@ export function generateLicenseChunk(): string {
 	let chunk = "";
 
 	for (let index = 0; index < 4; index += 1) {
-		const randomIndex = crypto.getRandomValues(new Uint32Array(1))[0] % LICENSE_ALPHABET.length;
+		const randomValue = crypto.getRandomValues(new Uint32Array(1))[0];
+		if (randomValue === undefined) {
+			throw new Error("Unable to generate license key");
+		}
+		const randomIndex = randomValue % LICENSE_ALPHABET.length;
 		chunk += LICENSE_ALPHABET[randomIndex];
 	}
 

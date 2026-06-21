@@ -9,6 +9,36 @@ function toDateOnly(value: string): string {
 	return value.slice(0, 10);
 }
 
+type LicenseRecord = {
+	id: number;
+	license_key: string;
+	name: string;
+	phone: string;
+	hwid: string | null;
+	expires_at: string;
+	status: "active" | "revoked";
+};
+
+async function getLicenseByKey(c: AppContext, licenseKey: string): Promise<LicenseRecord | null> {
+	return c.env.merlin_db
+		.prepare(
+			`
+				SELECT
+					id,
+					license_key,
+					name,
+					phone,
+					hwid,
+					expires_at,
+					status
+				FROM licenses
+				WHERE license_key = ?
+			`,
+		)
+		.bind(licenseKey)
+		.first<LicenseRecord>();
+}
+
 export class LoginRoute extends OpenAPIRoute {
 	schema = {
 		tags: ["Auth"],
@@ -60,31 +90,7 @@ export class LoginRoute extends OpenAPIRoute {
 			throw new HTTPException(500, { message: "JWT secret is not configured" });
 		}
 
-		const license = await c.env.merlin_db
-			.prepare(
-				`
-					SELECT
-						id,
-						license_key,
-						name,
-						phone,
-						hwid,
-						expires_at,
-						status
-					FROM licenses
-					WHERE license_key = ?
-				`,
-			)
-			.bind(data.body.licenseKey)
-			.first<{
-				id: number;
-				license_key: string;
-				name: string;
-				phone: string;
-				hwid: string | null;
-				expires_at: string;
-				status: "active" | "revoked";
-			}>();
+		const license = await getLicenseByKey(c, data.body.licenseKey);
 
 		if (!license) {
 			throw new HTTPException(401, { message: "Invalid license key" });
@@ -102,7 +108,7 @@ export class LoginRoute extends OpenAPIRoute {
 		let effectiveHwid = license.hwid;
 
 		if (!effectiveHwid) {
-			await c.env.merlin_db
+			const updateResult = await c.env.merlin_db
 				.prepare(
 					`
 						UPDATE licenses
@@ -113,7 +119,19 @@ export class LoginRoute extends OpenAPIRoute {
 				.bind(data.body.hwid, now.toISOString(), license.id)
 				.run();
 
-			effectiveHwid = data.body.hwid;
+			if (!updateResult.success) {
+				throw new HTTPException(500, { message: "Could not bind this license to the current computer" });
+			}
+
+			const refreshedLicense = await getLicenseByKey(c, data.body.licenseKey);
+			if (!refreshedLicense) {
+				throw new HTTPException(401, { message: "Invalid license key" });
+			}
+			if (refreshedLicense.hwid !== data.body.hwid) {
+				throw new HTTPException(500, { message: "The license HWID could not be confirmed after binding" });
+			}
+
+			effectiveHwid = refreshedLicense.hwid;
 		} else if (effectiveHwid !== data.body.hwid) {
 			throw new HTTPException(401, { message: "HWID mismatch" });
 		}

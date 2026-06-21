@@ -67,6 +67,9 @@ export async function verifyAccessToken(
 	}
 
 	const [encodedHeader, encodedPayload, encodedSignature] = parts;
+	if (!encodedHeader || !encodedPayload || !encodedSignature) {
+		throw new HTTPException(401, { message: "Invalid access token" });
+	}
 	const signingInput = `${encodedHeader}.${encodedPayload}`;
 	const key = await importJwtKey(secret);
 	const signature = Uint8Array.from(fromBase64Url(encodedSignature), (char) => char.charCodeAt(0));

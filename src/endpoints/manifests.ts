@@ -32,12 +32,15 @@ function isRetryableStatus(status: number): boolean {
 }
 
 function isZipHeader(bytes: Uint8Array): boolean {
+	const [byte0, byte1, byte2, byte3] = bytes;
 	return (
 		bytes.length >= 4 &&
-		bytes[0] === 0x50 &&
-		bytes[1] === 0x4b &&
-		[0x03, 0x05, 0x07].includes(bytes[2]) &&
-		[0x04, 0x06, 0x08].includes(bytes[3])
+		byte0 === 0x50 &&
+		byte1 === 0x4b &&
+		byte2 !== undefined &&
+		byte3 !== undefined &&
+		[0x03, 0x05, 0x07].includes(byte2) &&
+		[0x04, 0x06, 0x08].includes(byte3)
 	);
 }
 
@@ -158,7 +161,7 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 }
 
 export class ManifestsRoute extends OpenAPIRoute {
-	schema = {
+	schema: any = {
 		tags: ["Manifests"],
 		summary: "Download manifests using the authenticated fallback chain",
 		security: [{ bearerAuth: [] }],
@@ -230,8 +233,13 @@ export class ManifestsRoute extends OpenAPIRoute {
 		}
 
 		const data = await this.getValidatedData<typeof this.schema>();
+		const appId = data.query?.appid;
+		if (!appId) {
+			throw new HTTPException(400, { message: "Missing appid" });
+		}
+
 		const env = c.env as Env & ManifestEnv;
-		for (const source of createSources(data.query.appid, env)) {
+		for (const source of createSources(appId, env)) {
 			const response = await fetchSource(source);
 			if (!response) continue;
 
@@ -240,7 +248,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 			headers.set("content-type", "application/zip");
 			headers.set(
 				"content-disposition",
-				`attachment; filename="${data.query.appid}.zip"`,
+				`attachment; filename="${appId}.zip"`,
 			);
 			headers.set("x-merlin-manifest-source", source.name);
 
