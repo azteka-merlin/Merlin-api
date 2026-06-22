@@ -87,9 +87,8 @@ export class LoginRoute extends OpenAPIRoute {
 	};
 
 	async handle(c: AppContext) {
-		await enforceLoginRateLimit(c);
-
 		const data = await this.getValidatedData<typeof this.schema>();
+		await enforceLoginRateLimit(c, data.body);
 		const now = new Date();
 
 		if (!c.env.JWT_SECRET) {

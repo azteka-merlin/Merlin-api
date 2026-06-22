@@ -11,6 +11,11 @@ type RateLimitBindings = {
 	ADMIN_RATE_LIMITER?: RateLimitBinding;
 };
 
+type LoginRateLimitInput = {
+	licenseKey: string;
+	hwid: string;
+};
+
 const LOGIN_LIMIT_MESSAGE =
 	"O limite temporario de tentativas de acesso foi atingido. Aguarde aproximadamente 1 minuto e tente novamente.";
 const MANIFESTS_LIMIT_MESSAGE =
@@ -39,10 +44,32 @@ async function enforceLimit(
 	throw new HTTPException(429, { message });
 }
 
-export async function enforceLoginRateLimit(c: AppContext) {
-	const ipAddress = c.req.raw.headers.get("cf-connecting-ip") || "unknown";
+function getClientIp(c: AppContext): string | null {
+	const headers = c.req.raw.headers;
+	const connectingIp = headers.get("cf-connecting-ip")?.trim();
+	if (connectingIp) return connectingIp;
+
+	const forwardedFor = headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+	if (forwardedFor) return forwardedFor;
+
+	const realIp = headers.get("x-real-ip")?.trim();
+	return realIp || null;
+}
+
+export async function enforceLoginRateLimit(c: AppContext, input: LoginRateLimitInput) {
 	const env = c.env as typeof c.env & RateLimitBindings;
-	await enforceLimit(env.LOGIN_RATE_LIMITER, ipAddress, LOGIN_LIMIT_MESSAGE, "login");
+	const clientIp = getClientIp(c);
+	const normalizedLicense = input.licenseKey.trim().toUpperCase();
+	const normalizedHwid = input.hwid.trim().toLowerCase();
+	const keys = [
+		clientIp ? `login:ip:${clientIp}` : null,
+		`login:hwid:${normalizedHwid}`,
+		`login:key:${normalizedLicense}`,
+	].filter((key): key is string => Boolean(key));
+
+	for (const key of keys) {
+		await enforceLimit(env.LOGIN_RATE_LIMITER, key, LOGIN_LIMIT_MESSAGE, "login");
+	}
 }
 
 export async function enforceManifestsRateLimit(c: AppContext, licenseId: number) {
