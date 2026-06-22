@@ -1,6 +1,7 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { signAccessToken } from "../lib/auth";
+import { enforceLoginRateLimit } from "../lib/rate-limit";
 import { type AppContext, LoginRequest, LoginResponse } from "../types";
 
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
@@ -79,10 +80,15 @@ export class LoginRoute extends OpenAPIRoute {
 			"401": {
 				description: "Invalid license, expired license or HWID mismatch",
 			},
+			"429": {
+				description: "Too many login attempts from the current IP address",
+			},
 		},
 	};
 
 	async handle(c: AppContext) {
+		await enforceLoginRateLimit(c);
+
 		const data = await this.getValidatedData<typeof this.schema>();
 		const now = new Date();
 

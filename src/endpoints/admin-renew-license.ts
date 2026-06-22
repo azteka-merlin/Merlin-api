@@ -5,6 +5,7 @@ import {
 	requireAdminToken,
 	toIsoDateStart,
 } from "../lib/licenses";
+import { enforceAdminRateLimit } from "../lib/rate-limit";
 import {
 	type AppContext,
 	LicenseParams,
@@ -46,6 +47,9 @@ export class AdminRenewLicenseRoute extends OpenAPIRoute {
 			"401": {
 				description: "Missing or invalid admin token",
 			},
+			"429": {
+				description: "Too many administrative requests",
+			},
 			"404": {
 				description: "License not found",
 			},
@@ -53,7 +57,8 @@ export class AdminRenewLicenseRoute extends OpenAPIRoute {
 	};
 
 	async handle(c: AppContext) {
-		requireAdminToken(c);
+		const adminKey = requireAdminToken(c);
+		await enforceAdminRateLimit(c, adminKey);
 
 		const data = await this.getValidatedData<typeof this.schema>();
 		await getLicenseById(c, data.params.id);

@@ -35,7 +35,7 @@ export function generateLicenseKey(): string {
 	return `MERLIN-${generateLicenseChunk()}-${generateLicenseChunk()}-${generateLicenseChunk()}`;
 }
 
-export function requireAdminToken(c: AppContext): void {
+export function requireAdminToken(c: AppContext): string {
 	const header = c.req.raw.headers.get("authorization");
 
 	if (!header || !c.env.ADMIN_API_TOKEN) {
@@ -47,6 +47,8 @@ export function requireAdminToken(c: AppContext): void {
 	if (scheme !== "Bearer" || token !== c.env.ADMIN_API_TOKEN) {
 		throw new HTTPException(401, { message: "Unauthorized" });
 	}
+
+	return "admin:primary";
 }
 
 export function toIsoDateStart(date: string): string {

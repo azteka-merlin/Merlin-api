@@ -1,5 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { mapLicenseResponse, requireAdminToken } from "../lib/licenses";
+import { enforceAdminRateLimit } from "../lib/rate-limit";
 import type { AppContext } from "../types";
 import { LicenseListResponse } from "../types";
 
@@ -24,11 +25,15 @@ export class AdminListLicensesRoute extends OpenAPIRoute {
 			"401": {
 				description: "Missing or invalid admin token",
 			},
+			"429": {
+				description: "Too many administrative requests",
+			},
 		},
 	};
 
 	async handle(c: AppContext) {
-		requireAdminToken(c);
+		const adminKey = requireAdminToken(c);
+		await enforceAdminRateLimit(c, adminKey);
 
 		const result = await c.env.merlin_db
 			.prepare(

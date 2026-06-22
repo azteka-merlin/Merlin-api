@@ -1,6 +1,7 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { verifyAccessToken } from "../lib/auth";
+import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { type AppContext, ManifestQuery } from "../types";
 
 type ManifestEnv = {
@@ -180,6 +181,9 @@ export class ManifestsRoute extends OpenAPIRoute {
 			"401": {
 				description: "Missing, invalid or expired access token",
 			},
+			"429": {
+				description: "Too many manifest requests for the current license",
+			},
 			"502": {
 				description: "No manifest source returned a valid ZIP",
 			},
@@ -231,6 +235,8 @@ export class ManifestsRoute extends OpenAPIRoute {
 		if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
 			throw new HTTPException(401, { message: "License expired" });
 		}
+
+		await enforceManifestsRateLimit(c, license.id);
 
 		const data = await this.getValidatedData<typeof this.schema>();
 		const appId = data.query?.appid;
