@@ -17,6 +17,12 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"routes": [
+		{
+			"pattern": "api-merlin.com",
+			"custom_domain": true
+		}
+	],
 	"secrets": {
 		"required": [
 			"RYUU_AUTH_CODE",
