@@ -9,15 +9,15 @@ import { AdminRenewLicenseRoute } from "./endpoints/admin-renew-license";
 import { AdminResetHwidRoute } from "./endpoints/admin-reset-hwid";
 import { AdminRevokeLicenseRoute } from "./endpoints/admin-revoke-license";
 import { AdminUpsertOverrideRoute } from "./endpoints/admin-upsert-override";
+import { FixesCatalogRoute } from "./endpoints/fixes-catalog";
+import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { HealthRoute } from "./endpoints/health";
 import { ManifestsRoute } from "./endpoints/manifests";
 import { LoginRoute } from "./endpoints/login";
 import { VersionRoute } from "./endpoints/version";
 
-// Start a Hono app
 const app = new Hono<{ Bindings: Env }>();
 
-// Setup OpenAPI registry
 const openapi = fromHono(app, {
 	docs_url: "/",
 	schema: {
@@ -34,10 +34,11 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
 	bearerFormat: "API Token",
 });
 
-// Register OpenAPI endpoints
 openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
 openapi.get("/api/manifests", ManifestsRoute);
+openapi.get("/api/fixes/catalog", FixesCatalogRoute);
+openapi.get("/api/fixes/download", FixesDownloadRoute);
 openapi.post("/api/auth/login", LoginRoute);
 openapi.get("/api/admin/licenses", AdminListLicensesRoute);
 openapi.post("/api/admin/licenses", AdminCreateLicenseRoute);
@@ -49,8 +50,4 @@ openapi.get("/api/admin/overrides", AdminListOverridesRoute);
 openapi.post("/api/admin/overrides", AdminUpsertOverrideRoute);
 openapi.delete("/api/admin/overrides/:appId", AdminDeleteOverrideRoute);
 
-// You may also register routes for non OpenAPI directly on Hono
-// app.get('/test', (c) => c.text('Hono!'))
-
-// Export the Hono app
 export default app;

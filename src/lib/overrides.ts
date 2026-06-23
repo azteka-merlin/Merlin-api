@@ -1,13 +1,21 @@
 import { HTTPException } from "hono/http-exception";
 
-export type OverrideFileConfig = {
+export type ManifestOverrideConfig = {
 	enabled: boolean;
 	file: string;
 };
 
+export type FixOverrideConfig = {
+	enabled: boolean;
+	file: string;
+	gameName?: string;
+	filename?: string;
+	size?: string;
+};
+
 export type OverrideEntry = {
-	manifestOverride?: OverrideFileConfig;
-	fixOverride?: OverrideFileConfig;
+	manifestOverride?: ManifestOverrideConfig;
+	fixOverride?: FixOverrideConfig;
 };
 
 export type OverridesDocument = Record<string, OverrideEntry>;
@@ -19,6 +27,8 @@ type OverridesEnv = {
 const OVERRIDES_KEY = "overrides.json";
 const REQUIRED_FILES_MESSAGE =
 	"Could not prepare the required game files. Please try again later.";
+const REQUIRED_CORRECTION_MESSAGE =
+	"Could not load this correction right now. Please try again later.";
 
 function requireBucket(env: OverridesEnv): R2Bucket {
 	if (!env.MERLIN_FILES) {
@@ -37,6 +47,11 @@ function normalizeAppId(appId: string): string {
 	return normalized;
 }
 
+function basename(file: string): string {
+	const normalized = file.split("/").filter(Boolean);
+	return normalized[normalized.length - 1] || file;
+}
+
 function assertSafePath(file: string) {
 	if (file.includes("..") || file.includes("\\")) {
 		throw new HTTPException(400, { message: "Invalid override file path" });
@@ -46,7 +61,7 @@ function assertSafePath(file: string) {
 	}
 }
 
-function validateManifestOverride(appId: string, override: OverrideFileConfig) {
+function validateManifestOverride(appId: string, override: ManifestOverrideConfig) {
 	assertSafePath(override.file);
 
 	if (!override.file.endsWith(".zip")) {
@@ -59,7 +74,7 @@ function validateManifestOverride(appId: string, override: OverrideFileConfig) {
 	}
 }
 
-function validateFixOverride(appId: string, override: OverrideFileConfig) {
+function validateFixOverride(appId: string, override: FixOverrideConfig) {
 	assertSafePath(override.file);
 
 	if (!override.file.endsWith(".zip") && !override.file.endsWith(".rar")) {
@@ -69,6 +84,15 @@ function validateFixOverride(appId: string, override: OverrideFileConfig) {
 	const expectedPrefix = `${appId}/fixes/`;
 	if (!override.file.startsWith(expectedPrefix)) {
 		throw new HTTPException(400, { message: "Fix override path is invalid" });
+	}
+	if (override.gameName !== undefined && !override.gameName.trim()) {
+		throw new HTTPException(400, { message: "Fix override gameName is invalid" });
+	}
+	if (override.filename !== undefined && !override.filename.trim()) {
+		throw new HTTPException(400, { message: "Fix override filename is invalid" });
+	}
+	if (override.size !== undefined && !override.size.trim()) {
+		throw new HTTPException(400, { message: "Fix override size is invalid" });
 	}
 }
 
@@ -88,6 +112,9 @@ function validateEntry(appId: string, entry: OverrideEntry): OverrideEntry {
 		nextEntry.fixOverride = {
 			enabled: Boolean(entry.fixOverride.enabled),
 			file: entry.fixOverride.file.trim(),
+			gameName: entry.fixOverride.gameName?.trim() || undefined,
+			filename: entry.fixOverride.filename?.trim() || basename(entry.fixOverride.file.trim()),
+			size: entry.fixOverride.size?.trim() || undefined,
 		};
 	}
 
@@ -218,5 +245,38 @@ export async function getRequiredManifestOverride(
 	return {
 		bytes,
 		file: manifestOverride.file,
+	};
+}
+
+export async function getFixOverrideFile(
+	env: OverridesEnv,
+	appId: string,
+): Promise<{ bytes: Uint8Array; file: string; filename: string; size?: string; gameName?: string } | null> {
+	const normalizedAppId = normalizeAppId(appId);
+	const overrides = await readOverrides(env);
+	const entry = overrides[normalizedAppId];
+	const fixOverride = entry?.fixOverride;
+
+	if (!fixOverride?.enabled) {
+		return null;
+	}
+
+	validateFixOverride(normalizedAppId, fixOverride);
+	const bucket = requireBucket(env);
+	const object = await bucket.get(fixOverride.file);
+	if (!object) {
+		console.error("[overrides] required fix override file was not found", {
+			appId: normalizedAppId,
+			file: fixOverride.file,
+		});
+		throw new HTTPException(502, { message: REQUIRED_CORRECTION_MESSAGE });
+	}
+
+	return {
+		bytes: new Uint8Array(await object.arrayBuffer()),
+		file: fixOverride.file,
+		filename: fixOverride.filename || basename(fixOverride.file),
+		size: fixOverride.size,
+		gameName: fixOverride.gameName,
 	};
 }

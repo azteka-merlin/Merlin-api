@@ -38,6 +38,10 @@ export const ManifestQuery = z.object({
 	appid: z.string().min(1),
 });
 
+export const FixDownloadQuery = z.object({
+	appid: z.string().regex(/^\d+$/),
+});
+
 export const CreateLicenseRequest = z.object({
 	name: z.string().min(1).describe("Customer name"),
 	phone: z.string().min(1).describe("Customer phone number"),
@@ -79,14 +83,22 @@ export const RevokeLicenseRequest = z.object({
 	reason: z.string().min(1).describe("Reason for revocation"),
 });
 
-export const OverrideFileConfig = z.object({
+export const ManifestOverrideConfig = z.object({
 	enabled: z.boolean(),
 	file: z.string().min(1),
 });
 
+export const FixOverrideConfig = z.object({
+	enabled: z.boolean(),
+	file: z.string().min(1),
+	gameName: z.string().min(1).optional(),
+	filename: z.string().min(1).optional(),
+	size: z.string().min(1).optional(),
+});
+
 export const OverrideEntry = z.object({
-	manifestOverride: OverrideFileConfig.optional(),
-	fixOverride: OverrideFileConfig.optional(),
+	manifestOverride: ManifestOverrideConfig.optional(),
+	fixOverride: FixOverrideConfig.optional(),
 });
 
 export const OverrideParams = z.object({
@@ -96,8 +108,8 @@ export const OverrideParams = z.object({
 export const OverrideUpsertRequest = z
 	.object({
 		appId: z.string().regex(/^\d+$/),
-		manifestOverride: OverrideFileConfig.optional(),
-		fixOverride: OverrideFileConfig.optional(),
+		manifestOverride: ManifestOverrideConfig.optional(),
+		fixOverride: FixOverrideConfig.optional(),
 	})
 	.refine((value) => Boolean(value.manifestOverride || value.fixOverride), {
 		message: "At least one override must be provided",
