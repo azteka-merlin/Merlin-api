@@ -78,3 +78,42 @@ export const RenewLicenseRequest = z.object({
 export const RevokeLicenseRequest = z.object({
 	reason: z.string().min(1).describe("Reason for revocation"),
 });
+
+export const OverrideFileConfig = z.object({
+	enabled: z.boolean(),
+	file: z.string().min(1),
+});
+
+export const OverrideEntry = z.object({
+	manifestOverride: OverrideFileConfig.optional(),
+	fixOverride: OverrideFileConfig.optional(),
+});
+
+export const OverrideParams = z.object({
+	appId: z.string().regex(/^\d+$/),
+});
+
+export const OverrideUpsertRequest = z
+	.object({
+		appId: z.string().regex(/^\d+$/),
+		manifestOverride: OverrideFileConfig.optional(),
+		fixOverride: OverrideFileConfig.optional(),
+	})
+	.refine((value) => Boolean(value.manifestOverride || value.fixOverride), {
+		message: "At least one override must be provided",
+		path: ["appId"],
+	});
+
+export const OverrideResponse = z.object({
+	appId: z.string().regex(/^\d+$/),
+	override: OverrideEntry,
+});
+
+export const OverrideListResponse = z.object({
+	overrides: z.record(z.string(), OverrideEntry),
+});
+
+export const DeleteOverrideResponse = z.object({
+	success: z.literal(true),
+	appId: z.string().regex(/^\d+$/),
+});

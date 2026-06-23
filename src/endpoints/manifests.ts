@@ -1,6 +1,7 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { verifyAccessToken } from "../lib/auth";
+import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { type AppContext, ManifestQuery } from "../types";
 
@@ -8,6 +9,7 @@ type ManifestEnv = {
 	RYU_API_URL?: string;
 	RYUU_AUTH_CODE?: string;
 	HUBCAP_TOKEN?: string;
+	MERLIN_FILES?: R2Bucket;
 };
 
 type ManifestSource = {
@@ -32,17 +34,13 @@ function isRetryableStatus(status: number): boolean {
 	return status === 429 || status >= 500;
 }
 
-function isZipHeader(bytes: Uint8Array): boolean {
-	const [byte0, byte1, byte2, byte3] = bytes;
-	return (
-		bytes.length >= 4 &&
-		byte0 === 0x50 &&
-		byte1 === 0x4b &&
-		byte2 !== undefined &&
-		byte3 !== undefined &&
-		[0x03, 0x05, 0x07].includes(byte2) &&
-		[0x04, 0x06, 0x08].includes(byte3)
-	);
+function buildZipResponse(body: BodyInit, appId: string, sourceName: string): Response {
+	const headers = new Headers();
+	headers.set("cache-control", "no-store");
+	headers.set("content-type", "application/zip");
+	headers.set("content-disposition", `attachment; filename="${appId}.zip"`);
+	headers.set("x-merlin-manifest-source", sourceName);
+	return new Response(body, { status: 200, headers });
 }
 
 async function validatedZipResponse(response: Response): Promise<Response | null> {
@@ -185,7 +183,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				description: "Too many manifest requests for the current license",
 			},
 			"502": {
-				description: "No manifest source returned a valid ZIP",
+				description: "No manifest source returned a valid ZIP or a required override could not be prepared",
 			},
 		},
 	};
@@ -245,20 +243,16 @@ export class ManifestsRoute extends OpenAPIRoute {
 		}
 
 		const env = c.env as Env & ManifestEnv;
+		const override = await getRequiredManifestOverride(env, appId);
+		if (override) {
+			return buildZipResponse(override.bytes, appId, "r2-override");
+		}
+
 		for (const source of createSources(appId, env)) {
 			const response = await fetchSource(source);
-			if (!response) continue;
+			if (!response || !response.body) continue;
 
-			const headers = new Headers(response.headers);
-			headers.set("cache-control", "no-store");
-			headers.set("content-type", "application/zip");
-			headers.set(
-				"content-disposition",
-				`attachment; filename="${appId}.zip"`,
-			);
-			headers.set("x-merlin-manifest-source", source.name);
-
-			return new Response(response.body, { status: 200, headers });
+			return buildZipResponse(response.body, appId, source.name);
 		}
 
 		return c.json({ error: "No manifest source returned a valid ZIP" }, 502);

@@ -1,0 +1,222 @@
+import { HTTPException } from "hono/http-exception";
+
+export type OverrideFileConfig = {
+	enabled: boolean;
+	file: string;
+};
+
+export type OverrideEntry = {
+	manifestOverride?: OverrideFileConfig;
+	fixOverride?: OverrideFileConfig;
+};
+
+export type OverridesDocument = Record<string, OverrideEntry>;
+
+type OverridesEnv = {
+	MERLIN_FILES?: R2Bucket;
+};
+
+const OVERRIDES_KEY = "overrides.json";
+const REQUIRED_FILES_MESSAGE =
+	"Could not prepare the required game files. Please try again later.";
+
+function requireBucket(env: OverridesEnv): R2Bucket {
+	if (!env.MERLIN_FILES) {
+		throw new HTTPException(500, { message: "MERLIN_FILES binding is not configured" });
+	}
+
+	return env.MERLIN_FILES;
+}
+
+function normalizeAppId(appId: string): string {
+	const normalized = appId.trim();
+	if (!/^\d+$/.test(normalized)) {
+		throw new HTTPException(400, { message: "Invalid appId" });
+	}
+
+	return normalized;
+}
+
+function assertSafePath(file: string) {
+	if (file.includes("..") || file.includes("\\")) {
+		throw new HTTPException(400, { message: "Invalid override file path" });
+	}
+	if (file.startsWith("/") || file.startsWith("./")) {
+		throw new HTTPException(400, { message: "Invalid override file path" });
+	}
+}
+
+function validateManifestOverride(appId: string, override: OverrideFileConfig) {
+	assertSafePath(override.file);
+
+	if (!override.file.endsWith(".zip")) {
+		throw new HTTPException(400, { message: "Manifest override must be a ZIP file" });
+	}
+
+	const expectedPrefix = `${appId}/manifests/`;
+	if (!override.file.startsWith(expectedPrefix)) {
+		throw new HTTPException(400, { message: "Manifest override path is invalid" });
+	}
+}
+
+function validateFixOverride(appId: string, override: OverrideFileConfig) {
+	assertSafePath(override.file);
+
+	if (!override.file.endsWith(".zip") && !override.file.endsWith(".rar")) {
+		throw new HTTPException(400, { message: "Fix override must be a ZIP or RAR file" });
+	}
+
+	const expectedPrefix = `${appId}/fixes/`;
+	if (!override.file.startsWith(expectedPrefix)) {
+		throw new HTTPException(400, { message: "Fix override path is invalid" });
+	}
+}
+
+function validateEntry(appId: string, entry: OverrideEntry): OverrideEntry {
+	const nextEntry: OverrideEntry = {};
+
+	if (entry.manifestOverride) {
+		validateManifestOverride(appId, entry.manifestOverride);
+		nextEntry.manifestOverride = {
+			enabled: Boolean(entry.manifestOverride.enabled),
+			file: entry.manifestOverride.file.trim(),
+		};
+	}
+
+	if (entry.fixOverride) {
+		validateFixOverride(appId, entry.fixOverride);
+		nextEntry.fixOverride = {
+			enabled: Boolean(entry.fixOverride.enabled),
+			file: entry.fixOverride.file.trim(),
+		};
+	}
+
+	if (!nextEntry.manifestOverride && !nextEntry.fixOverride) {
+		throw new HTTPException(400, { message: "At least one override must be provided" });
+	}
+
+	return nextEntry;
+}
+
+export function isZipHeader(bytes: Uint8Array): boolean {
+	const [byte0, byte1, byte2, byte3] = bytes;
+	return (
+		bytes.length >= 4 &&
+		byte0 === 0x50 &&
+		byte1 === 0x4b &&
+		byte2 !== undefined &&
+		byte3 !== undefined &&
+		[0x03, 0x05, 0x07].includes(byte2) &&
+		[0x04, 0x06, 0x08].includes(byte3)
+	);
+}
+
+export async function readOverrides(env: OverridesEnv): Promise<OverridesDocument> {
+	const bucket = requireBucket(env);
+	const object = await bucket.get(OVERRIDES_KEY);
+	if (!object) return {};
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await object.text());
+	} catch {
+		throw new HTTPException(500, { message: "Invalid overrides configuration" });
+	}
+
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new HTTPException(500, { message: "Invalid overrides configuration" });
+	}
+
+	const result: OverridesDocument = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (!/^\d+$/.test(key)) {
+			continue;
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			continue;
+		}
+
+		const entry = validateEntry(key, value as OverrideEntry);
+		result[key] = entry;
+	}
+
+	return result;
+}
+
+export async function writeOverrides(env: OverridesEnv, overrides: OverridesDocument): Promise<void> {
+	const bucket = requireBucket(env);
+	await bucket.put(OVERRIDES_KEY, JSON.stringify(overrides, null, 2), {
+		httpMetadata: {
+			contentType: "application/json; charset=utf-8",
+			cacheControl: "no-store",
+		},
+	});
+}
+
+export async function upsertOverride(
+	env: OverridesEnv,
+	appId: string,
+	entry: OverrideEntry,
+): Promise<OverrideEntry> {
+	const normalizedAppId = normalizeAppId(appId);
+	const overrides = await readOverrides(env);
+	const nextEntry = validateEntry(normalizedAppId, entry);
+	overrides[normalizedAppId] = nextEntry;
+	await writeOverrides(env, overrides);
+	return nextEntry;
+}
+
+export async function deleteOverride(env: OverridesEnv, appId: string): Promise<boolean> {
+	const normalizedAppId = normalizeAppId(appId);
+	const overrides = await readOverrides(env);
+	if (!overrides[normalizedAppId]) {
+		return false;
+	}
+
+	delete overrides[normalizedAppId];
+	await writeOverrides(env, overrides);
+	return true;
+}
+
+export async function getRequiredManifestOverride(
+	env: OverridesEnv,
+	appId: string,
+): Promise<{ bytes: Uint8Array; file: string } | null> {
+	const normalizedAppId = normalizeAppId(appId);
+	const overrides = await readOverrides(env);
+	const entry = overrides[normalizedAppId];
+	const manifestOverride = entry?.manifestOverride;
+
+	if (!manifestOverride?.enabled) {
+		return null;
+	}
+
+	validateManifestOverride(normalizedAppId, manifestOverride);
+	const bucket = requireBucket(env);
+	const object = await bucket.get(manifestOverride.file);
+	if (!object) {
+		console.error("[overrides] required manifest override file was not found", {
+			appId: normalizedAppId,
+			file: manifestOverride.file,
+		});
+		throw new HTTPException(502, {
+			message: REQUIRED_FILES_MESSAGE,
+		});
+	}
+
+	const bytes = new Uint8Array(await object.arrayBuffer());
+	if (!isZipHeader(bytes)) {
+		console.error("[overrides] required manifest override file is not a valid ZIP", {
+			appId: normalizedAppId,
+			file: manifestOverride.file,
+		});
+		throw new HTTPException(502, {
+			message: REQUIRED_FILES_MESSAGE,
+		});
+	}
+
+	return {
+		bytes,
+		file: manifestOverride.file,
+	};
+}

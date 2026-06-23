@@ -64,6 +64,12 @@
 			"database_id": "1498dabb-c5f3-4e17-a0f1-5058bc5ca1e4"
 		}
 	],
+	"r2_buckets": [
+		{
+			"binding": "MERLIN_FILES",
+			"bucket_name": "merlin-files"
+		}
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
