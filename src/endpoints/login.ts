@@ -2,12 +2,17 @@ import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { signAccessToken } from "../lib/auth";
 import { enforceLoginRateLimit } from "../lib/rate-limit";
+import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, LoginRequest, LoginResponse } from "../types";
 
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
 
 function toDateOnly(value: string): string {
 	return value.slice(0, 10);
+}
+
+function getClientIp(c: AppContext): string | null {
+	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
 }
 
 type LicenseRecord = {
@@ -140,6 +145,16 @@ export class LoginRoute extends OpenAPIRoute {
 		} else if (effectiveHwid !== data.body.hwid) {
 			throw new HTTPException(401, { message: "HWID mismatch" });
 		}
+
+		await writeUserActivityLog(c, {
+			licenseId: license.id,
+			licenseKey: license.license_key,
+			userName: license.name,
+			action: "user_login_success",
+			status: "success",
+			ipAddress: getClientIp(c),
+			hwid: effectiveHwid,
+		});
 
 		const accessToken = await signAccessToken(
 			{

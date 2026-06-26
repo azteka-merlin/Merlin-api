@@ -1,4 +1,4 @@
-/**
+﻿/**
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
@@ -17,6 +17,22 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"assets": {
+		"directory": "../merlin-admin/dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/",
+			"/login",
+			"/licenses",
+			"/overrides",
+			"/settings",
+			"/panel-api/*",
+			"/api/*",
+			"/doc*",
+			"/openapi.json*"
+		]
+	},
 	"routes": [
 		{
 			"pattern": "api-merlin.com",
@@ -54,7 +70,9 @@
 			"RYUU_AUTH_CODE",
 			"HUBCAP_TOKEN",
 			"ADMIN_API_TOKEN",
-			"JWT_SECRET"
+			"JWT_SECRET",
+			"INTERNAL_ADMIN_AUTH_SECRET",
+			"SESSION_HASH_SECRET"
 		]
 	},
 	"d1_databases": [
@@ -99,3 +117,7 @@
 	 */
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 }
+
+
+
+

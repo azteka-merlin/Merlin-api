@@ -3,6 +3,7 @@ import { HTTPException } from "hono/http-exception";
 import { verifyAccessToken } from "../lib/auth";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
+import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, ManifestQuery } from "../types";
 
 type ManifestEnv = {
@@ -19,6 +20,15 @@ type ManifestSource = {
 	maxAttempts: number;
 };
 
+type LicenseLookup = {
+	id: number;
+	license_key: string;
+	name: string;
+	hwid: string | null;
+	expires_at: string;
+	status: "active" | "revoked";
+};
+
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 
@@ -28,6 +38,10 @@ function parseBearerToken(request: Request): string | null {
 
 	const [scheme, token] = header.split(" ");
 	return scheme === "Bearer" && token ? token : null;
+}
+
+function getClientIp(c: AppContext): string | null {
+	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -95,10 +109,7 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 			await response.body?.cancel();
 			if (!isRetryableStatus(response.status)) return null;
 		} catch (error) {
-			console.warn(
-				`${source.name} request failed:`,
-				error instanceof Error ? error.message : "unknown error",
-			);
+			console.warn(`${source.name} request failed:`, error instanceof Error ? error.message : "unknown error");
 		}
 
 		if (attempt < source.maxAttempts) {
@@ -206,18 +217,13 @@ export class ManifestsRoute extends OpenAPIRoute {
 		const license = await c.env.merlin_db
 			.prepare(
 				`
-					SELECT id, hwid, expires_at, status
+					SELECT id, license_key, name, hwid, expires_at, status
 					FROM licenses
 					WHERE id = ?
 				`,
 			)
 			.bind(tokenPayload.sub)
-			.first<{
-				id: number;
-				hwid: string | null;
-				expires_at: string;
-				status: "active" | "revoked";
-			}>();
+			.first<LicenseLookup>();
 
 		if (!license) {
 			throw new HTTPException(401, { message: "License not found" });
@@ -242,9 +248,22 @@ export class ManifestsRoute extends OpenAPIRoute {
 			throw new HTTPException(400, { message: "Missing appid" });
 		}
 
+		const clientIp = getClientIp(c);
 		const env = c.env as Env & ManifestEnv;
 		const override = await getRequiredManifestOverride(env, appId);
 		if (override) {
+			await writeUserActivityLog(c, {
+				licenseId: license.id,
+				licenseKey: license.license_key,
+				userName: license.name,
+				action: "game_activation_success",
+				status: "success",
+				appId,
+				gameName: null,
+				ipAddress: clientIp,
+				hwid: tokenPayload.hwid,
+				metadata: { source: "r2-override" },
+			});
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
@@ -252,8 +271,34 @@ export class ManifestsRoute extends OpenAPIRoute {
 			const response = await fetchSource(source);
 			if (!response || !response.body) continue;
 
+			await writeUserActivityLog(c, {
+				licenseId: license.id,
+				licenseKey: license.license_key,
+				userName: license.name,
+				action: "game_activation_success",
+				status: "success",
+				appId,
+				gameName: null,
+				ipAddress: clientIp,
+				hwid: tokenPayload.hwid,
+				metadata: { source: source.name },
+			});
+
 			return buildZipResponse(response.body, appId, source.name);
 		}
+
+		await writeUserActivityLog(c, {
+			licenseId: license.id,
+			licenseKey: license.license_key,
+			userName: license.name,
+			action: "game_activation_denied",
+			status: "denied",
+			appId,
+			gameName: null,
+			ipAddress: clientIp,
+			hwid: tokenPayload.hwid,
+			reason: "manifest_unavailable",
+		});
 
 		return c.json({ error: "No manifest source returned a valid ZIP" }, 502);
 	}

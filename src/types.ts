@@ -1,7 +1,12 @@
-import type { Context } from "hono";
+﻿import type { Context } from "hono";
 import { z } from "zod";
 
-export type AppContext = Context<{ Bindings: Env }>;
+export interface AppBindings extends Env {
+  INTERNAL_ADMIN_AUTH_SECRET: string;
+  SESSION_HASH_SECRET: string;
+}
+
+export type AppContext = Context<{ Bindings: AppBindings }>;
 
 export const HealthResponse = z.object({
 	status: z.literal("online"),
