@@ -3,31 +3,20 @@ import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
-import { AdminCreateLicenseRoute } from "./endpoints/admin-create-license";
-import { AdminDeleteOverrideRoute } from "./endpoints/admin-delete-override";
-import { AdminGetLicenseRoute } from "./endpoints/admin-get-license";
-import { AdminListLicensesRoute } from "./endpoints/admin-list-licenses";
-import { AdminListOverridesRoute } from "./endpoints/admin-list-overrides";
-import { AdminRenewLicenseRoute } from "./endpoints/admin-renew-license";
-import { AdminResetHwidRoute } from "./endpoints/admin-reset-hwid";
-import { AdminRevokeLicenseRoute } from "./endpoints/admin-revoke-license";
-import { AdminUpsertOverrideRoute } from "./endpoints/admin-upsert-override";
 import { FixesCatalogRoute } from "./endpoints/fixes-catalog";
 import { FixesDownloadRoute } from "./endpoints/fixes-download";
+import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
 import { VersionRoute } from "./endpoints/version";
 import {
-  buildCsrfToken,
   clearAdminSessionCookie,
   loginAdminUser,
   logoutAdminSession,
-  logoutAdminSessionByToken,
+  type AuthSessionResult,
   readAdminSession,
-  readAdminSessionByToken,
   requireAdminSession,
-  requireInternalAdminSecret,
   SESSION_COOKIE_NAME,
   setAdminSessionCookie,
 } from "./lib/admin-security";
@@ -42,7 +31,9 @@ import {
   reactivateLicense,
   updateLicense,
 } from "./lib/admin-license-service";
-import { type AppBindings, CreateLicenseRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
+import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
+import { verifyAccessToken } from "./lib/auth";
+import { type AppBindings, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs } from "./lib/user-activity-service";
@@ -120,7 +111,7 @@ async function servePanelApp(c: any) {
   return c.env.ASSETS.fetch(getPanelIndexRequest(c));
 }
 
-function sessionPayload(sessionResult: Awaited<ReturnType<typeof readAdminSessionByToken>>) {
+function sessionPayload(sessionResult: AuthSessionResult | null) {
   if (!sessionResult) {
     return null;
   }
@@ -138,18 +129,6 @@ function sessionPayload(sessionResult: Awaited<ReturnType<typeof readAdminSessio
   };
 }
 
-function extractBearerToken(c: any) {
-  const header = c.req.header("authorization");
-  if (!header) {
-    throw new HTTPException(401, { message: "Unauthorized" });
-  }
-  const [scheme, token] = header.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    throw new HTTPException(401, { message: "Unauthorized" });
-  }
-  return token;
-}
-
 function parseBody<T>(schema: z.ZodSchema<T>, value: unknown) {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
@@ -164,6 +143,42 @@ function parseLicenseId(raw: string) {
     throw new HTTPException(400, { message: "Invalid license id" });
   }
   return value;
+}
+
+function sanitizeOverrideFilename(fileName: string) {
+  const normalized = String(fileName || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .pop() || "";
+
+  const safe = normalized
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+
+  if (!safe) {
+    throw new HTTPException(400, { message: "Invalid file name" });
+  }
+
+  return safe;
+}
+
+function detectUploadContentType(fileName: string) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".zip")) return "application/zip";
+  if (lower.endsWith(".rar")) return "application/vnd.rar";
+  return "application/octet-stream";
+}
+
+function formatUploadSize(bytes: number) {
+  const value = Number(bytes) || 0;
+  if (value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const amount = value / (1024 ** index);
+  return `${amount >= 100 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
 }
 
 async function handleProtectedPage(c: any) {
@@ -274,6 +289,97 @@ app.post("/panel-api/security/blocked-ips/:id/unblock", async (c) => {
 
   return c.json({ blockedIp: unblocked }, 200);
 });
+app.get("/panel-api/overrides", async (c) => {
+  await requireAdminSession(c);
+  const overrides = await readOverrides(c.env);
+  return c.json({ overrides }, 200);
+});
+
+app.post("/panel-api/overrides", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(OverrideUpsertRequest, await c.req.json());
+  const override = await upsertOverride(c.env, body.appId, {
+    manifestOverride: body.manifestOverride,
+    fixOverride: body.fixOverride,
+  });
+  return c.json({ appId: body.appId, override }, 200);
+});
+
+app.post("/panel-api/overrides/upload", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const formData = await c.req.formData();
+  const appId = String(formData.get("appId") || "").trim();
+  const kind = String(formData.get("kind") || "").trim();
+  const file = formData.get("file");
+
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Informe um appId numérico válido." });
+  }
+
+  if (kind !== "manifest" && kind !== "fix") {
+    throw new HTTPException(400, { message: "Tipo de upload inválido." });
+  }
+
+  if (!(file instanceof File)) {
+    throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+  }
+
+  const safeName = sanitizeOverrideFilename(file.name || "arquivo");
+  const lowerName = safeName.toLowerCase();
+  const isZip = lowerName.endsWith(".zip");
+  const isRar = lowerName.endsWith(".rar");
+
+  if (kind === "manifest" && !isZip) {
+    throw new HTTPException(400, { message: "Manifest override aceita apenas arquivos .zip." });
+  }
+
+  if (kind === "fix" && !isZip && !isRar) {
+    throw new HTTPException(400, { message: "Fix override aceita arquivos .zip ou .rar." });
+  }
+
+  const bytes = await file.arrayBuffer();
+  const sizeBytes = file.size || bytes.byteLength || 0;
+  if (sizeBytes <= 0) {
+    throw new HTTPException(400, { message: "O arquivo enviado está vazio." });
+  }
+
+  const folder = kind === "manifest" ? "manifests" : "fixes";
+  const objectKey = `${appId}/${folder}/${safeName}`;
+
+  await c.env.MERLIN_FILES.put(objectKey, bytes, {
+    httpMetadata: {
+      contentType: detectUploadContentType(safeName),
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    appId,
+    kind,
+    path: objectKey,
+    filename: safeName,
+    sizeBytes,
+    sizeLabel: formatUploadSize(sizeBytes),
+  }, 200);
+});
+
+app.delete("/panel-api/overrides/:appId", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const appId = c.req.param("appId");
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Invalid appId" });
+  }
+
+  const deleted = await deleteOverride(c.env, appId);
+  if (!deleted) {
+    throw new HTTPException(404, { message: "Override not found" });
+  }
+
+  return c.json({ success: true, appId }, 200);
+});
+
 app.get("/panel-api/licenses", async (c) => {
   await requireAdminSession(c);
   const licenses = await listLicenses(c);
@@ -353,122 +459,68 @@ app.post("/panel-api/licenses/:id/reset-hwid", async (c) => {
   return c.json(mapLicense(updated), 200);
 });
 
-app.post("/api/admin/auth/login", async (c) => {
-  requireInternalAdminSecret(c);
-  const body = parseBody(adminLoginSchema, await c.req.json());
-  const session = await loginAdminUser(c, body.username, body.password, { rememberMe: body.rememberMe });
-  return c.json({ success: true, ...sessionPayload(session), sessionToken: session.token }, 200);
-});
-
-app.get("/api/admin/auth/session", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: false });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  return c.json({ success: true, ...sessionPayload(session) }, 200);
-});
-
-app.post("/api/admin/auth/refresh", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: true });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  return c.json({ success: true, ...sessionPayload(session), sessionToken: session.token }, 200);
-});
-
-app.post("/api/admin/auth/logout", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  await logoutAdminSessionByToken(c, token);
-  return c.json({ success: true }, 200);
-});
-
-app.get("/api/admin/user-activity", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: false });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  const limit = Number(c.req.query("limit") || "100");
-  const action = c.req.query("action")?.trim() || undefined;
-  const status = c.req.query("status")?.trim() || undefined;
-  const search = c.req.query("search")?.trim() || undefined;
-  const logs = await listUserActivityLogs(c, { limit, action, status, search });
-  return c.json({ success: true, logs }, 200);
-});
-app.get("/api/admin/audit-logs", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: false });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  const limit = Number(c.req.query("limit") || "100");
-  const adminUserIdRaw = c.req.query("adminUserId");
-  const adminUserId = adminUserIdRaw && /^\d+$/.test(adminUserIdRaw) ? Number(adminUserIdRaw) : null;
-  const action = c.req.query("action")?.trim() || undefined;
-  const search = c.req.query("search")?.trim() || undefined;
-  const logs = await listAdminAuditLogs(c, { limit, adminUserId, action, search });
-  return c.json({ success: true, logs }, 200);
-});
-app.get("/api/admin/security/blocked-ips", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: false });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  const includeHistory = c.req.query("includeHistory") === "true";
-  const blockedIps = await listBlockedIps(c, includeHistory);
-  return c.json({ success: true, blockedIps }, 200);
-});
-
-app.post("/api/admin/security/blocked-ips/:id/unblock", async (c) => {
-  requireInternalAdminSecret(c);
-  const token = extractBearerToken(c);
-  const session = await readAdminSessionByToken(c, token, { touch: true, rotate: false });
-  if (!session) {
-    return c.json({ success: false, error: "Unauthorized" }, 401);
-  }
-
-  const id = Number(c.req.param("id"));
-  if (!Number.isInteger(id) || id <= 0) {
-    return c.json({ success: false, error: "Invalid blocked IP id" }, 400);
-  }
-
-  const blockedIp = await unblockBlockedIp(c, id, {
-    adminUserId: session.session.admin_user_id,
-    ipHash: session.session.ip_hash,
-    userAgentHash: session.session.user_agent_hash,
-  });
-
-  return c.json({ success: true, blockedIp }, 200);
-});
 openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
+app.get("/api/manifests/status", async (c) => {
+  const authorization = c.req.header("authorization") || "";
+  const [scheme, token] = authorization.split(" ");
+  if (scheme !== "Bearer" || !token) {
+    throw new HTTPException(401, { message: "Missing access token" });
+  }
+
+  if (!c.env.JWT_SECRET) {
+    throw new HTTPException(500, { message: "JWT secret is not configured" });
+  }
+
+  const payload = await verifyAccessToken(token, c.env.JWT_SECRET);
+  if (payload.exp <= Math.floor(Date.now() / 1000)) {
+    throw new HTTPException(401, { message: "Access token expired" });
+  }
+
+  const license = await c.env.merlin_db
+    .prepare(`
+      SELECT id, hwid, expires_at, status
+      FROM licenses
+      WHERE id = ?
+    `)
+    .bind(payload.sub)
+    .first<{ id: number; hwid: string | null; expires_at: string; status: "active" | "revoked" }>();
+
+  if (!license) {
+    throw new HTTPException(401, { message: "License not found" });
+  }
+  if (license.status !== "active") {
+    throw new HTTPException(401, { message: "License is not active" });
+  }
+  if (!license.hwid || license.hwid !== payload.hwid) {
+    throw new HTTPException(401, { message: "HWID mismatch" });
+  }
+
+  const expiresAt = new Date(license.expires_at);
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
+    throw new HTTPException(401, { message: "License expired" });
+  }
+
+  const appId = String(c.req.query("appid") || "").trim();
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Invalid appid" });
+  }
+
+  const overrides = await readOverrides(c.env);
+  const requiresVersionPin = Boolean(overrides[appId]?.manifestOverride?.enabled);
+
+  return c.json({
+    success: true,
+    appId,
+    requiresVersionPin,
+  }, 200);
+});
+
 openapi.get("/api/manifests", ManifestsRoute);
 openapi.get("/api/fixes/catalog", FixesCatalogRoute);
 openapi.get("/api/fixes/download", FixesDownloadRoute);
+openapi.post("/api/fixes/vote", FixesVoteRoute);
 openapi.post("/api/auth/login", LoginRoute);
-openapi.get("/api/admin/licenses", AdminListLicensesRoute);
-openapi.post("/api/admin/licenses", AdminCreateLicenseRoute);
-openapi.get("/api/admin/licenses/:id", AdminGetLicenseRoute);
-openapi.post("/api/admin/licenses/:id/renew", AdminRenewLicenseRoute);
-openapi.post("/api/admin/licenses/:id/revoke", AdminRevokeLicenseRoute);
-openapi.post("/api/admin/licenses/:id/reset-hwid", AdminResetHwidRoute);
-openapi.get("/api/admin/overrides", AdminListOverridesRoute);
-openapi.post("/api/admin/overrides", AdminUpsertOverrideRoute);
-openapi.delete("/api/admin/overrides/:appId", AdminDeleteOverrideRoute);
 
 app.onError((error, c) => {
   console.error("[merlin-api:error]", error);

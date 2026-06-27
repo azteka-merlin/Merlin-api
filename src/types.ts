@@ -2,8 +2,9 @@
 import { z } from "zod";
 
 export interface AppBindings extends Env {
-  INTERNAL_ADMIN_AUTH_SECRET: string;
   SESSION_HASH_SECRET: string;
+  ADMIN_API_TOKEN?: string;
+  INTERNAL_ADMIN_AUTH_SECRET?: string;
 }
 
 export type AppContext = Context<{ Bindings: AppBindings }>;
@@ -45,6 +46,23 @@ export const ManifestQuery = z.object({
 
 export const FixDownloadQuery = z.object({
 	appid: z.string().regex(/^\d+$/),
+});
+
+export const CorrectionVoteValue = z.enum(["up", "down"]);
+
+export const CorrectionVoteRequest = z.object({
+	appId: z.string().regex(/^\d+$/),
+	vote: CorrectionVoteValue,
+});
+
+export const CorrectionVoteResponse = z.object({
+	success: z.literal(true),
+	appId: z.string().regex(/^\d+$/),
+	vote: CorrectionVoteValue,
+	viewerVote: CorrectionVoteValue,
+	upvotes: z.number().int().nonnegative(),
+	downvotes: z.number().int().nonnegative(),
+	score: z.number().int(),
 });
 
 export const CreateLicenseRequest = z.object({
@@ -99,6 +117,7 @@ export const FixOverrideConfig = z.object({
 	gameName: z.string().min(1).optional(),
 	filename: z.string().min(1).optional(),
 	size: z.string().min(1).optional(),
+	adminNote: z.string().min(1).optional(),
 });
 
 export const OverrideEntry = z.object({
@@ -134,3 +153,4 @@ export const DeleteOverrideResponse = z.object({
 	success: z.literal(true),
 	appId: z.string().regex(/^\d+$/),
 });
+

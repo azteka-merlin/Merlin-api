@@ -69,9 +69,7 @@
 		"required": [
 			"RYUU_AUTH_CODE",
 			"HUBCAP_TOKEN",
-			"ADMIN_API_TOKEN",
 			"JWT_SECRET",
-			"INTERNAL_ADMIN_AUTH_SECRET",
 			"SESSION_HASH_SECRET"
 		]
 	},

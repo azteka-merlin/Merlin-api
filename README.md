@@ -71,9 +71,7 @@ Observacoes:
 5. Configure secrets obrigatorios:
    `npx wrangler secret put RYUU_AUTH_CODE`
    `npx wrangler secret put HUBCAP_TOKEN`
-   `npx wrangler secret put ADMIN_API_TOKEN`
    `npx wrangler secret put JWT_SECRET`
-   `npx wrangler secret put INTERNAL_ADMIN_AUTH_SECRET`
    `npx wrangler secret put SESSION_HASH_SECRET`
 6. Gere o primeiro admin:
    `npm run admin:bootstrap`
@@ -91,7 +89,7 @@ Observacoes:
 
 ## Notas de seguranca
 
-- `ADMIN_API_TOKEN` nunca vai para o bundle do React
+- painel servido apenas por sessao administrativa com cookie HttpOnly + CSRF
 - o cookie `merlin_admin_session` e `HttpOnly`, `Secure` e `SameSite=Strict`
 - rotas mutaveis do painel exigem sessao valida e CSRF token
 - falhas de login sao auditadas e participam de lock por usuario e bloqueio por IP

@@ -11,6 +11,7 @@ export type FixOverrideConfig = {
 	gameName?: string;
 	filename?: string;
 	size?: string;
+	adminNote?: string;
 };
 
 export type OverrideEntry = {
@@ -94,6 +95,9 @@ function validateFixOverride(appId: string, override: FixOverrideConfig) {
 	if (override.size !== undefined && !override.size.trim()) {
 		throw new HTTPException(400, { message: "Fix override size is invalid" });
 	}
+	if (override.adminNote !== undefined && !override.adminNote.trim()) {
+		throw new HTTPException(400, { message: "Fix override adminNote is invalid" });
+	}
 }
 
 function validateEntry(appId: string, entry: OverrideEntry): OverrideEntry {
@@ -115,6 +119,7 @@ function validateEntry(appId: string, entry: OverrideEntry): OverrideEntry {
 			gameName: entry.fixOverride.gameName?.trim() || undefined,
 			filename: entry.fixOverride.filename?.trim() || basename(entry.fixOverride.file.trim()),
 			size: entry.fixOverride.size?.trim() || undefined,
+			adminNote: entry.fixOverride.adminNote?.trim() || undefined,
 		};
 	}
 
@@ -269,11 +274,14 @@ export async function getFixOverrideFile(
 			appId: normalizedAppId,
 			file: fixOverride.file,
 		});
-		throw new HTTPException(502, { message: REQUIRED_CORRECTION_MESSAGE });
+		throw new HTTPException(502, {
+			message: REQUIRED_CORRECTION_MESSAGE,
+		});
 	}
 
+	const bytes = new Uint8Array(await object.arrayBuffer());
 	return {
-		bytes: new Uint8Array(await object.arrayBuffer()),
+		bytes,
 		file: fixOverride.file,
 		filename: fixOverride.filename || basename(fixOverride.file),
 		size: fixOverride.size,
