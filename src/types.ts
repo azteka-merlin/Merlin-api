@@ -121,6 +121,7 @@ export const FixOverrideConfig = z.object({
 });
 
 export const OverrideEntry = z.object({
+	name: z.string().min(1).optional(),
 	manifestOverride: ManifestOverrideConfig.optional(),
 	fixOverride: FixOverrideConfig.optional(),
 });
@@ -132,6 +133,7 @@ export const OverrideParams = z.object({
 export const OverrideUpsertRequest = z
 	.object({
 		appId: z.string().regex(/^\d+$/),
+		name: z.string().min(1),
 		manifestOverride: ManifestOverrideConfig.optional(),
 		fixOverride: FixOverrideConfig.optional(),
 	})

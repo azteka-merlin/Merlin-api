@@ -296,6 +296,7 @@ app.post("/panel-api/overrides", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const body = parseBody(OverrideUpsertRequest, await c.req.json());
   const override = await upsertOverride(c.env, body.appId, {
+    name: body.name,
     manifestOverride: body.manifestOverride,
     fixOverride: body.fixOverride,
   });

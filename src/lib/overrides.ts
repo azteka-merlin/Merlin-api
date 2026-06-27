@@ -15,6 +15,7 @@ export type FixOverrideConfig = {
 };
 
 export type OverrideEntry = {
+	name?: string;
 	manifestOverride?: ManifestOverrideConfig;
 	fixOverride?: FixOverrideConfig;
 };
@@ -100,8 +101,32 @@ function validateFixOverride(appId: string, override: FixOverrideConfig) {
 	}
 }
 
-function validateEntry(appId: string, entry: OverrideEntry): OverrideEntry {
+function normalizeOverrideName(entry: OverrideEntry): string | undefined {
+	const rawName =
+		typeof entry.name === "string" && entry.name.trim()
+			? entry.name.trim()
+			: typeof entry.fixOverride?.gameName === "string" && entry.fixOverride.gameName.trim()
+				? entry.fixOverride.gameName.trim()
+				: undefined;
+
+	return rawName || undefined;
+}
+
+function validateEntry(
+	appId: string,
+	entry: OverrideEntry,
+	options: { allowLegacyNameMissing?: boolean } = {},
+): OverrideEntry {
 	const nextEntry: OverrideEntry = {};
+	const normalizedName = normalizeOverrideName(entry);
+
+	if (!normalizedName && !options.allowLegacyNameMissing) {
+		throw new HTTPException(400, { message: "Override name is required" });
+	}
+
+	if (normalizedName) {
+		nextEntry.name = normalizedName;
+	}
 
 	if (entry.manifestOverride) {
 		validateManifestOverride(appId, entry.manifestOverride);
@@ -168,7 +193,7 @@ export async function readOverrides(env: OverridesEnv): Promise<OverridesDocumen
 			continue;
 		}
 
-		const entry = validateEntry(key, value as OverrideEntry);
+		const entry = validateEntry(key, value as OverrideEntry, { allowLegacyNameMissing: true });
 		result[key] = entry;
 	}
 
@@ -285,6 +310,6 @@ export async function getFixOverrideFile(
 		file: fixOverride.file,
 		filename: fixOverride.filename || basename(fixOverride.file),
 		size: fixOverride.size,
-		gameName: fixOverride.gameName,
+		gameName: entry?.name || fixOverride.gameName,
 	};
 }
