@@ -182,20 +182,18 @@ function formatUploadSize(bytes: number) {
 }
 
 async function handleProtectedPage(c: any) {
-  const session = await readAdminSession(c, { touch: true, rotate: false });
+  const session = await readAdminSession(c, { touch: false, rotate: false });
   if (!session) {
     clearAdminSessionCookie(c);
     return c.redirect("/login", 302);
   }
 
-  setAdminSessionCookie(c, session.token, session.cookieMaxAge);
   return servePanelApp(c);
 }
 
 app.get("/login", async (c) => {
-  const session = await readAdminSession(c, { touch: true, rotate: false });
+  const session = await readAdminSession(c, { touch: false, rotate: false });
   if (session) {
-    setAdminSessionCookie(c, session.token, session.cookieMaxAge);
     return c.redirect("/", 302);
   }
 
@@ -226,13 +224,12 @@ app.post("/panel-api/auth/login", async (c) => {
 });
 
 app.get("/panel-api/auth/session", async (c) => {
-  const session = await readAdminSession(c, { touch: true, rotate: false });
+  const session = await readAdminSession(c, { touch: false, rotate: false });
   if (!session) {
     clearAdminSessionCookie(c);
     return c.json({ success: false, error: "Sessao expirada. Faca login novamente." }, 401);
   }
 
-  setAdminSessionCookie(c, session.token, session.cookieMaxAge);
   return c.json(sessionPayload(session), 200);
 });
 
