@@ -117,11 +117,11 @@ export const FixOverrideConfig = z.object({
 	gameName: z.string().min(1).optional(),
 	filename: z.string().min(1).optional(),
 	size: z.string().min(1).optional(),
-	adminNote: z.string().min(1).optional(),
 });
 
 export const OverrideEntry = z.object({
 	name: z.string().min(1).optional(),
+	adminNote: z.string().min(1).optional(),
 	manifestOverride: ManifestOverrideConfig.optional(),
 	fixOverride: FixOverrideConfig.optional(),
 });
@@ -134,11 +134,12 @@ export const OverrideUpsertRequest = z
 	.object({
 		appId: z.string().regex(/^\d+$/),
 		name: z.string().min(1),
+		adminNote: z.string().min(1).optional(),
 		manifestOverride: ManifestOverrideConfig.optional(),
 		fixOverride: FixOverrideConfig.optional(),
 	})
-	.refine((value) => Boolean(value.manifestOverride || value.fixOverride), {
-		message: "At least one override must be provided",
+	.refine((value) => Boolean(value.adminNote || value.manifestOverride || value.fixOverride), {
+		message: "At least one override detail must be provided",
 		path: ["appId"],
 	});
 

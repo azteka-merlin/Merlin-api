@@ -1,4 +1,4 @@
-import { OpenAPIRoute } from "chanfana";
+﻿import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { getFixOverrideFile } from "../lib/overrides";
 import { FixDownloadQuery, type AppContext } from "../types";
@@ -47,6 +47,7 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 		headers.set("content-disposition", `attachment; filename="${override.filename}"`);
 		headers.set("x-merlin-fix-source", "r2-override");
 
-		return new Response(override.bytes, { status: 200, headers });
+		return new Response(override.object.body, { status: 200, headers });
 	}
 }
+

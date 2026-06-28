@@ -222,7 +222,7 @@ export function setAdminSessionCookie(c: AppContext, token: string, maxAge = ADM
   setCookie(c, SESSION_COOKIE_NAME, token, {
     httpOnly: true,
     secure: true,
-    sameSite: "Strict",
+    sameSite: "Lax",
     path: "/",
     maxAge,
     expires: new Date(Date.now() + maxAge * 1000),
@@ -233,7 +233,7 @@ export function clearAdminSessionCookie(c: AppContext) {
   setCookie(c, SESSION_COOKIE_NAME, "", {
     httpOnly: true,
     secure: true,
-    sameSite: "Strict",
+    sameSite: "Lax",
     path: "/",
     maxAge: 0,
   });

@@ -56,7 +56,7 @@ function firstEligibleCorrection(fixes: unknown): { href: string; filename: stri
   return null;
 }
 
-function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string }> }> {
+function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> {
   if (!Array.isArray(entries)) {
     throw new Error("Invalid fixes catalog payload");
   }
@@ -78,7 +78,7 @@ function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: 
         fixes: [fix],
       };
     })
-    .filter((entry): entry is { appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string }> } => Boolean(entry));
+    .filter((entry): entry is { appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> } => Boolean(entry));
 }
 
 function buildDownloadHref(request: Request, appId: string): string {
@@ -142,7 +142,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
       },
     });
 
-    let remoteEntries: Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string }> }> = [];
+    let remoteEntries: Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> = [];
     if (remoteResponse.ok) {
       remoteEntries = normalizeRemoteEntries(await remoteResponse.json());
     } else {
@@ -154,37 +154,51 @@ export class FixesCatalogRoute extends OpenAPIRoute {
 
     for (const [appId, entry] of Object.entries(overrides)) {
       const fixOverride = entry.fixOverride;
-      if (!fixOverride?.enabled) continue;
-
-      const nextFix = {
-        href: buildDownloadHref(c.req.raw, appId),
-        filename: fixOverride.filename || `${appId}${fixOverride.file.endsWith(".rar") ? ".rar" : ".zip"}`,
-        size: fixOverride.size || undefined,
-        adminNote: fixOverride.adminNote || undefined,
-      };
-
+      const overrideName = entry.name || fixOverride?.gameName || undefined;
+      const overrideAdminNote = entry.adminNote || undefined;
       const existing = byAppId.get(appId);
-      if (existing) {
+
+      if (fixOverride?.enabled) {
+        const nextFix = {
+          href: buildDownloadHref(c.req.raw, appId),
+          filename: fixOverride.filename || `${appId}${fixOverride.file.endsWith(".rar") ? ".rar" : ".zip"}`,
+          size: fixOverride.size || undefined,
+          adminNote: overrideAdminNote,
+        };
+
+        if (existing) {
+          byAppId.set(appId, {
+            ...existing,
+            name: overrideName || existing.name,
+            fixes: [nextFix],
+          });
+          continue;
+        }
+
+        if (!overrideName) {
+          console.warn("[fixes] skipping override-only catalog item without name", { appId });
+          continue;
+        }
+
         byAppId.set(appId, {
-          ...existing,
-          name: fixOverride.gameName || existing.name,
+          appid: appId,
+          name: overrideName,
           fixes: [nextFix],
         });
         continue;
       }
 
-      if (!fixOverride.gameName) {
-        console.warn("[fixes] skipping override-only catalog item without gameName", { appId });
-        continue;
-      }
+      if (!existing || (!overrideName && !overrideAdminNote)) continue;
 
       byAppId.set(appId, {
-        appid: appId,
-        name: fixOverride.gameName,
-        fixes: [nextFix],
+        ...existing,
+        name: overrideName || existing.name,
+        fixes: existing.fixes.map((fix) => ({
+          ...fix,
+          adminNote: overrideAdminNote || fix.adminNote,
+        })),
       });
     }
-
     const appIds = [...byAppId.keys()];
     const [voteTotals, viewerLicenseId] = await Promise.all([
       listCorrectionVoteTotals(c.env, appIds),
@@ -226,3 +240,4 @@ export class FixesCatalogRoute extends OpenAPIRoute {
     return c.json(items, 200);
   }
 }
+

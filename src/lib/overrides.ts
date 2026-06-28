@@ -11,11 +11,11 @@ export type FixOverrideConfig = {
 	gameName?: string;
 	filename?: string;
 	size?: string;
-	adminNote?: string;
 };
 
 export type OverrideEntry = {
 	name?: string;
+	adminNote?: string;
 	manifestOverride?: ManifestOverrideConfig;
 	fixOverride?: FixOverrideConfig;
 };
@@ -96,9 +96,6 @@ function validateFixOverride(appId: string, override: FixOverrideConfig) {
 	if (override.size !== undefined && !override.size.trim()) {
 		throw new HTTPException(400, { message: "Fix override size is invalid" });
 	}
-	if (override.adminNote !== undefined && !override.adminNote.trim()) {
-		throw new HTTPException(400, { message: "Fix override adminNote is invalid" });
-	}
 }
 
 function normalizeOverrideName(entry: OverrideEntry): string | undefined {
@@ -119,6 +116,13 @@ function validateEntry(
 ): OverrideEntry {
 	const nextEntry: OverrideEntry = {};
 	const normalizedName = normalizeOverrideName(entry);
+	const legacyAdminNote =
+		typeof (entry.fixOverride as FixOverrideConfig & { adminNote?: string } | undefined)?.adminNote === "string" &&
+		(entry.fixOverride as FixOverrideConfig & { adminNote?: string }).adminNote?.trim()
+			? (entry.fixOverride as FixOverrideConfig & { adminNote?: string }).adminNote?.trim()
+			: undefined;
+	const normalizedAdminNote =
+		typeof entry.adminNote === "string" && entry.adminNote.trim() ? entry.adminNote.trim() : legacyAdminNote;
 
 	if (!normalizedName && !options.allowLegacyNameMissing) {
 		throw new HTTPException(400, { message: "Override name is required" });
@@ -126,6 +130,10 @@ function validateEntry(
 
 	if (normalizedName) {
 		nextEntry.name = normalizedName;
+	}
+
+	if (normalizedAdminNote) {
+		nextEntry.adminNote = normalizedAdminNote;
 	}
 
 	if (entry.manifestOverride) {
@@ -144,12 +152,11 @@ function validateEntry(
 			gameName: entry.fixOverride.gameName?.trim() || undefined,
 			filename: entry.fixOverride.filename?.trim() || basename(entry.fixOverride.file.trim()),
 			size: entry.fixOverride.size?.trim() || undefined,
-			adminNote: entry.fixOverride.adminNote?.trim() || undefined,
 		};
 	}
 
-	if (!nextEntry.manifestOverride && !nextEntry.fixOverride) {
-		throw new HTTPException(400, { message: "At least one override must be provided" });
+	if (!nextEntry.manifestOverride && !nextEntry.fixOverride && !nextEntry.adminNote) {
+		throw new HTTPException(400, { message: "At least one override detail must be provided" });
 	}
 
 	return nextEntry;
@@ -281,7 +288,7 @@ export async function getRequiredManifestOverride(
 export async function getFixOverrideFile(
 	env: OverridesEnv,
 	appId: string,
-): Promise<{ bytes: Uint8Array; file: string; filename: string; size?: string; gameName?: string } | null> {
+): Promise<{ object: R2ObjectBody; file: string; filename: string; size?: string; gameName?: string } | null> {
 	const normalizedAppId = normalizeAppId(appId);
 	const overrides = await readOverrides(env);
 	const entry = overrides[normalizedAppId];
@@ -304,9 +311,8 @@ export async function getFixOverrideFile(
 		});
 	}
 
-	const bytes = new Uint8Array(await object.arrayBuffer());
 	return {
-		bytes,
+		object,
 		file: fixOverride.file,
 		filename: fixOverride.filename || basename(fixOverride.file),
 		size: fixOverride.size,

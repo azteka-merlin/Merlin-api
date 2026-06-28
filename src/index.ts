@@ -89,6 +89,28 @@ const updateLicenseSchema = z.object({
   expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   hwid: z.string().trim().optional().nullable(),
 });
+const overrideUploadInitSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  kind: z.enum(["manifest", "fix"]),
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+});
+const overrideUploadAbortSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  kind: z.enum(["manifest", "fix"]),
+  uploadId: z.string().min(1),
+  objectKey: z.string().min(1),
+});
+const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+  uploadedParts: z.array(
+    z.object({
+      partNumber: z.number().int().positive(),
+      etag: z.string().min(1),
+    }),
+  ).min(1),
+});
 
 function jsonError(message: string, status = 400) {
   return new Response(
@@ -179,6 +201,55 @@ function formatUploadSize(bytes: number) {
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   const amount = value / (1024 ** index);
   return `${amount >= 100 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
+}
+
+const OVERRIDE_UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+
+function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", uploadName: string) {
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Informe um appId numerico valido." });
+  }
+
+  const safeName = sanitizeOverrideFilename(uploadName);
+  const lowerName = safeName.toLowerCase();
+  const isZip = lowerName.endsWith(".zip");
+  const isRar = lowerName.endsWith(".rar");
+
+  if (kind === "manifest" && !isZip) {
+    throw new HTTPException(400, { message: "Manifest override aceita apenas arquivos .zip." });
+  }
+
+  if (kind === "fix" && !isZip && !isRar) {
+    throw new HTTPException(400, { message: "Fix override aceita arquivos .zip ou .rar." });
+  }
+
+  const folder = kind === "manifest" ? "manifests" : "fixes";
+  return {
+    safeName,
+    folder,
+    objectKey: `${appId}/${folder}/${safeName}`,
+  };
+}
+
+function validateOverrideUploadObjectKey(appId: string, kind: "manifest" | "fix", objectKey: string) {
+  const normalized = String(objectKey || "").trim().replace(/\\/g, "/");
+  if (!normalized || normalized.includes("..") || normalized.startsWith("/")) {
+    throw new HTTPException(400, { message: "Invalid override object key" });
+  }
+
+  const folder = kind === "manifest" ? "manifests" : "fixes";
+  const expectedPrefix = `${appId}/${folder}/`;
+  if (!normalized.startsWith(expectedPrefix)) {
+    throw new HTTPException(400, { message: "Invalid override object key" });
+  }
+
+  const safeName = sanitizeOverrideFilename(normalized);
+  const canonical = `${expectedPrefix}${safeName}`;
+  if (canonical !== normalized) {
+    throw new HTTPException(400, { message: "Invalid override object key" });
+  }
+
+  return resolveOverrideUploadTarget(appId, kind, safeName);
 }
 
 async function handleProtectedPage(c: any) {
@@ -297,33 +368,146 @@ app.post("/panel-api/overrides", async (c) => {
   const body = parseBody(OverrideUpsertRequest, await c.req.json());
   const override = await upsertOverride(c.env, body.appId, {
     name: body.name,
+    adminNote: body.adminNote,
     manifestOverride: body.manifestOverride,
     fixOverride: body.fixOverride,
   });
   return c.json({ appId: body.appId, override }, 200);
 });
 
-app.post("/panel-api/overrides/upload", async (c) => {
+app.post("/panel-api/overrides/upload/initiate", async (c) => {
   await requireAdminSession(c, { mutate: true });
 
-  const formData = await c.req.formData();
-  const appId = String(formData.get("appId") || "").trim();
-  const kind = String(formData.get("kind") || "").trim();
-  const file = formData.get("file");
+  const body = parseBody(overrideUploadInitSchema, await c.req.json());
+  const target = resolveOverrideUploadTarget(body.appId, body.kind, body.filename);
 
-  if (!/^\d+$/.test(appId)) {
-    throw new HTTPException(400, { message: "Informe um appId numérico válido." });
+  const upload = await c.env.MERLIN_FILES.createMultipartUpload(target.objectKey, {
+    httpMetadata: {
+      contentType: detectUploadContentType(target.safeName),
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    appId: body.appId,
+    kind: body.kind,
+    uploadId: upload.uploadId,
+    path: target.objectKey,
+    filename: target.safeName,
+    partSize: OVERRIDE_UPLOAD_PART_SIZE,
+    sizeBytes: body.sizeBytes,
+    sizeLabel: formatUploadSize(body.sizeBytes),
+  }, 200);
+});
+
+app.post("/panel-api/overrides/upload/part", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const appId = String(c.req.query("appId") || "").trim();
+  const kind = String(c.req.query("kind") || "").trim();
+  const uploadId = String(c.req.query("uploadId") || "").trim();
+  const objectKey = String(c.req.query("objectKey") || "").trim();
+  const partNumber = Number(c.req.query("partNumber") || "0");
+
+  if ((kind !== "manifest" && kind !== "fix") || !uploadId || !Number.isInteger(partNumber) || partNumber <= 0) {
+    throw new HTTPException(400, { message: "Invalid multipart upload request" });
   }
 
-  if (kind !== "manifest" && kind !== "fix") {
-    throw new HTTPException(400, { message: "Tipo de upload inválido." });
-  }
-
-  if (!(file instanceof File)) {
+  const target = validateOverrideUploadObjectKey(appId, kind, objectKey);
+  const body = c.req.raw.body;
+  if (!body) {
     throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
   }
 
-  const safeName = sanitizeOverrideFilename(file.name || "arquivo");
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(target.objectKey, uploadId);
+  const uploadedPart = await upload.uploadPart(partNumber, body);
+  return c.json(uploadedPart, 200);
+});
+
+app.post("/panel-api/overrides/upload/complete", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const body = parseBody(overrideUploadCompleteSchema, await c.req.json());
+  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey);
+
+  if (target.safeName !== resolveOverrideUploadTarget(body.appId, body.kind, body.filename).safeName) {
+    throw new HTTPException(400, { message: "Invalid override file name" });
+  }
+
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(target.objectKey, body.uploadId);
+  const uploadedParts = [...body.uploadedParts].sort((left, right) => left.partNumber - right.partNumber);
+  await upload.complete(uploadedParts);
+
+  return c.json({
+    success: true,
+    appId: body.appId,
+    kind: body.kind,
+    path: target.objectKey,
+    filename: target.safeName,
+    sizeBytes: body.sizeBytes,
+    sizeLabel: formatUploadSize(body.sizeBytes),
+  }, 200);
+});
+
+app.post("/panel-api/overrides/upload/abort", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const body = parseBody(overrideUploadAbortSchema, await c.req.json());
+  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey);
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(target.objectKey, body.uploadId);
+  await upload.abort();
+
+  return c.json({ success: true }, 200);
+});
+
+app.post("/panel-api/overrides/upload", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const contentType = c.req.header("content-type") || "";
+  let appId = "";
+  let kind = "";
+  let uploadName = "arquivo";
+  let sizeBytes = 0;
+  let uploadBody: ReadableStream | ArrayBuffer | null = null;
+
+  if (contentType.includes("multipart/form-data")) {
+    const formData = await c.req.formData();
+    const file = formData.get("file");
+
+    appId = String(formData.get("appId") || "").trim();
+    kind = String(formData.get("kind") || "").trim();
+
+    if (!(file instanceof File)) {
+      throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+    }
+
+    uploadName = file.name || "arquivo";
+    sizeBytes = file.size || 0;
+    uploadBody = await file.arrayBuffer();
+  } else {
+    appId = String(c.req.query("appId") || "").trim();
+    kind = String(c.req.query("kind") || "").trim();
+    uploadName = c.req.header("x-upload-filename") || "arquivo";
+
+    const headerSize = Number(c.req.header("x-upload-size") || c.req.header("content-length") || "0");
+    sizeBytes = Number.isFinite(headerSize) ? headerSize : 0;
+    uploadBody = c.req.raw.body;
+
+    if (!uploadBody) {
+      throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+    }
+  }
+
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Informe um appId numerico valido." });
+  }
+
+  if (kind !== "manifest" && kind !== "fix") {
+    throw new HTTPException(400, { message: "Tipo de upload invalido." });
+  }
+
+  const safeName = sanitizeOverrideFilename(uploadName);
   const lowerName = safeName.toLowerCase();
   const isZip = lowerName.endsWith(".zip");
   const isRar = lowerName.endsWith(".rar");
@@ -336,16 +520,14 @@ app.post("/panel-api/overrides/upload", async (c) => {
     throw new HTTPException(400, { message: "Fix override aceita arquivos .zip ou .rar." });
   }
 
-  const bytes = await file.arrayBuffer();
-  const sizeBytes = file.size || bytes.byteLength || 0;
   if (sizeBytes <= 0) {
-    throw new HTTPException(400, { message: "O arquivo enviado está vazio." });
+    throw new HTTPException(400, { message: "O arquivo enviado esta vazio." });
   }
 
   const folder = kind === "manifest" ? "manifests" : "fixes";
   const objectKey = `${appId}/${folder}/${safeName}`;
 
-  await c.env.MERLIN_FILES.put(objectKey, bytes, {
+  await c.env.MERLIN_FILES.put(objectKey, uploadBody, {
     httpMetadata: {
       contentType: detectUploadContentType(safeName),
       cacheControl: "no-store",
@@ -361,6 +543,60 @@ app.post("/panel-api/overrides/upload", async (c) => {
     sizeBytes,
     sizeLabel: formatUploadSize(sizeBytes),
   }, 200);
+});
+
+app.get("/panel-api/overrides/download", async (c) => {
+  await requireAdminSession(c);
+
+  const appId = String(c.req.query("appId") || "").trim();
+  const kind = String(c.req.query("kind") || "").trim();
+
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Invalid appId" });
+  }
+
+  if (kind !== "manifest" && kind !== "fix") {
+    throw new HTTPException(400, { message: "Invalid override kind" });
+  }
+
+  const overrides = await readOverrides(c.env);
+  const entry = overrides[appId];
+  if (!entry) {
+    throw new HTTPException(404, { message: "Override not found" });
+  }
+
+  const filePath = kind === "manifest"
+    ? entry.manifestOverride?.file
+    : entry.fixOverride?.file;
+
+  if (!filePath) {
+    throw new HTTPException(404, { message: "Override file not found" });
+  }
+
+  const object = await c.env.MERLIN_FILES.get(filePath);
+  if (!object) {
+    throw new HTTPException(404, { message: "Stored override file not found" });
+  }
+
+  const downloadName = sanitizeOverrideFilename(
+    kind === "fix"
+      ? entry.fixOverride?.filename || filePath.split("/").filter(Boolean).pop() || `${appId}.zip`
+      : filePath.split("/").filter(Boolean).pop() || `${appId}.zip`
+  );
+
+  const headers = new Headers();
+  if (typeof object.writeHttpMetadata === "function") {
+    object.writeHttpMetadata(headers);
+  } else {
+    headers.set("Content-Type", detectUploadContentType(downloadName));
+  }
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Disposition", `attachment; filename="${downloadName}"`);
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
 });
 
 app.delete("/panel-api/overrides/:appId", async (c) => {
