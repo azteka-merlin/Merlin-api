@@ -100,7 +100,10 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 			const response = await fetch(source.url, source.init);
 			if (response.ok) {
 				const zipResponse = await validatedZipResponse(response);
-				if (zipResponse) return zipResponse;
+				if (zipResponse) {
+					console.info(`${source.name} returned HTTP ${response.status}`);
+					return zipResponse;
+				}
 				console.warn(`${source.name} returned a non-ZIP payload`);
 				return null;
 			}
@@ -152,6 +155,13 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 			maxAttempts: 2,
 		});
 	}
+
+	sources.push({
+		name: "skyflare",
+		url: `https://raw.githubusercontent.com/skyflarefox/Skyapi/refs/heads/main/${appId}.zip`,
+		init: { headers: commonHeaders },
+		maxAttempts: 1,
+	});
 
 	const githubUrls = [
 		`https://codeload.github.com/SPIN0ZAi/SB_manifest_DB/zip/refs/heads/${appId}`,
