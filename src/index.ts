@@ -95,13 +95,33 @@ const overrideUploadInitSchema = z.object({
   filename: z.string().min(1),
   sizeBytes: z.number().int().positive(),
 });
+const merlinUpdateUploadInitSchema = z.object({
+  version: z.string().regex(/^\d+\.\d+\.\d+$/),
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+});
 const overrideUploadAbortSchema = z.object({
   appId: z.string().regex(/^\d+$/),
   kind: z.enum(["manifest", "fix"]),
   uploadId: z.string().min(1),
   objectKey: z.string().min(1),
 });
+const merlinUpdateUploadAbortSchema = z.object({
+  uploadId: z.string().min(1),
+  objectKey: z.string().min(1),
+});
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+  uploadedParts: z.array(
+    z.object({
+      partNumber: z.number().int().positive(),
+      etag: z.string().min(1),
+    }),
+  ).min(1),
+});
+const merlinUpdateUploadCompleteSchema = merlinUpdateUploadAbortSchema.extend({
+  version: z.string().regex(/^\d+\.\d+\.\d+$/),
   filename: z.string().min(1),
   sizeBytes: z.number().int().positive(),
   uploadedParts: z.array(
@@ -203,7 +223,11 @@ function formatUploadSize(bytes: number) {
   return `${amount >= 100 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
 }
 
-const OVERRIDE_UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+const OVERRIDE_UPLOAD_PART_SIZE = 16 * 1024 * 1024;
+const MERLIN_UPDATE_OBJECT_KEY = "_updates/Merlin-Setup-latest.exe";
+const MERLIN_UPDATE_LATEST_JSON_KEY = "_updates/latest.json";
+const PUBLIC_UPDATE_LATEST_URL = "https://api-merlin.com/api/updates/latest";
+const PUBLIC_UPDATE_DOWNLOAD_URL = "https://api-merlin.com/api/updates/download";
 
 function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", uploadName: string) {
   if (!/^\d+$/.test(appId)) {
@@ -229,6 +253,43 @@ function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", up
     folder,
     objectKey: `${appId}/${folder}/${safeName}`,
   };
+}
+
+function sanitizeMerlinUpdateFilename(fileName: string) {
+  const safeName = sanitizeOverrideFilename(fileName);
+  if (!/\.exe$/i.test(safeName)) {
+    throw new HTTPException(400, { message: "O instalador do Merlin deve ser um arquivo .exe." });
+  }
+  return safeName;
+}
+
+function buildMerlinUpdateMetadata(version: string, filename: string, sizeBytes: number) {
+  return {
+    version,
+    filename,
+    sizeBytes,
+    sizeLabel: formatUploadSize(sizeBytes),
+    objectKey: MERLIN_UPDATE_OBJECT_KEY,
+    latestUrl: PUBLIC_UPDATE_LATEST_URL,
+    downloadUrl: PUBLIC_UPDATE_DOWNLOAD_URL,
+    publishedAt: new Date().toISOString(),
+  };
+}
+
+async function readMerlinUpdateMetadata(env: AppBindings) {
+  const object = await env.MERLIN_FILES.get(MERLIN_UPDATE_LATEST_JSON_KEY);
+  if (!object) return null;
+
+  const raw = await object.text();
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.version !== "string" || typeof parsed.downloadUrl !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function validateOverrideUploadObjectKey(appId: string, kind: "manifest" | "fix", objectKey: string) {
@@ -597,6 +658,144 @@ app.get("/panel-api/overrides/download", async (c) => {
     status: 200,
     headers,
   });
+});
+
+app.get("/api/updates/latest", async (c) => {
+  const latest = await readMerlinUpdateMetadata(c.env);
+  if (!latest) {
+    return c.json({ success: false }, 404);
+  }
+
+  return c.json({
+    success: true,
+    version: latest.version,
+    filename: latest.filename,
+    sizeBytes: latest.sizeBytes || 0,
+    sizeLabel: latest.sizeLabel || formatUploadSize(Number(latest.sizeBytes) || 0),
+    downloadUrl: latest.downloadUrl || PUBLIC_UPDATE_DOWNLOAD_URL,
+    publishedAt: latest.publishedAt || null,
+  }, 200);
+});
+
+app.get("/api/updates/download", async (c) => {
+  const latest = await readMerlinUpdateMetadata(c.env);
+  if (!latest) {
+    throw new HTTPException(404, { message: "Update not found" });
+  }
+
+  const object = await c.env.MERLIN_FILES.get(MERLIN_UPDATE_OBJECT_KEY);
+  if (!object) {
+    throw new HTTPException(404, { message: "Stored update file not found" });
+  }
+
+  const downloadName = sanitizeMerlinUpdateFilename(latest.filename || `Merlin-Setup-${latest.version || "latest"}.exe`);
+  const headers = new Headers();
+  if (typeof object.writeHttpMetadata === "function") {
+    object.writeHttpMetadata(headers);
+  } else {
+    headers.set("Content-Type", "application/vnd.microsoft.portable-executable");
+  }
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Disposition", `attachment; filename="${downloadName}"`);
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
+});
+
+app.get("/panel-api/updates", async (c) => {
+  await requireAdminSession(c);
+  const latest = await readMerlinUpdateMetadata(c.env);
+  return c.json({ update: latest }, 200);
+});
+
+app.post("/panel-api/updates/upload/initiate", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(merlinUpdateUploadInitSchema, await c.req.json());
+  const safeName = sanitizeMerlinUpdateFilename(body.filename);
+
+  const upload = await c.env.MERLIN_FILES.createMultipartUpload(MERLIN_UPDATE_OBJECT_KEY, {
+    httpMetadata: {
+      contentType: "application/vnd.microsoft.portable-executable",
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    version: body.version,
+    uploadId: upload.uploadId,
+    objectKey: MERLIN_UPDATE_OBJECT_KEY,
+    filename: safeName,
+    partSize: OVERRIDE_UPLOAD_PART_SIZE,
+    sizeBytes: body.sizeBytes,
+    sizeLabel: formatUploadSize(body.sizeBytes),
+  }, 200);
+});
+
+app.post("/panel-api/updates/upload/part", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const uploadId = String(c.req.query("uploadId") || "").trim();
+  const objectKey = String(c.req.query("objectKey") || "").trim();
+  const partNumber = Number(c.req.query("partNumber") || "0");
+
+  if (!uploadId || !Number.isInteger(partNumber) || partNumber <= 0) {
+    throw new HTTPException(400, { message: "Invalid multipart upload request" });
+  }
+  if (objectKey !== MERLIN_UPDATE_OBJECT_KEY) {
+    throw new HTTPException(400, { message: "Invalid update upload target" });
+  }
+
+  const body = c.req.raw.body;
+  if (!body) {
+    throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+  }
+
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(MERLIN_UPDATE_OBJECT_KEY, uploadId);
+  const uploadedPart = await upload.uploadPart(partNumber, body);
+  return c.json(uploadedPart, 200);
+});
+
+app.post("/panel-api/updates/upload/complete", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(merlinUpdateUploadCompleteSchema, await c.req.json());
+
+  if (body.objectKey !== MERLIN_UPDATE_OBJECT_KEY) {
+    throw new HTTPException(400, { message: "Invalid update upload target" });
+  }
+
+  const safeName = sanitizeMerlinUpdateFilename(body.filename);
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(MERLIN_UPDATE_OBJECT_KEY, body.uploadId);
+  const uploadedParts = [...body.uploadedParts].sort((left, right) => left.partNumber - right.partNumber);
+  await upload.complete(uploadedParts);
+
+  const metadata = buildMerlinUpdateMetadata(body.version, safeName, body.sizeBytes);
+  await c.env.MERLIN_FILES.put(MERLIN_UPDATE_LATEST_JSON_KEY, JSON.stringify(metadata, null, 2), {
+    httpMetadata: {
+      contentType: "application/json; charset=utf-8",
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    update: metadata,
+  }, 200);
+});
+
+app.post("/panel-api/updates/upload/abort", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(merlinUpdateUploadAbortSchema, await c.req.json());
+  if (body.objectKey !== MERLIN_UPDATE_OBJECT_KEY) {
+    throw new HTTPException(400, { message: "Invalid update upload target" });
+  }
+
+  const upload = c.env.MERLIN_FILES.resumeMultipartUpload(MERLIN_UPDATE_OBJECT_KEY, body.uploadId);
+  await upload.abort();
+
+  return c.json({ success: true }, 200);
 });
 
 app.delete("/panel-api/overrides/:appId", async (c) => {
