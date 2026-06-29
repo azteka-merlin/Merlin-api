@@ -57,6 +57,14 @@ export async function getLicense(c: AppContext, id: number) {
   return license;
 }
 
+function normalizeStoredPhone(value: string) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if ((digits.length === 12 || digits.length === 13) && digits.startsWith("55")) {
+    return digits.slice(2);
+  }
+  return digits.slice(0, 11);
+}
+
 export async function createLicense(
   c: AppContext,
   input: { name: string; phone: string; expiresAt: string },
@@ -64,6 +72,13 @@ export async function createLicense(
 ) {
   const now = new Date().toISOString();
   const expiresAt = toIsoDateStart(input.expiresAt);
+  const normalizedPhone = normalizeStoredPhone(input.phone);
+  if (normalizedPhone.length !== 11) {
+    throw new HTTPException(400, { message: "A valid Brazilian cellphone number with area code is required" });
+  }
+  if (normalizedPhone.length !== 11) {
+    throw new HTTPException(400, { message: "A valid Brazilian cellphone number with area code is required" });
+  }
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
 
@@ -78,7 +93,7 @@ export async function createLicense(
             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
           `,
         )
-        .bind(licenseKey, input.name, input.phone, null, expiresAt, null, now, now)
+        .bind(licenseKey, input.name, normalizedPhone, null, expiresAt, null, now, now)
         .run();
       break;
     } catch (error) {
@@ -112,6 +127,7 @@ export async function updateLicense(
 ) {
   const current = await getLicense(c, id);
   const nextHwid = input.hwid?.trim() || null;
+  const normalizedPhone = normalizeStoredPhone(input.phone);
   await c.env.merlin_db
     .prepare(
       `
@@ -120,7 +136,7 @@ export async function updateLicense(
         WHERE id = ?
       `,
     )
-    .bind(input.name, input.phone, nextHwid, toIsoDateStart(input.expiresAt), new Date().toISOString(), current.id)
+    .bind(input.name, normalizedPhone, nextHwid, toIsoDateStart(input.expiresAt), new Date().toISOString(), current.id)
     .run();
 
   const updated = await getLicense(c, id);
