@@ -55,6 +55,10 @@ const SOURCE_IMAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const STEAM_NO_IMAGE_CACHE_TTL_MS = 60 * 1000;
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 const STEAM_INVALID_APP_TYPE = "__invalid__";
+const SEARCH_SOURCE_TIMEOUT_MS = 3_000;
+const STEAM_SEARCH_TIMEOUT_MS = 2_500;
+const CATALOG_QUERY_MISS_CACHE_TTL_MS = 5 * 60 * 1000;
+const DEPOT_QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
 const NON_PLAYABLE_NAME_PATTERNS = [
 	/\bcreation kit\b/i,
 	/\bscript extender\b/i,
@@ -102,12 +106,79 @@ let steamDetailsCache = new Map<string, {
 	coverSource: string | null;
 }>();
 
+let catalogMissCache = new Map<string, number>();
+
+let depotSearchCache = new Map<string, {
+	expiresAt: number;
+	items: SearchItem[];
+}>();
+
 function parseBearerToken(request: Request): string | null {
 	const header = request.headers.get("authorization");
 	if (!header) return null;
 
 	const [scheme, token] = header.split(" ");
 	return scheme === "Bearer" && token ? token : null;
+}
+
+async function fetchWithTimeout(
+	input: RequestInfo | URL,
+	init: RequestInit = {},
+	timeoutMs = SEARCH_SOURCE_TIMEOUT_MS
+): Promise<Response> {
+	const controller = new AbortController();
+	const timeoutHandle = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+	try {
+		return await fetch(input, {
+			...init,
+			signal: controller.signal,
+		});
+	} finally {
+		clearTimeout(timeoutHandle);
+	}
+}
+
+function normalizeSearchKey(searchTerm: string, limit: number): string {
+	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}`;
+}
+
+function hasFreshCatalogMiss(searchTerm: string, limit: number): boolean {
+	const key = normalizeSearchKey(searchTerm, limit);
+	const expiresAt = catalogMissCache.get(key) || 0;
+	if (expiresAt > Date.now()) {
+		return true;
+	}
+	catalogMissCache.delete(key);
+	return false;
+}
+
+function recordCatalogMiss(searchTerm: string, limit: number): void {
+	catalogMissCache.set(
+		normalizeSearchKey(searchTerm, limit),
+		Date.now() + CATALOG_QUERY_MISS_CACHE_TTL_MS
+	);
+}
+
+function clearCatalogMiss(searchTerm: string, limit: number): void {
+	catalogMissCache.delete(normalizeSearchKey(searchTerm, limit));
+}
+
+function getCachedDepotSearch(searchTerm: string, limit: number): SearchItem[] | null {
+	const key = normalizeSearchKey(searchTerm, limit);
+	const cached = depotSearchCache.get(key);
+	if (cached && cached.expiresAt > Date.now()) {
+		return cached.items.map((item) => ({ ...item }));
+	}
+	depotSearchCache.delete(key);
+	return null;
+}
+
+function setCachedDepotSearch(searchTerm: string, limit: number, items: SearchItem[]): void {
+	depotSearchCache.set(normalizeSearchKey(searchTerm, limit), {
+		expiresAt: Date.now() + DEPOT_QUERY_CACHE_TTL_MS,
+		items: items.map((item) => ({ ...item })),
+	});
 }
 
 function normalizeDepotboxGame(entry: unknown): SearchItem | null {
@@ -169,23 +240,23 @@ async function isUsableSourceCoverUrl(url: string): Promise<boolean> {
 	let ok = false;
 
 	try {
-		let response = await fetch(url, {
+		let response = await fetchWithTimeout(url, {
 			method: "HEAD",
 			headers: {
 				Accept: "image/*",
 				"User-Agent": USER_AGENT,
 			},
-		});
+		}, STEAM_SEARCH_TIMEOUT_MS);
 
 		if (!response.ok && (response.status === 403 || response.status === 405)) {
 			await response.body?.cancel();
-			response = await fetch(url, {
+			response = await fetchWithTimeout(url, {
 				headers: {
 					Accept: "image/*",
 					Range: "bytes=0-0",
 					"User-Agent": USER_AGENT,
 				},
-			});
+			}, STEAM_SEARCH_TIMEOUT_MS);
 		}
 
 		const contentType = String(response.headers.get("content-type") || "").trim().toLocaleLowerCase();
@@ -214,25 +285,82 @@ function scoreMatch(game: SearchItem, normalizedQuery: string): number {
 	return -1;
 }
 
-function isLikelyPlayableSteamApp(details: {
+function pushTopCatalogMatch(
+	matches: Array<SearchItem & { score: number }>,
+	candidate: SearchItem & { score: number },
+	limit: number
+): void {
+	let insertAt = matches.length;
+	for (let index = 0; index < matches.length; index += 1) {
+		const current = matches[index];
+		if (!current) continue;
+		if (
+			candidate.score > current.score
+			|| (
+				candidate.score === current.score
+				&& (
+					candidate.name.localeCompare(current.name) < 0
+					|| (
+						candidate.name === current.name
+						&& candidate.appId.localeCompare(current.appId) < 0
+					)
+				)
+			)
+		) {
+			insertAt = index;
+			break;
+		}
+	}
+
+	if (insertAt >= limit && matches.length >= limit) {
+		return;
+	}
+
+	matches.splice(insertAt, 0, candidate);
+	if (matches.length > limit) {
+		matches.length = limit;
+	}
+}
+
+function findTopCatalogMatches(items: SearchItem[], normalizedQuery: string, limit: number): SearchItem[] {
+	const safeLimit = Math.max(1, Math.trunc(Number(limit) || 0));
+	const matches: Array<SearchItem & { score: number }> = [];
+
+	for (const item of items) {
+		const score = scoreMatch(item, normalizedQuery);
+		if (score < 0) continue;
+		pushTopCatalogMatch(matches, { ...item, score }, safeLimit);
+	}
+
+	return matches.map(({ score, ...item }) => item);
+}
+
+function matchesDepotHeavyFilters(details: {
+	name: string | null;
+	shortDescription: string | null;
+}): boolean {
+	const name = String(details.name || "").trim();
+	const shortDescription = String(details.shortDescription || "").trim();
+	const haystack = `${name} ${shortDescription}`;
+
+	if (NON_PLAYABLE_DESCRIPTION_PATTERNS.some((pattern) => pattern.test(shortDescription))) {
+		return true;
+	}
+
+	return NON_PLAYABLE_NAME_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function isLikelyPlayableDepotCandidate(details: {
 	type: string | null;
 	name: string | null;
 	shortDescription: string | null;
 }): boolean {
 	const type = String(details.type || "").trim().toLocaleLowerCase();
-	const name = String(details.name || "").trim();
-	const shortDescription = String(details.shortDescription || "").trim();
-	const haystack = `${name} ${shortDescription}`;
-
 	if (type && type !== "game") {
 		return false;
 	}
 
-	if (NON_PLAYABLE_DESCRIPTION_PATTERNS.some((pattern) => pattern.test(shortDescription))) {
-		return false;
-	}
-
-	return !NON_PLAYABLE_NAME_PATTERNS.some((pattern) => pattern.test(haystack));
+	return !matchesDepotHeavyFilters(details);
 }
 
 async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[]> {
@@ -261,12 +389,12 @@ async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[
 			url.searchParams.set("appids", appIdsToFetch.join(","));
 			url.searchParams.set("filters", "basic");
 
-			const response = await fetch(url.toString(), {
+			const response = await fetchWithTimeout(url.toString(), {
 				headers: {
 					Accept: "application/json",
 					"User-Agent": USER_AGENT,
 				},
-			});
+			}, STEAM_SEARCH_TIMEOUT_MS);
 
 			if (response.ok) {
 				const payload = await response.json() as Record<string, SteamBasicAppDetails>;
@@ -315,14 +443,8 @@ async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[
 		}
 	}
 
-	const playableItems = items.filter((item) => {
-		const cached = steamDetailsCache.get(item.appId);
-		if (!cached) return true;
-		return isLikelyPlayableSteamApp(cached);
-	});
-
 	return Promise.all(
-		playableItems.map(async (item) => {
+		items.map(async (item) => {
 			const cached = steamDetailsCache.get(item.appId);
 			if (cached?.coverUrl) {
 				return {
@@ -375,12 +497,12 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 			url.searchParams.set("appids", appIdsToFetch.join(","));
 			url.searchParams.set("filters", "basic");
 
-			const response = await fetch(url.toString(), {
+			const response = await fetchWithTimeout(url.toString(), {
 				headers: {
 					Accept: "application/json",
 					"User-Agent": USER_AGENT,
 				},
-			});
+			}, STEAM_SEARCH_TIMEOUT_MS);
 
 			if (response.ok) {
 				steamFetchSucceeded = true;
@@ -432,12 +554,18 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 
 	const validatedItems = items.filter((item) => {
 		const cached = steamDetailsCache.get(item.appId);
-		return Boolean(cached && isLikelyPlayableSteamApp(cached));
+		if (cached) {
+			return isLikelyPlayableDepotCandidate(cached);
+		}
+
+		return !matchesDepotHeavyFilters({
+			name: item.name,
+			shortDescription: null,
+		});
 	});
 
-	if (!steamFetchSucceeded && validatedItems.length === 0) {
-		console.warn("[games-search] depotbox fallback produced no Steam-validated results because Steam validation is unavailable");
-		return [];
+	if (!steamFetchSucceeded && validatedItems.length > 0) {
+		console.warn("[games-search] depotbox fallback is using heavy-filtered results because Steam validation is unavailable");
 	}
 
 	return Promise.all(
@@ -518,39 +646,53 @@ async function requireActiveViewerLicense(c: AppContext): Promise<void> {
 async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: number): Promise<SearchItem[]> {
 	if (!env.DEPOTBOX_API_KEY) return [];
 
-	const response = await fetch(DEPOTBOX_SEARCH_URL, {
-		method: "POST",
-		headers: {
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			"User-Agent": USER_AGENT,
-			"X-API-Key": env.DEPOTBOX_API_KEY,
-		},
-		body: JSON.stringify({
-			searchTerm,
-			limit,
-			filter_dlc: "exclude",
-		}),
-	});
-
-	if (!response.ok) {
-		console.warn(`[games-search] depotbox returned HTTP ${response.status}`);
-		await response.body?.cancel();
-		return [];
+	const cached = getCachedDepotSearch(searchTerm, limit);
+	if (cached) {
+		return cached;
 	}
 
-	const payload = await response.json() as { success?: boolean; games?: unknown[] };
-	if (!Array.isArray(payload.games)) {
-		console.warn("[games-search] depotbox returned an invalid payload");
+	try {
+		const response = await fetchWithTimeout(DEPOTBOX_SEARCH_URL, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				"User-Agent": USER_AGENT,
+				"X-API-Key": env.DEPOTBOX_API_KEY,
+			},
+			body: JSON.stringify({
+				searchTerm,
+				limit,
+				filter_dlc: "exclude",
+			}),
+		}, SEARCH_SOURCE_TIMEOUT_MS);
+
+		if (!response.ok) {
+			console.warn(`[games-search] depotbox returned HTTP ${response.status}`);
+			await response.body?.cancel();
+			setCachedDepotSearch(searchTerm, limit, []);
+			return [];
+		}
+
+		const payload = await response.json() as { success?: boolean; games?: unknown[] };
+		if (!Array.isArray(payload.games)) {
+			console.warn("[games-search] depotbox returned an invalid payload");
+			setCachedDepotSearch(searchTerm, limit, []);
+			return [];
+		}
+
+		const items = payload.games
+			.map(normalizeDepotboxGame)
+			.filter((item): item is SearchItem => Boolean(item))
+			.slice(0, limit);
+
+		const validatedItems = await validateDepotboxResultsWithSteam(items);
+		setCachedDepotSearch(searchTerm, limit, validatedItems);
+		return validatedItems;
+	} catch (error) {
+		console.warn("[games-search] depotbox request failed:", error instanceof Error ? error.message : "unknown error");
 		return [];
 	}
-
-	const items = payload.games
-		.map(normalizeDepotboxGame)
-		.filter((item): item is SearchItem => Boolean(item))
-		.slice(0, limit);
-
-	return validateDepotboxResultsWithSteam(items);
 }
 
 async function loadFallbackCatalog(): Promise<SearchItem[]> {
@@ -558,12 +700,12 @@ async function loadFallbackCatalog(): Promise<SearchItem[]> {
 		return gamesCatalogCache.items;
 	}
 
-	const response = await fetch(FALLBACK_GAMES_CATALOG_URL, {
+	const response = await fetchWithTimeout(FALLBACK_GAMES_CATALOG_URL, {
 		headers: {
 			Accept: "application/json",
 			"User-Agent": USER_AGENT,
 		},
-	});
+	}, SEARCH_SOURCE_TIMEOUT_MS);
 
 	if (!response.ok) {
 		throw new Error(`Fallback catalog returned HTTP ${response.status}`);
@@ -589,24 +731,25 @@ async function loadFallbackCatalog(): Promise<SearchItem[]> {
 async function searchFallbackCatalog(searchTerm: string, limit: number): Promise<SearchItem[]> {
 	const normalizedQuery = searchTerm.trim().toLocaleLowerCase();
 	if (!normalizedQuery) return [];
+	if (hasFreshCatalogMiss(normalizedQuery, limit)) return [];
 
 	const items = await loadFallbackCatalog();
-	return enrichWithSteamMetadata(
-		items
-		.map((item) => ({ ...item, score: scoreMatch(item, normalizedQuery) }))
-		.filter((item) => item.score >= 0)
-		.sort((left, right) => right.score - left.score
-			|| left.name.localeCompare(right.name)
-			|| left.appId.localeCompare(right.appId))
-		.slice(0, limit)
-		.map(({ score, ...item }) => item)
-	);
+	const topMatches = findTopCatalogMatches(items, normalizedQuery, limit);
+	const enrichedItems = await enrichWithSteamMetadata(topMatches);
+
+	if (enrichedItems.length === 0) {
+		recordCatalogMiss(normalizedQuery, limit);
+	} else {
+		clearCatalogMiss(normalizedQuery, limit);
+	}
+
+	return enrichedItems;
 }
 
 export class GamesSearchRoute extends OpenAPIRoute {
 	schema = {
 		tags: ["Games"],
-		summary: "Search games using the catalog first and Depotbox as a Steam-validated fallback",
+		summary: "Search games using the catalog first and Depotbox as a filtered fallback",
 		security: [{ bearerAuth: [] }],
 		request: {
 			body: {
