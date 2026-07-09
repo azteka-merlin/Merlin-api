@@ -44,8 +44,27 @@ export const ManifestQuery = z.object({
 	appid: z.string().min(1),
 });
 
+export const GameSearchRequest = z.object({
+	searchTerm: z.string().min(1),
+	limit: z.coerce.number().int().min(1).max(100).optional().default(25),
+});
+
+export const GameSearchItem = z.object({
+	appId: z.string().regex(/^\d+$/),
+	name: z.string().min(1),
+	coverUrl: z.string().url().nullable().optional(),
+	coverSource: z.string().min(1).nullable().optional(),
+});
+
+export const GameSearchResponse = z.object({
+	success: z.literal(true),
+	source: z.enum(["depotbox", "catalog"]),
+	items: z.array(GameSearchItem),
+});
+
 export const FixDownloadQuery = z.object({
 	appid: z.string().regex(/^\d+$/),
+	source: z.enum(["override", "depotbox"]).optional(),
 });
 
 export const CorrectionVoteValue = z.enum(["up", "down"]);

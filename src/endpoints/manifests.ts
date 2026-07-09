@@ -7,6 +7,7 @@ import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, ManifestQuery } from "../types";
 
 type ManifestEnv = {
+	DEPOTBOX_API_KEY?: string;
 	RYU_API_URL?: string;
 	RYUU_AUTH_CODE?: string;
 	HUBCAP_TOKEN?: string;
@@ -18,6 +19,7 @@ type ManifestSource = {
 	url: string;
 	init: RequestInit;
 	maxAttempts: number;
+	timeoutMs?: number;
 };
 
 type LicenseLookup = {
@@ -31,6 +33,9 @@ type LicenseLookup = {
 
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
+const SOURCE_TIMEOUT_MS = 10_000;
+const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
+const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
 
 function parseBearerToken(request: Request): string | null {
 	const header = request.headers.get("authorization");
@@ -96,8 +101,13 @@ async function validatedZipResponse(response: Response): Promise<Response | null
 
 async function fetchSource(source: ManifestSource): Promise<Response | null> {
 	for (let attempt = 1; attempt <= source.maxAttempts; attempt += 1) {
+		const controller = new AbortController();
+		const timeoutHandle = setTimeout(() => controller.abort("timeout"), source.timeoutMs || SOURCE_TIMEOUT_MS);
 		try {
-			const response = await fetch(source.url, source.init);
+			const response = await fetch(source.url, {
+				...source.init,
+				signal: controller.signal,
+			});
 			if (response.ok) {
 				const zipResponse = await validatedZipResponse(response);
 				if (zipResponse) {
@@ -113,6 +123,8 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 			if (!isRetryableStatus(response.status)) return null;
 		} catch (error) {
 			console.warn(`${source.name} request failed:`, error instanceof Error ? error.message : "unknown error");
+		} finally {
+			clearTimeout(timeoutHandle);
 		}
 
 		if (attempt < source.maxAttempts) {
@@ -138,7 +150,26 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 			name: "ryu",
 			url: ryuUrl.toString(),
 			init: { headers: commonHeaders },
-			maxAttempts: 2,
+			maxAttempts: 1,
+			timeoutMs: SOURCE_TIMEOUT_MS,
+		});
+	}
+
+	if (env.DEPOTBOX_API_KEY) {
+		sources.push({
+			name: "depotbox",
+			url: DEPOTBOX_DIRECT_DOWNLOAD_URL,
+			init: {
+				method: "POST",
+				headers: {
+					...commonHeaders,
+					"Content-Type": "application/json",
+					"X-API-Key": env.DEPOTBOX_API_KEY,
+				},
+				body: JSON.stringify({ appid: appId }),
+			},
+			maxAttempts: 1,
+			timeoutMs: SOURCE_TIMEOUT_MS,
 		});
 	}
 
@@ -152,7 +183,8 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 					Authorization: `Bearer ${env.HUBCAP_TOKEN}`,
 				},
 			},
-			maxAttempts: 2,
+			maxAttempts: 1,
+			timeoutMs: SOURCE_TIMEOUT_MS,
 		});
 	}
 
@@ -161,6 +193,7 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 		url: `https://raw.githubusercontent.com/skyflarefox/Skyapi/refs/heads/main/${appId}.zip`,
 		init: { headers: commonHeaders },
 		maxAttempts: 1,
+		timeoutMs: FALLBACK_SOURCE_TIMEOUT_MS,
 	});
 
 	const githubUrls = [
@@ -174,6 +207,7 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 			url,
 			init: { headers: commonHeaders },
 			maxAttempts: 1,
+			timeoutMs: FALLBACK_SOURCE_TIMEOUT_MS,
 		});
 	}
 

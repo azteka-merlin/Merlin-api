@@ -89,6 +89,16 @@ function buildDownloadHref(request: Request, appId: string): string {
   return url.toString();
 }
 
+function isDepotboxCorrectionHref(href: string): boolean {
+  try {
+    const url = new URL(href);
+    return url.origin === "https://depotbox.org"
+      && url.pathname === "/api/direct-download";
+  } catch {
+    return false;
+  }
+}
+
 async function getViewerLicenseId(c: AppContext): Promise<number | null> {
   const accessToken = parseBearerToken(c.req.raw);
   if (!accessToken || !c.env.JWT_SECRET) return null;
@@ -151,6 +161,21 @@ export class FixesCatalogRoute extends OpenAPIRoute {
 
     const overrides = await readOverrides(c.env);
     const byAppId = new Map(remoteEntries.map((entry) => [entry.appid, entry]));
+    const depotboxApiKey = typeof c.env.DEPOTBOX_API_KEY === "string" ? c.env.DEPOTBOX_API_KEY.trim() : "";
+
+    if (depotboxApiKey) {
+      for (const [appId, entry] of byAppId.entries()) {
+        byAppId.set(appId, {
+          ...entry,
+          fixes: entry.fixes.map((fix) => ({
+            ...fix,
+            href: isDepotboxCorrectionHref(fix.href)
+              ? `${buildDownloadHref(c.req.raw, appId)}&source=depotbox`
+              : fix.href,
+          })),
+        });
+      }
+    }
 
     for (const [appId, entry] of Object.entries(overrides)) {
       const fixOverride = entry.fixOverride;

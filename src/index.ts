@@ -6,6 +6,7 @@ import { z } from "zod";
 import { FixesCatalogRoute } from "./endpoints/fixes-catalog";
 import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
+import { GamesSearchRoute } from "./endpoints/games-search";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
@@ -894,6 +895,7 @@ app.post("/panel-api/licenses/:id/reset-hwid", async (c) => {
 
 openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
+openapi.post("/api/games/search", GamesSearchRoute);
 app.get("/api/manifests/status", async (c) => {
   const authorization = c.req.header("authorization") || "";
   const [scheme, token] = authorization.split(" ");

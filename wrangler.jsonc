@@ -67,6 +67,7 @@
 	],
 	"secrets": {
 		"required": [
+			"DEPOTBOX_API_KEY",
 			"RYUU_AUTH_CODE",
 			"HUBCAP_TOKEN",
 			"JWT_SECRET",

@@ -9,6 +9,7 @@ interface __BaseEnv_Env {
 	ADMIN_RATE_LIMITER: RateLimit;
 	ASSETS: Fetcher;
 	RYU_API_URL: "https://generator.ryuu.lol/secure_download";
+	DEPOTBOX_API_KEY: string;
 	RYUU_AUTH_CODE: string;
 	HUBCAP_TOKEN: string;
 	JWT_SECRET: string;
@@ -25,7 +26,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RYU_API_URL" | "RYUU_AUTH_CODE" | "HUBCAP_TOKEN" | "JWT_SECRET" | "SESSION_HASH_SECRET">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RYU_API_URL" | "DEPOTBOX_API_KEY" | "RYUU_AUTH_CODE" | "HUBCAP_TOKEN" | "JWT_SECRET" | "SESSION_HASH_SECRET">> {}
 }
 
 // Begin runtime types
