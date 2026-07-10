@@ -222,65 +222,69 @@ function normalizeFallbackCatalogGame(entry: unknown): SearchItem | null {
 	};
 }
 
-function scoreMatch(game: SearchItem, normalizedQuery: string): number {
-	const name = game.name.toLocaleLowerCase();
-	const appId = game.appId;
-	if (!normalizedQuery) return -1;
-	if (appId === normalizedQuery) return 4000;
-	if (name.startsWith(normalizedQuery)) return 3000 - name.length;
-	if (name.includes(normalizedQuery)) return 2000 - name.indexOf(normalizedQuery);
-	if (/^\d+$/.test(normalizedQuery) && appId.startsWith(normalizedQuery)) return 1000 - appId.length;
-	return -1;
+function normalizeGameSearchText(value: string): string {
+	return String(value || "")
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.replace(/[^\p{L}\p{N}\s]+/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLocaleLowerCase();
 }
 
-function pushTopCatalogMatch(
-	matches: Array<SearchItem & { score: number }>,
-	candidate: SearchItem & { score: number },
-	limit: number
-): void {
-	let insertAt = matches.length;
-	for (let index = 0; index < matches.length; index += 1) {
-		const current = matches[index];
-		if (!current) continue;
-		if (
-			candidate.score > current.score
-			|| (
-				candidate.score === current.score
-				&& (
-					candidate.name.localeCompare(current.name) < 0
-					|| (
-						candidate.name === current.name
-						&& candidate.appId.localeCompare(current.appId) < 0
-					)
-				)
-			)
-		) {
-			insertAt = index;
-			break;
-		}
-	}
-
-	if (insertAt >= limit && matches.length >= limit) {
-		return;
-	}
-
-	matches.splice(insertAt, 0, candidate);
-	if (matches.length > limit) {
-		matches.length = limit;
-	}
+function appIdRank(appId: string, query: string): number {
+	if (appId === query) return 0;
+	if (appId.startsWith(query)) return 1;
+	if (appId.includes(query)) return 2;
+	return 3;
 }
 
-function findTopCatalogMatches(items: SearchItem[], normalizedQuery: string, limit: number): SearchItem[] {
+function searchCatalogLikeRyu(items: SearchItem[], searchTerm: string, limit: number): SearchItem[] {
 	const safeLimit = Math.max(1, Math.trunc(Number(limit) || 0));
-	const matches: Array<SearchItem & { score: number }> = [];
+	const query = String(searchTerm || "").trim();
+	if (!query) return [];
 
-	for (const item of items) {
-		const score = scoreMatch(item, normalizedQuery);
-		if (score < 0) continue;
-		pushTopCatalogMatch(matches, { ...item, score }, safeLimit);
-	}
+	const normalizedQuery = normalizeGameSearchText(query);
+	const lowerQuery = query.toLocaleLowerCase();
+	const isDigitsOnly = /^\d+$/.test(query);
 
-	return matches.map(({ score, ...item }) => item);
+	const matches = items.filter((item) => {
+		const appId = item.appId;
+		const name = item.name;
+		if (appId.includes(query)) return true;
+		if (normalizedQuery && normalizeGameSearchText(name).includes(normalizedQuery)) return true;
+		return name.toLocaleLowerCase().includes(lowerQuery);
+	});
+
+	matches.sort((a, b) => {
+		const appIdA = a.appId;
+		const appIdB = b.appId;
+		const nameA = a.name;
+		const nameB = b.name;
+
+		if (isDigitsOnly) {
+			const rankA = appIdRank(appIdA, query);
+			const rankB = appIdRank(appIdB, query);
+			if (rankA !== rankB) return rankA - rankB;
+			if (rankA <= 2) {
+				return (parseInt(appIdA, 10) || 0) - (parseInt(appIdB, 10) || 0);
+			}
+		}
+
+		if (normalizedQuery) {
+			const normalizedNameA = normalizeGameSearchText(nameA);
+			const normalizedNameB = normalizeGameSearchText(nameB);
+			const hitA = normalizedNameA.includes(normalizedQuery);
+			const hitB = normalizedNameB.includes(normalizedQuery);
+			if (hitA !== hitB) return hitA ? -1 : 1;
+			const byLength = normalizedNameA.length - normalizedNameB.length;
+			if (byLength !== 0) return byLength;
+		}
+
+		return (parseInt(appIdA, 10) || 0) - (parseInt(appIdB, 10) || 0);
+	});
+
+	return matches.slice(0, safeLimit);
 }
 
 function matchesDepotHeavyFilters(details: {
@@ -655,18 +659,18 @@ async function loadFallbackCatalog(): Promise<SearchItem[]> {
 }
 
 async function searchFallbackCatalog(searchTerm: string, limit: number): Promise<SearchItem[]> {
-	const normalizedQuery = searchTerm.trim().toLocaleLowerCase();
-	if (!normalizedQuery) return [];
-	if (hasFreshCatalogMiss(normalizedQuery, limit)) return [];
+	const query = searchTerm.trim();
+	if (!query) return [];
+	if (hasFreshCatalogMiss(query, limit)) return [];
 
 	const items = await loadFallbackCatalog();
-	const topMatches = findTopCatalogMatches(items, normalizedQuery, limit);
-	const enrichedItems = await finalizeCatalogItems(topMatches);
+	const matches = searchCatalogLikeRyu(items, query, limit);
+	const enrichedItems = await finalizeCatalogItems(matches);
 
 	if (enrichedItems.length === 0) {
-		recordCatalogMiss(normalizedQuery, limit);
+		recordCatalogMiss(query, limit);
 	} else {
-		clearCatalogMiss(normalizedQuery, limit);
+		clearCatalogMiss(query, limit);
 	}
 
 	return enrichedItems;
