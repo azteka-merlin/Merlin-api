@@ -664,6 +664,7 @@ async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: num
 				searchTerm,
 				limit,
 				filter_dlc: "exclude",
+				filter_availability: true,
 			}),
 		}, SEARCH_SOURCE_TIMEOUT_MS);
 
