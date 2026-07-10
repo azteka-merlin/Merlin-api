@@ -51,7 +51,6 @@ const USER_AGENT = "Merlin/2.0";
 const DEPOTBOX_SEARCH_URL = "https://depotbox.org/api/search-games";
 const FALLBACK_GAMES_CATALOG_URL = "https://generator.ryuu.lol/files/games.json";
 const GAMES_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
-const SOURCE_IMAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const STEAM_NO_IMAGE_CACHE_TTL_MS = 60 * 1000;
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 const STEAM_INVALID_APP_TYPE = "__invalid__";
@@ -91,11 +90,6 @@ let gamesCatalogCache: {
 	expiresAt: 0,
 	items: [],
 };
-
-let sourceImageValidationCache = new Map<string, {
-	expiresAt: number;
-	ok: boolean;
-}>();
 
 let steamDetailsCache = new Map<string, {
 	expiresAt: number;
@@ -228,52 +222,6 @@ function normalizeFallbackCatalogGame(entry: unknown): SearchItem | null {
 	};
 }
 
-async function isUsableSourceCoverUrl(url: string): Promise<boolean> {
-	url = String(url || "").trim();
-	if (!url) return false;
-
-	const cached = sourceImageValidationCache.get(url);
-	if (cached && cached.expiresAt > Date.now()) {
-		return cached.ok;
-	}
-
-	let ok = false;
-
-	try {
-		let response = await fetchWithTimeout(url, {
-			method: "HEAD",
-			headers: {
-				Accept: "image/*",
-				"User-Agent": USER_AGENT,
-			},
-		}, STEAM_SEARCH_TIMEOUT_MS);
-
-		if (!response.ok && (response.status === 403 || response.status === 405)) {
-			await response.body?.cancel();
-			response = await fetchWithTimeout(url, {
-				headers: {
-					Accept: "image/*",
-					Range: "bytes=0-0",
-					"User-Agent": USER_AGENT,
-				},
-			}, STEAM_SEARCH_TIMEOUT_MS);
-		}
-
-		const contentType = String(response.headers.get("content-type") || "").trim().toLocaleLowerCase();
-		ok = response.ok && (!contentType || contentType.startsWith("image/"));
-		await response.body?.cancel();
-	} catch {
-		ok = false;
-	}
-
-	sourceImageValidationCache.set(url, {
-		expiresAt: Date.now() + SOURCE_IMAGE_CACHE_TTL_MS,
-		ok,
-	});
-
-	return ok;
-}
-
 function scoreMatch(game: SearchItem, normalizedQuery: string): number {
 	const name = game.name.toLocaleLowerCase();
 	const appId = game.appId;
@@ -363,7 +311,7 @@ function isLikelyPlayableDepotCandidate(details: {
 	return !matchesDepotHeavyFilters(details);
 }
 
-async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[]> {
+async function finalizeCatalogItems(items: SearchItem[]): Promise<SearchItem[]> {
 	if (items.length === 0) {
 		return items;
 	}
@@ -371,15 +319,11 @@ async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[
 	const now = Date.now();
 	const appIdsToFetch = [...new Set(
 		items
+			.filter((item) => !item.coverUrl)
 			.map((item) => item.appId)
 			.filter((appId) => {
 				const cached = steamDetailsCache.get(appId);
-				const sourceItem = items.find((item) => item.appId === appId);
-				const sourceHasCover = Boolean(sourceItem?.coverUrl);
-				return !cached
-					|| cached.expiresAt <= now
-					|| !cached.type
-					|| (!cached.coverUrl && !sourceHasCover);
+				return !cached || cached.expiresAt <= now || !cached.coverUrl;
 			})
 	)];
 
@@ -401,17 +345,6 @@ async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[
 				for (const appId of appIdsToFetch) {
 					const details = payload?.[appId];
 					const hasBasicData = details?.success === true && details?.data;
-					const type = hasBasicData
-						? typeof details.data?.type === "string"
-							? details.data.type.trim().toLocaleLowerCase()
-							: null
-						: STEAM_INVALID_APP_TYPE;
-					const name = typeof details?.data?.name === "string"
-						? details.data.name.trim()
-						: null;
-					const shortDescription = typeof details?.data?.short_description === "string"
-						? details.data.short_description.trim()
-						: null;
 					const capsuleImage = typeof details?.data?.capsule_image === "string"
 						? details.data.capsule_image.trim()
 						: "";
@@ -427,52 +360,44 @@ async function enrichWithSteamMetadata(items: SearchItem[]): Promise<SearchItem[
 
 					steamDetailsCache.set(appId, {
 						expiresAt: now + (coverUrl ? GAMES_CATALOG_CACHE_TTL_MS : STEAM_NO_IMAGE_CACHE_TTL_MS),
-						type,
-						name,
-						shortDescription,
+						type: hasBasicData && typeof details.data?.type === "string"
+							? details.data.type.trim().toLocaleLowerCase()
+							: null,
+						name: hasBasicData && typeof details.data?.name === "string"
+							? details.data.name.trim()
+							: null,
+						shortDescription: hasBasicData && typeof details.data?.short_description === "string"
+							? details.data.short_description.trim()
+							: null,
 						coverUrl,
 						coverSource,
 					});
 				}
 			} else {
-				console.warn(`[games-search] steam appdetails returned HTTP ${response.status}`);
+				console.warn(`[games-search] steam image lookup returned HTTP ${response.status}`);
 				await response.body?.cancel();
 			}
 		} catch (error) {
-			console.warn("[games-search] steam appdetails request failed:", error instanceof Error ? error.message : "unknown error");
+			console.warn("[games-search] steam image lookup failed:", error instanceof Error ? error.message : "unknown error");
 		}
 	}
 
-	return Promise.all(
-		items.map(async (item) => {
-			const cached = steamDetailsCache.get(item.appId);
-			if (cached?.coverUrl) {
-				return {
-					...item,
-					name: cached.name || item.name,
-					coverUrl: cached.coverUrl,
-					coverSource: cached.coverSource,
-				};
-			}
+	return items.map((item) => {
+		const cached = steamDetailsCache.get(item.appId);
+		if (item.coverUrl) {
+			return item;
+		}
 
-			const sourceCoverUrl = typeof item.coverUrl === "string" ? item.coverUrl.trim() : "";
-			if (sourceCoverUrl && await isUsableSourceCoverUrl(sourceCoverUrl)) {
-				return {
-					...item,
-					name: cached?.name || item.name,
-					coverUrl: sourceCoverUrl,
-					coverSource: item.coverSource || null,
-				};
-			}
-
+		if (cached?.coverUrl) {
 			return {
 				...item,
-				name: cached?.name || item.name,
-				coverUrl: null,
-				coverSource: null,
+				coverUrl: cached.coverUrl,
+				coverSource: cached.coverSource,
 			};
-		})
-	);
+		}
+
+		return item;
+	});
 }
 
 async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<SearchItem[]> {
@@ -582,7 +507,7 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 				};
 			}
 
-			if (sourceCoverUrl && await isUsableSourceCoverUrl(sourceCoverUrl)) {
+			if (sourceCoverUrl) {
 				return {
 					...item,
 					name: cached?.name || item.name,
@@ -736,7 +661,7 @@ async function searchFallbackCatalog(searchTerm: string, limit: number): Promise
 
 	const items = await loadFallbackCatalog();
 	const topMatches = findTopCatalogMatches(items, normalizedQuery, limit);
-	const enrichedItems = await enrichWithSteamMetadata(topMatches);
+	const enrichedItems = await finalizeCatalogItems(topMatches);
 
 	if (enrichedItems.length === 0) {
 		recordCatalogMiss(normalizedQuery, limit);
