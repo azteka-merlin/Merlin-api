@@ -1,10 +1,12 @@
-﻿import type { Context } from "hono";
+import type { Context } from "hono";
 import { z } from "zod";
 
 export interface AppBindings extends Env {
   SESSION_HASH_SECRET: string;
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
+  MERLIN_WORKER_TOKEN?: string;
+  STEAM_ACCOUNT_ID?: string;
 }
 
 export type AppContext = Context<{ Bindings: AppBindings }>;

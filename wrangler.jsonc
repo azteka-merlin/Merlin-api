@@ -1,4 +1,4 @@
-﻿/**
+/**
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
@@ -11,9 +11,7 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
-	"vars": {
-		"RYU_API_URL": "https://generator.ryuu.lol/secure_download"
-	},
+	"keep_vars": true,
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
@@ -85,6 +83,10 @@
 		{
 			"binding": "MERLIN_FILES",
 			"bucket_name": "merlin-files"
+		},
+		{
+			"binding": "MERLIN_ACTIVATIONS",
+			"bucket_name": "merlin-activations"
 		}
 	],
 	/**

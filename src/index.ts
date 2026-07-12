@@ -15,6 +15,7 @@ import {
   clearAdminSessionCookie,
   loginAdminUser,
   logoutAdminSession,
+  requireInternalAdminSecret,
   type AuthSessionResult,
   readAdminSession,
   requireAdminSession,
@@ -36,6 +37,19 @@ import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
 import { verifyAccessToken } from "./lib/auth";
 import { type AppBindings, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
+import {
+  assertPremiumDownloadAccess,
+  completePremiumActivation,
+  createPremiumGame,
+  deletePremiumGame,
+  failPremiumActivationReservation,
+  getPremiumGame,
+  listPremiumCatalog,
+  listPremiumGames,
+  requireAuthenticatedPremiumLicense,
+  reservePremiumActivation,
+  updatePremiumGame,
+} from "./lib/premium-games";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs } from "./lib/user-activity-service";
 
@@ -78,7 +92,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/settings"] as const;
+const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/settings"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -101,6 +115,11 @@ const merlinUpdateUploadInitSchema = z.object({
   filename: z.string().min(1),
   sizeBytes: z.number().int().positive(),
 });
+const premiumGameUploadInitSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+});
 const overrideUploadAbortSchema = z.object({
   appId: z.string().regex(/^\d+$/),
   kind: z.enum(["manifest", "fix"]),
@@ -110,6 +129,48 @@ const overrideUploadAbortSchema = z.object({
 const merlinUpdateUploadAbortSchema = z.object({
   uploadId: z.string().min(1),
   objectKey: z.string().min(1),
+});
+const premiumGameUploadAbortSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  uploadId: z.string().min(1),
+  objectKey: z.string().min(1),
+});
+const activationGenerateSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  steamAccountId: z.string().regex(/^\d+$/).optional(),
+});
+const activationDownloadQuerySchema = z.object({
+  appid: z.string().regex(/^\d+$/),
+});
+const premiumActivationRequestSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+});
+const premiumThirdPartyActivationRequestSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  tokenReq: z.string().trim().min(1),
+});
+const premiumGameCreateSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  name: z.string().min(1).optional(),
+  coverUrl: z.string().url().nullable().optional(),
+  archiveKey: z.string().min(1).optional(),
+  installSubpath: z.string().min(1).optional(),
+  activationType: z.enum(["steam_ticket", "third_party"]).optional(),
+  launchExecutablePath: z.string().min(1).nullable().optional(),
+  activationLimit: z.number().int().positive().optional(),
+  enabled: z.boolean().optional(),
+});
+const premiumGameUpdateSchema = z.object({
+  name: z.string().min(1).nullable().optional(),
+  coverUrl: z.string().url().nullable().optional(),
+  archiveKey: z.string().min(1).nullable().optional(),
+  installSubpath: z.string().min(1).nullable().optional(),
+  activationType: z.enum(["steam_ticket", "third_party"]).nullable().optional(),
+  launchExecutablePath: z.string().min(1).nullable().optional(),
+  activationLimit: z.number().int().positive().optional(),
+  enabled: z.boolean().optional(),
+}).refine((value) => Object.keys(value).length > 0, {
+  message: "At least one premium game field must be provided",
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -132,6 +193,16 @@ const merlinUpdateUploadCompleteSchema = merlinUpdateUploadAbortSchema.extend({
     }),
   ).min(1),
 });
+const premiumGameUploadCompleteSchema = premiumGameUploadAbortSchema.extend({
+  filename: z.string().min(1),
+  sizeBytes: z.number().int().positive(),
+  uploadedParts: z.array(
+    z.object({
+      partNumber: z.number().int().positive(),
+      etag: z.string().min(1),
+    }),
+  ).min(1),
+});
 
 function jsonError(message: string, status = 400) {
   return new Response(
@@ -144,6 +215,194 @@ function jsonError(message: string, status = 400) {
       headers: { "content-type": "application/json; charset=utf-8" },
     },
   );
+}
+
+function getActivationAssetKey(appId: string) {
+  return `${appId}/${appId}.zip`;
+}
+
+function getActivationDownloadPath(appId: string) {
+  return `/api/activations/download?appid=${encodeURIComponent(appId)}`;
+}
+
+function getActivationDownloadUrl(c: any, appId: string) {
+  return new URL(getActivationDownloadPath(appId), c.req.url).toString();
+}
+
+function getPremiumDownloadPath(appId: string) {
+  return `/api/premium/download?appid=${encodeURIComponent(appId)}`;
+}
+
+function getPremiumDownloadUrl(c: any, appId: string) {
+  return new URL(getPremiumDownloadPath(appId), c.req.url).toString();
+}
+
+function getActivationPayload(worker: { payload: unknown } | null, appId: string, steamAccountId: string, c: any) {
+  const payload = worker && typeof worker.payload === "object" && worker.payload !== null
+    ? worker.payload as Record<string, unknown>
+    : null;
+  const parsed = payload && typeof payload.parsed === "object" && payload.parsed !== null
+    ? payload.parsed as Record<string, unknown>
+    : null;
+
+  return {
+    appId,
+    steamAccountId,
+    steamId: typeof parsed?.steamId === "string" ? parsed.steamId : null,
+    configSteamUserId: typeof parsed?.configSteamUserId === "string"
+      ? parsed.configSteamUserId
+      : steamAccountId,
+    ticket: typeof parsed?.ticket === "string" ? parsed.ticket : null,
+    configIni: typeof payload?.configIni === "string" ? payload.configIni : null,
+    archiveFileName: `${appId}.zip`,
+    archiveKey: getActivationAssetKey(appId),
+    archiveDownloadPath: getActivationDownloadPath(appId),
+    archiveDownloadUrl: getActivationDownloadUrl(c, appId),
+  };
+}
+
+function getPremiumActivationPayload(
+  worker: { payload: unknown } | null,
+  appId: string,
+  steamAccountId: string,
+  archiveKey: string,
+  c: any,
+) {
+  const payload = worker && typeof worker.payload === "object" && worker.payload !== null
+    ? worker.payload as Record<string, unknown>
+    : null;
+  const parsed = payload && typeof payload.parsed === "object" && payload.parsed !== null
+    ? payload.parsed as Record<string, unknown>
+    : null;
+
+  return {
+    appId,
+    steamAccountId,
+    steamId: typeof parsed?.steamId === "string" ? parsed.steamId : null,
+    configSteamUserId: typeof parsed?.configSteamUserId === "string"
+      ? parsed.configSteamUserId
+      : steamAccountId,
+    ticket: typeof parsed?.ticket === "string" ? parsed.ticket : null,
+    configIni: typeof payload?.configIni === "string" ? payload.configIni : null,
+    archiveFileName: `${appId}.zip`,
+    archiveKey,
+    archiveDownloadPath: getPremiumDownloadPath(appId),
+    archiveDownloadUrl: getPremiumDownloadUrl(c, appId),
+  };
+}
+
+async function callMerlinWorker(c: any, appId: string, steamAccountId: string) {
+  const baseUrl = String(c.env.MERLIN_WORKER_URL || "").trim().replace(/\/$/, "");
+  const workerToken = String(c.env.MERLIN_WORKER_TOKEN || "").trim();
+
+  if (!baseUrl) {
+    throw new HTTPException(500, { message: "MERLIN_WORKER_URL is not configured" });
+  }
+
+  if (!workerToken) {
+    throw new HTTPException(500, { message: "MERLIN_WORKER_TOKEN is not configured" });
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/ticket-jobs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({ appId: Number(appId), steamAccountId }),
+    });
+  } catch (error) {
+    throw new HTTPException(502, {
+      message: `Could not reach Merlin worker: ${error instanceof Error ? error.message : "Unknown error"}`,
+    });
+  }
+
+  const rawText = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    payload = rawText || null;
+  }
+
+  const upstreamBodyPreview = rawText && rawText.length > 1000
+    ? rawText.slice(0, 1000) + "..."
+    : rawText || null;
+
+  return {
+    status: response.status,
+    ok: response.ok,
+    payload,
+    error: response.ok
+      ? null
+      : {
+          message: `Merlin worker returned HTTP ${response.status}`,
+          upstreamStatus: response.status,
+          upstreamStatusText: response.statusText || null,
+          upstreamBody: upstreamBodyPreview,
+          upstreamServer: response.headers.get("server"),
+          upstreamCfRay: response.headers.get("cf-ray"),
+    },
+  };
+}
+
+async function callMerlinWorkerThirdPartyToken(c: any, tokenReq: string) {
+  const baseUrl = String(c.env.MERLIN_WORKER_URL || "").trim().replace(/\/$/, "");
+  const workerToken = String(c.env.MERLIN_WORKER_TOKEN || "").trim();
+
+  if (!baseUrl) {
+    throw new HTTPException(500, { message: "MERLIN_WORKER_URL is not configured" });
+  }
+
+  if (!workerToken) {
+    throw new HTTPException(500, { message: "MERLIN_WORKER_TOKEN is not configured" });
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/token-jobs-third-party`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({ tokenReq }),
+    });
+  } catch (error) {
+    throw new HTTPException(502, {
+      message: `Could not reach Merlin worker: ${error instanceof Error ? error.message : "Unknown error"}`,
+    });
+  }
+
+  const rawText = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    payload = rawText || null;
+  }
+
+  const upstreamBodyPreview = rawText && rawText.length > 1000
+    ? rawText.slice(0, 1000) + "..."
+    : rawText || null;
+
+  return {
+    status: response.status,
+    ok: response.ok,
+    payload,
+    error: response.ok
+      ? null
+      : {
+          message: `Merlin worker returned HTTP ${response.status}`,
+          upstreamStatus: response.status,
+          upstreamStatusText: response.statusText || null,
+          upstreamBody: upstreamBodyPreview,
+          upstreamServer: response.headers.get("server"),
+          upstreamCfRay: response.headers.get("cf-ray"),
+        },
+  };
 }
 
 function getPanelIndexRequest(c: any) {
@@ -264,6 +523,22 @@ function sanitizeMerlinUpdateFilename(fileName: string) {
   return safeName;
 }
 
+function resolvePremiumGameUploadTarget(appId: string, uploadName: string) {
+  if (!/^\d+$/.test(appId)) {
+    throw new HTTPException(400, { message: "Informe um appId numerico valido." });
+  }
+
+  const safeName = sanitizeOverrideFilename(uploadName);
+  if (!/\.zip$/i.test(safeName)) {
+    throw new HTTPException(400, { message: "Premium activation aceita apenas arquivos .zip." });
+  }
+
+  return {
+    safeName,
+    objectKey: `${appId}/${appId}.zip`,
+  };
+}
+
 function buildMerlinUpdateMetadata(version: string, filename: string, sizeBytes: number) {
   return {
     version,
@@ -312,6 +587,25 @@ function validateOverrideUploadObjectKey(appId: string, kind: "manifest" | "fix"
   }
 
   return resolveOverrideUploadTarget(appId, kind, safeName);
+}
+
+function validatePremiumGameUploadObjectKey(appId: string, objectKey: string) {
+  const normalizedAppId = String(appId || "").trim();
+  if (!/^\d+$/.test(normalizedAppId)) {
+    throw new HTTPException(400, { message: "Invalid appId" });
+  }
+
+  const normalized = String(objectKey || "").trim().replace(/\\/g, "/");
+  if (!normalized || normalized.includes("..") || normalized.startsWith("/")) {
+    throw new HTTPException(400, { message: "Invalid premium activation object key" });
+  }
+
+  const target = resolvePremiumGameUploadTarget(normalizedAppId, `${normalizedAppId}.zip`);
+  if (normalized !== target.objectKey) {
+    throw new HTTPException(400, { message: "Invalid premium activation object key" });
+  }
+
+  return target;
 }
 
 async function handleProtectedPage(c: any) {
@@ -423,6 +717,205 @@ app.get("/panel-api/overrides", async (c) => {
   await requireAdminSession(c);
   const overrides = await readOverrides(c.env);
   return c.json({ overrides }, 200);
+});
+
+app.get("/panel-api/premium/games", async (c) => {
+  await requireAdminSession(c);
+  const games = await listPremiumGames(c);
+  return c.json({ games }, 200);
+});
+
+app.get("/panel-api/premium/games/:appId", async (c) => {
+  await requireAdminSession(c);
+  const game = await getPremiumGame(c, c.req.param("appId"));
+  if (!game) {
+    throw new HTTPException(404, { message: "Premium game not found" });
+  }
+
+  return c.json({ game }, 200);
+});
+
+app.post("/panel-api/premium/games", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(premiumGameCreateSchema, await c.req.json());
+  const game = await createPremiumGame(c, body);
+  return c.json({ success: true, game }, 201);
+});
+
+app.put("/panel-api/premium/games/:appId", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(premiumGameUpdateSchema, await c.req.json());
+  const game = await updatePremiumGame(c, c.req.param("appId"), body);
+  return c.json({ success: true, game }, 200);
+});
+
+app.delete("/panel-api/premium/games/:appId", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const deleted = await deletePremiumGame(c, c.req.param("appId"));
+  if (!deleted) {
+    throw new HTTPException(404, { message: "Premium game not found" });
+  }
+
+  return c.json({ success: true, appId: c.req.param("appId") }, 200);
+});
+
+app.post("/panel-api/premium/games/upload/initiate", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  const body = parseBody(premiumGameUploadInitSchema, await c.req.json());
+  const target = resolvePremiumGameUploadTarget(body.appId, body.filename);
+
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS binding is not configured" });
+  }
+
+  const upload = await c.env.MERLIN_ACTIVATIONS.createMultipartUpload(target.objectKey, {
+    httpMetadata: {
+      contentType: "application/zip",
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    appId: body.appId,
+    uploadId: upload.uploadId,
+    objectKey: target.objectKey,
+    filename: target.safeName,
+    partSize: OVERRIDE_UPLOAD_PART_SIZE,
+    sizeBytes: body.sizeBytes,
+    sizeLabel: formatUploadSize(body.sizeBytes),
+  }, 200);
+});
+
+app.post("/panel-api/premium/games/upload/part", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS binding is not configured" });
+  }
+
+  const appId = String(c.req.query("appId") || "").trim();
+  const uploadId = String(c.req.query("uploadId") || "").trim();
+  const objectKey = String(c.req.query("objectKey") || "").trim();
+  const partNumber = Number(c.req.query("partNumber") || "0");
+
+  if (!uploadId || !Number.isInteger(partNumber) || partNumber <= 0) {
+    throw new HTTPException(400, { message: "Invalid multipart upload request" });
+  }
+
+  const target = validatePremiumGameUploadObjectKey(appId, objectKey);
+  const body = c.req.raw.body;
+  if (!body) {
+    throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+  }
+
+  const upload = c.env.MERLIN_ACTIVATIONS.resumeMultipartUpload(target.objectKey, uploadId);
+  const uploadedPart = await upload.uploadPart(partNumber, body);
+  return c.json(uploadedPart, 200);
+});
+
+app.post("/panel-api/premium/games/upload/complete", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS binding is not configured" });
+  }
+
+  const body = parseBody(premiumGameUploadCompleteSchema, await c.req.json());
+  const target = validatePremiumGameUploadObjectKey(body.appId, body.objectKey);
+  const expectedUpload = resolvePremiumGameUploadTarget(body.appId, body.filename);
+  if (target.objectKey !== expectedUpload.objectKey) {
+    throw new HTTPException(400, { message: "Invalid premium activation file name" });
+  }
+
+  const upload = c.env.MERLIN_ACTIVATIONS.resumeMultipartUpload(target.objectKey, body.uploadId);
+  const uploadedParts = [...body.uploadedParts].sort((left, right) => left.partNumber - right.partNumber);
+  await upload.complete(uploadedParts);
+
+  return c.json({
+    success: true,
+    appId: body.appId,
+    objectKey: target.objectKey,
+    filename: target.safeName,
+    sizeBytes: body.sizeBytes,
+    sizeLabel: formatUploadSize(body.sizeBytes),
+  }, 200);
+});
+
+app.post("/panel-api/premium/games/upload/abort", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS binding is not configured" });
+  }
+
+  const body = parseBody(premiumGameUploadAbortSchema, await c.req.json());
+  const target = validatePremiumGameUploadObjectKey(body.appId, body.objectKey);
+  const upload = c.env.MERLIN_ACTIVATIONS.resumeMultipartUpload(target.objectKey, body.uploadId);
+  await upload.abort();
+
+  return c.json({ success: true }, 200);
+});
+
+app.post("/panel-api/premium/games/upload", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS binding is not configured" });
+  }
+
+  const contentType = c.req.header("content-type") || "";
+  let appId = "";
+  let uploadName = "arquivo.zip";
+  let sizeBytes = 0;
+  let uploadBody: ReadableStream | ArrayBuffer | null = null;
+
+  if (contentType.includes("multipart/form-data")) {
+    const formData = await c.req.formData();
+    const file = formData.get("file");
+
+    appId = String(formData.get("appId") || "").trim();
+    if (!(file instanceof File)) {
+      throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+    }
+
+    uploadName = file.name || "arquivo.zip";
+    sizeBytes = file.size || 0;
+    uploadBody = await file.arrayBuffer();
+  } else {
+    appId = String(c.req.query("appId") || "").trim();
+    uploadName = c.req.header("x-upload-filename") || "arquivo.zip";
+
+    const headerSize = Number(c.req.header("x-upload-size") || c.req.header("content-length") || "0");
+    sizeBytes = Number.isFinite(headerSize) ? headerSize : 0;
+    uploadBody = c.req.raw.body;
+
+    if (!uploadBody) {
+      throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
+    }
+  }
+
+  const target = resolvePremiumGameUploadTarget(appId, uploadName);
+  if (sizeBytes <= 0) {
+    throw new HTTPException(400, { message: "O arquivo enviado esta vazio." });
+  }
+
+  await c.env.MERLIN_ACTIVATIONS.put(target.objectKey, uploadBody, {
+    httpMetadata: {
+      contentType: "application/zip",
+      cacheControl: "no-store",
+    },
+  });
+
+  return c.json({
+    success: true,
+    appId,
+    objectKey: target.objectKey,
+    filename: target.safeName,
+    sizeBytes,
+    sizeLabel: formatUploadSize(sizeBytes),
+  }, 200);
 });
 
 app.post("/panel-api/overrides", async (c) => {
@@ -893,6 +1386,263 @@ app.post("/panel-api/licenses/:id/reset-hwid", async (c) => {
   return c.json(mapLicense(updated), 200);
 });
 
+app.get("/api/premium/catalog", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const games = await listPremiumCatalog(c, license.id);
+
+  return c.json({
+    success: true,
+    games,
+  }, 200);
+});
+
+app.post("/api/premium/activate", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const body = parseBody(premiumActivationRequestSchema, await c.req.json());
+  const steamAccountId = String(c.env.STEAM_ACCOUNT_ID || "").trim();
+  if (!steamAccountId) {
+    throw new HTTPException(500, { message: "STEAM_ACCOUNT_ID is not configured" });
+  }
+
+  const reservation = await reservePremiumActivation(c, license.id, body.appId);
+
+  if (reservation.game.activationType === "third_party") {
+    const completion = await completePremiumActivation(c, reservation.reservationId);
+
+    return c.json({
+      success: true,
+      appId: body.appId,
+      activationType: reservation.game.activationType,
+      activation: {
+        appId: body.appId,
+        archiveFileName: `${body.appId}.zip`,
+        archiveKey: reservation.game.archiveKey,
+        archiveDownloadPath: getPremiumDownloadPath(body.appId),
+        archiveDownloadUrl: getPremiumDownloadUrl(c, body.appId),
+        launchExecutablePath: reservation.game.launchExecutablePath,
+      },
+      cooldownUntil: completion.cooldownUntil,
+    }, 200);
+  }
+
+  let worker: Awaited<ReturnType<typeof callMerlinWorker>> | null = null;
+  try {
+    worker = await callMerlinWorker(c, body.appId, steamAccountId);
+    if (!worker.ok) {
+      await failPremiumActivationReservation(
+        c,
+        reservation.reservationId,
+        "worker_call",
+        worker.error?.upstreamBody || worker.error?.message || "Merlin worker request failed",
+      );
+
+      return c.json({
+        success: false,
+        stage: "worker_call",
+        error: worker.error?.message || "Merlin worker request failed",
+        worker: {
+          status: worker.status,
+          ok: worker.ok,
+        },
+      }, 502);
+    }
+
+    const completion = await completePremiumActivation(c, reservation.reservationId);
+    const activation = getPremiumActivationPayload(
+      worker,
+      body.appId,
+      steamAccountId,
+      reservation.game.archiveKey,
+      c,
+    );
+
+    return c.json({
+      success: true,
+      appId: body.appId,
+      steamAccountId,
+      activation,
+      cooldownUntil: completion.cooldownUntil,
+    }, 200);
+  } catch (error) {
+    if (!worker || !worker.ok) {
+      await failPremiumActivationReservation(
+        c,
+        reservation.reservationId,
+        "activation_unhandled",
+        error instanceof Error ? error.message : "Unknown activation error",
+      );
+    }
+
+    throw error;
+  }
+});
+
+app.post("/api/premium/activate-third-party", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const body = parseBody(premiumThirdPartyActivationRequestSchema, await c.req.json());
+  await assertPremiumDownloadAccess(c, license.id, body.appId);
+
+  const worker = await callMerlinWorkerThirdPartyToken(c, body.tokenReq);
+  if (!worker.ok) {
+    return c.json({
+      success: false,
+      stage: "worker_call",
+      error: worker.error?.message || "Merlin worker request failed",
+      worker: {
+        status: worker.status,
+        ok: worker.ok,
+      },
+    }, 502);
+  }
+
+  const payload = worker.payload && typeof worker.payload === "object" && !Array.isArray(worker.payload)
+    ? worker.payload as Record<string, unknown>
+    : null;
+  const parsed = payload && typeof payload.parsed === "object" && payload.parsed !== null && !Array.isArray(payload.parsed)
+    ? payload.parsed as Record<string, unknown>
+    : null;
+  const activationPayload = typeof payload?.token === "string"
+    ? payload.token
+    : typeof parsed?.token === "string"
+      ? parsed.token
+      : null;
+
+  if (!activationPayload) {
+    return c.json({
+      success: false,
+      stage: "worker_payload",
+      error: "Merlin worker did not return an activation payload",
+      worker: {
+        status: worker.status,
+        ok: worker.ok,
+      },
+    }, 502);
+  }
+
+  return c.json({
+    success: true,
+    appId: body.appId,
+    activation: {
+      appId: body.appId,
+      activationPayload,
+    },
+  }, 200);
+});
+
+app.get("/api/premium/download", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const query = parseBody(activationDownloadQuerySchema, c.req.query());
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS is not configured" });
+  }
+
+  const game = await assertPremiumDownloadAccess(c, license.id, query.appid);
+  const object = await c.env.MERLIN_ACTIVATIONS.get(game.archiveKey);
+  if (!object) {
+    throw new HTTPException(404, { message: "Premium activation archive not found" });
+  }
+
+  const headers = new Headers();
+  if (typeof object.writeHttpMetadata === "function") {
+    object.writeHttpMetadata(headers);
+  } else {
+    headers.set("Content-Type", "application/zip");
+  }
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Disposition", `attachment; filename="${query.appid}.zip"`);
+  headers.set("x-merlin-activation-source", "r2-premium");
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
+});
+
+app.post("/api/activations/generate", async (c) => {
+  try {
+    requireInternalAdminSecret(c);
+
+    const body = parseBody(activationGenerateSchema, await c.req.json());
+    const steamAccountId = body.steamAccountId || String(c.env.STEAM_ACCOUNT_ID || "").trim();
+    if (!steamAccountId) {
+      return c.json({
+        success: false,
+        stage: "config",
+        error: "STEAM_ACCOUNT_ID is not configured",
+      }, 500);
+    }
+
+    const worker = await callMerlinWorker(c, body.appId, steamAccountId);
+    if (!worker.ok) {
+      return c.json({
+        success: false,
+        stage: "worker_call",
+        error: worker.error?.message || "Merlin worker request failed",
+        worker,
+      }, 502);
+    }
+
+    const assetKey = getActivationAssetKey(body.appId);
+    const asset = c.env.MERLIN_ACTIVATIONS
+      ? await c.env.MERLIN_ACTIVATIONS.head(assetKey)
+      : null;
+    const activation = getActivationPayload(worker, body.appId, steamAccountId, c);
+
+    return c.json({
+      success: true,
+      appId: body.appId,
+      steamAccountId,
+      activation,
+      worker,
+      activationAsset: {
+        bucketBound: Boolean(c.env.MERLIN_ACTIVATIONS),
+        key: assetKey,
+        exists: Boolean(asset),
+        size: asset?.size || 0,
+        etag: asset?.etag || null,
+        uploaded: asset?.uploaded ? asset.uploaded.toISOString() : null,
+      },
+    }, 200);
+  } catch (error) {
+    return c.json({
+      success: false,
+      stage: "unhandled",
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? String(error.stack || "") : null,
+    }, 500);
+  }
+});
+
+app.get("/api/activations/download", async (c) => {
+  requireInternalAdminSecret(c);
+
+  const query = parseBody(activationDownloadQuerySchema, c.req.query());
+  if (!c.env.MERLIN_ACTIVATIONS) {
+    throw new HTTPException(500, { message: "MERLIN_ACTIVATIONS is not configured" });
+  }
+
+  const assetKey = getActivationAssetKey(query.appid);
+  const object = await c.env.MERLIN_ACTIVATIONS.get(assetKey);
+  if (!object) {
+    throw new HTTPException(404, { message: "Activation archive not found" });
+  }
+
+  const headers = new Headers();
+  if (typeof object.writeHttpMetadata === "function") {
+    object.writeHttpMetadata(headers);
+  } else {
+    headers.set("Content-Type", "application/zip");
+  }
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Disposition", `attachment; filename="${query.appid}.zip"`);
+  headers.set("x-merlin-activation-source", "r2-activation");
+
+  return new Response(object.body, {
+    status: 200,
+    headers,
+  });
+});
+
 openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
@@ -989,15 +1739,4 @@ app.notFound((c) => {
 });
 
 export default app;
-
-
-
-
-
-
-
-
-
-
-
 
