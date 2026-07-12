@@ -50,6 +50,15 @@ import {
   reservePremiumActivation,
   updatePremiumGame,
 } from "./lib/premium-games";
+import {
+  createPoll,
+  deletePoll,
+  listActivePolls,
+  listPolls,
+  setPollStatus,
+  updatePoll,
+  votePoll,
+} from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs } from "./lib/user-activity-service";
 
@@ -92,7 +101,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/settings"] as const;
+const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/settings"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -171,6 +180,28 @@ const premiumGameUpdateSchema = z.object({
   enabled: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: "At least one premium game field must be provided",
+});
+const pollOptionSchema = z.object({
+  label: z.string().trim().min(1),
+  gameAppId: z.string().trim().regex(/^\d+$/).nullable().optional(),
+});
+const pollContributionOptionSchema = z.object({
+  label: z.string().trim().min(1),
+  minAmount: z.number().int().nonnegative().nullable().optional(),
+  maxAmount: z.number().int().nonnegative().nullable().optional(),
+});
+const pollUpsertSchema = z.object({
+  type: z.enum(["basic", "game_request"]),
+  question: z.string().trim().min(1),
+  status: z.enum(["draft", "open", "closed"]).optional(),
+  currencyCode: z.string().trim().regex(/^[A-Za-z]{3}$/).nullable().optional(),
+  options: z.array(pollOptionSchema).min(2).max(3),
+  contributionOptions: z.array(pollContributionOptionSchema).max(4).nullable().optional(),
+});
+const pollVoteSchema = z.object({
+  optionId: z.number().int().positive().nullable().optional(),
+  contributionOptionId: z.number().int().positive().nullable().optional(),
+  contributionSkipped: z.boolean().nullable().optional(),
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -918,6 +949,43 @@ app.post("/panel-api/premium/games/upload", async (c) => {
   }, 200);
 });
 
+app.get("/panel-api/polls", async (c) => {
+  await requireAdminSession(c);
+  const polls = await listPolls(c);
+  return c.json({ polls }, 200);
+});
+
+app.post("/panel-api/polls", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(pollUpsertSchema, await c.req.json());
+  const poll = await createPoll(c, body);
+  return c.json({ success: true, poll }, 201);
+});
+
+app.put("/panel-api/polls/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(pollUpsertSchema, await c.req.json());
+  const poll = await updatePoll(c, c.req.param("id"), body);
+  return c.json({ success: true, poll }, 200);
+});
+
+app.post("/panel-api/polls/:id/open", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const poll = await setPollStatus(c, c.req.param("id"), "open");
+  return c.json({ success: true, poll }, 200);
+});
+
+app.post("/panel-api/polls/:id/close", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const poll = await setPollStatus(c, c.req.param("id"), "closed");
+  return c.json({ success: true, poll }, 200);
+});
+
+app.delete("/panel-api/polls/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  return c.json(await deletePoll(c, c.req.param("id")), 200);
+});
+
 app.post("/panel-api/overrides", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const body = parseBody(OverrideUpsertRequest, await c.req.json());
@@ -1558,6 +1626,19 @@ app.get("/api/premium/download", async (c) => {
   });
 });
 
+app.get("/api/polls/active", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const polls = await listActivePolls(c, license.id);
+  return c.json({ success: true, polls }, 200);
+});
+
+app.post("/api/polls/:id/vote", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const body = parseBody(pollVoteSchema, await c.req.json());
+  const poll = await votePoll(c, c.req.param("id"), license.id, body);
+  return c.json({ success: true, poll }, 200);
+});
+
 app.post("/api/activations/generate", async (c) => {
   try {
     requireInternalAdminSecret(c);
@@ -1739,4 +1820,3 @@ app.notFound((c) => {
 });
 
 export default app;
-
