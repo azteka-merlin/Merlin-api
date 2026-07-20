@@ -13,6 +13,7 @@ import { ManifestsRoute } from "./endpoints/manifests";
 import { VersionRoute } from "./endpoints/version";
 import {
   clearAdminSessionCookie,
+  getClientIp,
   loginAdminUser,
   logoutAdminSession,
   requireInternalAdminSecret,
@@ -39,10 +40,14 @@ import { type AppBindings, CreateLicenseRequest, OverrideUpsertRequest, RenewLic
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import {
   assertPremiumDownloadAccess,
+  assertPremiumActivationReservationForLicense,
   completePremiumActivation,
+  completePremiumActivationForLicense,
   createPremiumGame,
   deletePremiumGame,
   failPremiumActivationReservation,
+  failPremiumActivationReservationForLicense,
+  findPremiumActivationReservationForLicense,
   getPremiumGame,
   listPremiumCatalog,
   listPremiumGames,
@@ -60,7 +65,7 @@ import {
   votePoll,
 } from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
-import { listUserActivityLogs } from "./lib/user-activity-service";
+import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
 
 const app = new Hono<{ Bindings: AppBindings }>();
 
@@ -156,7 +161,17 @@ const premiumActivationRequestSchema = z.object({
 });
 const premiumThirdPartyActivationRequestSchema = z.object({
   appId: z.string().regex(/^\d+$/),
+  reservationId: z.number().int().positive().optional(),
   tokenReq: z.string().trim().min(1),
+});
+const premiumActivationEventSchema = z.object({
+  appId: z.string().regex(/^\d+$/),
+  reservationId: z.number().int().positive().optional(),
+  activationType: z.enum(["steam_ticket", "third_party"]).optional(),
+  stage: z.string().trim().min(1).max(80),
+  reason: z.string().trim().min(1).max(120).optional(),
+  message: z.string().trim().max(1000).optional(),
+  cooldownApplied: z.boolean().optional(),
 });
 const premiumGameCreateSchema = z.object({
   appId: z.string().regex(/^\d+$/),
@@ -320,6 +335,71 @@ function getPremiumActivationPayload(
     archiveDownloadPath: getPremiumDownloadPath(appId),
     archiveDownloadUrl: getPremiumDownloadUrl(c, appId),
   };
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function getErrorStatus(error: unknown) {
+  const status = typeof (error as { status?: unknown })?.status === "number"
+    ? (error as { status: number }).status
+    : null;
+  return status;
+}
+
+function getPremiumWorkerLogPayload(worker: { status: number; ok: boolean; payload: unknown; error: unknown } | null) {
+  if (!worker) return null;
+  const payload = worker.payload && typeof worker.payload === "object" && !Array.isArray(worker.payload)
+    ? worker.payload as Record<string, unknown>
+    : null;
+
+  return {
+    status: worker.status,
+    ok: worker.ok,
+    message: typeof payload?.message === "string" ? payload.message : null,
+    jobId: typeof payload?.jobId === "string" ? payload.jobId : null,
+    exitCode: typeof payload?.exitCode === "number" ? payload.exitCode : null,
+    killed: typeof payload?.killed === "boolean" ? payload.killed : null,
+    signal: typeof payload?.signal === "string" ? payload.signal : null,
+    stdout: typeof payload?.stdout === "string" ? payload.stdout.slice(0, 2000) : null,
+    stderr: typeof payload?.stderr === "string" ? payload.stderr.slice(0, 2000) : null,
+    error: worker.error,
+  };
+}
+
+async function writePremiumActivityLog(
+  c: any,
+  license: { id: number; licenseKey: string; name: string; hwid: string },
+  input: {
+    action: "premium_activation_success" | "premium_activation_failed";
+    status: "success" | "denied";
+    appId: string;
+    gameName?: string | null;
+    reason?: string | null;
+    metadata?: Record<string, unknown> | null;
+  },
+) {
+  try {
+    await writeUserActivityLog(c, {
+      licenseId: license.id,
+      licenseKey: license.licenseKey,
+      userName: license.name,
+      action: input.action,
+      status: input.status,
+      appId: input.appId,
+      gameName: input.gameName ?? null,
+      ipAddress: getClientIp(c),
+      hwid: license.hwid,
+      reason: input.reason ?? null,
+      metadata: {
+        source: "premium",
+        ...(input.metadata || {}),
+      },
+    });
+  } catch (error) {
+    console.warn("[premium-activity] failed to write user activity log:", getErrorMessage(error));
+  }
 }
 
 async function callMerlinWorker(c: any, appId: string, steamAccountId: string) {
@@ -1467,30 +1547,69 @@ app.get("/api/premium/catalog", async (c) => {
 app.post("/api/premium/activate", async (c) => {
   const license = await requireAuthenticatedPremiumLicense(c);
   const body = parseBody(premiumActivationRequestSchema, await c.req.json());
-  const steamAccountId = String(c.env.STEAM_ACCOUNT_ID || "").trim();
-  if (!steamAccountId) {
-    throw new HTTPException(500, { message: "STEAM_ACCOUNT_ID is not configured" });
+
+  let reservation: Awaited<ReturnType<typeof reservePremiumActivation>>;
+  try {
+    reservation = await reservePremiumActivation(c, license.id, body.appId);
+  } catch (error) {
+    const game = await getPremiumGame(c, body.appId).catch(() => null);
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: game?.name || null,
+      reason: "premium_reservation_failed",
+      metadata: {
+        stage: "reservation",
+        activationType: game?.activationType || null,
+        error: getErrorMessage(error),
+        httpStatus: getErrorStatus(error),
+      },
+    });
+    throw error;
   }
 
-  const reservation = await reservePremiumActivation(c, license.id, body.appId);
-
   if (reservation.game.activationType === "third_party") {
-    const completion = await completePremiumActivation(c, reservation.reservationId);
-
     return c.json({
       success: true,
       appId: body.appId,
       activationType: reservation.game.activationType,
+      reservationId: reservation.reservationId,
       activation: {
         appId: body.appId,
+        reservationId: reservation.reservationId,
         archiveFileName: `${body.appId}.zip`,
         archiveKey: reservation.game.archiveKey,
         archiveDownloadPath: getPremiumDownloadPath(body.appId),
         archiveDownloadUrl: getPremiumDownloadUrl(c, body.appId),
         launchExecutablePath: reservation.game.launchExecutablePath,
       },
-      cooldownUntil: completion.cooldownUntil,
+      cooldownUntil: null,
     }, 200);
+  }
+
+  const steamAccountId = String(c.env.STEAM_ACCOUNT_ID || "").trim();
+  if (!steamAccountId) {
+    await failPremiumActivationReservation(
+      c,
+      reservation.reservationId,
+      "configuration",
+      "STEAM_ACCOUNT_ID is not configured",
+    );
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: reservation.game.name,
+      reason: "premium_configuration_failed",
+      metadata: {
+        stage: "configuration",
+        activationType: reservation.game.activationType,
+        reservationId: reservation.reservationId,
+        error: "STEAM_ACCOUNT_ID is not configured",
+      },
+    });
+    throw new HTTPException(500, { message: "STEAM_ACCOUNT_ID is not configured" });
   }
 
   let worker: Awaited<ReturnType<typeof callMerlinWorker>> | null = null;
@@ -1503,6 +1622,19 @@ app.post("/api/premium/activate", async (c) => {
         "worker_call",
         worker.error?.upstreamBody || worker.error?.message || "Merlin worker request failed",
       );
+      await writePremiumActivityLog(c, license, {
+        action: "premium_activation_failed",
+        status: "denied",
+        appId: body.appId,
+        gameName: reservation.game.name,
+        reason: "premium_worker_failed",
+        metadata: {
+          stage: "worker_call",
+          activationType: reservation.game.activationType,
+          reservationId: reservation.reservationId,
+          worker: getPremiumWorkerLogPayload(worker),
+        },
+      });
 
       return c.json({
         success: false,
@@ -1511,6 +1643,8 @@ app.post("/api/premium/activate", async (c) => {
         worker: {
           status: worker.status,
           ok: worker.ok,
+          payload: worker.payload,
+          error: worker.error,
         },
       }, 502);
     }
@@ -1523,6 +1657,19 @@ app.post("/api/premium/activate", async (c) => {
       reservation.game.archiveKey,
       c,
     );
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_success",
+      status: "success",
+      appId: body.appId,
+      gameName: reservation.game.name,
+      metadata: {
+        stage: "completed",
+        activationType: reservation.game.activationType,
+        reservationId: reservation.reservationId,
+        archiveKey: reservation.game.archiveKey,
+        cooldownUntil: completion.cooldownUntil,
+      },
+    });
 
     return c.json({
       success: true,
@@ -1533,12 +1680,28 @@ app.post("/api/premium/activate", async (c) => {
     }, 200);
   } catch (error) {
     if (!worker || !worker.ok) {
+      const failureStage = worker ? "activation_unhandled" : "worker_call";
+      const failureReason = worker ? "premium_activation_unhandled" : "premium_worker_unreachable";
       await failPremiumActivationReservation(
         c,
         reservation.reservationId,
-        "activation_unhandled",
+        failureStage,
         error instanceof Error ? error.message : "Unknown activation error",
       );
+      await writePremiumActivityLog(c, license, {
+        action: "premium_activation_failed",
+        status: "denied",
+        appId: body.appId,
+        gameName: reservation.game.name,
+        reason: failureReason,
+        metadata: {
+          stage: failureStage,
+          activationType: reservation.game.activationType,
+          reservationId: reservation.reservationId,
+          error: getErrorMessage(error),
+          worker: getPremiumWorkerLogPayload(worker),
+        },
+      });
     }
 
     throw error;
@@ -1548,10 +1711,67 @@ app.post("/api/premium/activate", async (c) => {
 app.post("/api/premium/activate-third-party", async (c) => {
   const license = await requireAuthenticatedPremiumLicense(c);
   const body = parseBody(premiumThirdPartyActivationRequestSchema, await c.req.json());
-  await assertPremiumDownloadAccess(c, license.id, body.appId);
+  const game = await assertPremiumDownloadAccess(c, license.id, body.appId);
+  const reservationId = body.reservationId
+    || await findPremiumActivationReservationForLicense(c, license.id, body.appId);
 
-  const worker = await callMerlinWorkerThirdPartyToken(c, body.tokenReq);
+  if (!reservationId) {
+    throw new HTTPException(409, { message: "Premium activation reservation is not available" });
+  }
+
+  await assertPremiumActivationReservationForLicense(c, reservationId, license.id, body.appId);
+
+  let worker: Awaited<ReturnType<typeof callMerlinWorkerThirdPartyToken>>;
+  try {
+    worker = await callMerlinWorkerThirdPartyToken(c, body.tokenReq);
+  } catch (error) {
+    await failPremiumActivationReservationForLicense(
+      c,
+      reservationId,
+      license.id,
+      body.appId,
+      "worker_call",
+      getErrorMessage(error),
+    );
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: game.name,
+      reason: "premium_worker_unreachable",
+      metadata: {
+        stage: "worker_call",
+        activationType: game.activationType,
+        reservationId,
+        error: getErrorMessage(error),
+        httpStatus: getErrorStatus(error),
+      },
+    });
+    throw error;
+  }
   if (!worker.ok) {
+    await failPremiumActivationReservationForLicense(
+      c,
+      reservationId,
+      license.id,
+      body.appId,
+      "worker_call",
+      worker.error?.upstreamBody || worker.error?.message || "Merlin worker request failed",
+    );
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: game.name,
+      reason: "premium_token_generation_failed",
+      metadata: {
+        stage: "worker_call",
+        activationType: game.activationType,
+        reservationId,
+        worker: getPremiumWorkerLogPayload(worker),
+      },
+    });
+
     return c.json({
       success: false,
       stage: "worker_call",
@@ -1559,6 +1779,8 @@ app.post("/api/premium/activate-third-party", async (c) => {
       worker: {
         status: worker.status,
         ok: worker.ok,
+        payload: worker.payload,
+        error: worker.error,
       },
     }, 502);
   }
@@ -1576,6 +1798,28 @@ app.post("/api/premium/activate-third-party", async (c) => {
       : null;
 
   if (!activationPayload) {
+    await failPremiumActivationReservationForLicense(
+      c,
+      reservationId,
+      license.id,
+      body.appId,
+      "worker_payload",
+      "Merlin worker did not return an activation payload",
+    );
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: game.name,
+      reason: "premium_token_payload_missing",
+      metadata: {
+        stage: "worker_payload",
+        activationType: game.activationType,
+        reservationId,
+        worker: getPremiumWorkerLogPayload(worker),
+      },
+    });
+
     return c.json({
       success: false,
       stage: "worker_payload",
@@ -1583,18 +1827,94 @@ app.post("/api/premium/activate-third-party", async (c) => {
       worker: {
         status: worker.status,
         ok: worker.ok,
+        payload: worker.payload,
       },
     }, 502);
   }
 
+  let completion: Awaited<ReturnType<typeof completePremiumActivationForLicense>>;
+  try {
+    completion = await completePremiumActivationForLicense(
+      c,
+      reservationId,
+      license.id,
+      body.appId,
+    );
+  } catch (error) {
+    await writePremiumActivityLog(c, license, {
+      action: "premium_activation_failed",
+      status: "denied",
+      appId: body.appId,
+      gameName: game.name,
+      reason: "premium_completion_failed",
+      metadata: {
+        stage: "completion",
+        activationType: game.activationType,
+        reservationId,
+        error: getErrorMessage(error),
+        tokenGenerated: true,
+      },
+    });
+    throw error;
+  }
+  await writePremiumActivityLog(c, license, {
+    action: "premium_activation_success",
+    status: "success",
+    appId: body.appId,
+    gameName: game.name,
+    metadata: {
+      stage: "completed",
+      activationType: game.activationType,
+      reservationId,
+      archiveKey: game.archiveKey,
+      cooldownUntil: completion.cooldownUntil,
+    },
+  });
+
   return c.json({
     success: true,
     appId: body.appId,
+    reservationId,
+    cooldownUntil: completion.cooldownUntil,
     activation: {
       appId: body.appId,
       activationPayload,
     },
   }, 200);
+});
+
+app.post("/api/premium/activation-events", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  const body = parseBody(premiumActivationEventSchema, await c.req.json());
+  const game = await getPremiumGame(c, body.appId);
+
+  if (body.reservationId && body.cooldownApplied !== true) {
+    await failPremiumActivationReservationForLicense(
+      c,
+      body.reservationId,
+      license.id,
+      body.appId,
+      body.stage,
+      body.message || body.reason || null,
+    );
+  }
+
+  await writePremiumActivityLog(c, license, {
+    action: "premium_activation_failed",
+    status: "denied",
+    appId: body.appId,
+    gameName: game?.name || null,
+    reason: body.reason || "premium_local_failure",
+    metadata: {
+      stage: body.stage,
+      activationType: body.activationType || game?.activationType || null,
+      reservationId: body.reservationId || null,
+      cooldownApplied: body.cooldownApplied === true,
+      message: body.message || null,
+    },
+  });
+
+  return c.json({ success: true }, 200);
 });
 
 app.get("/api/premium/download", async (c) => {

@@ -808,6 +808,81 @@ export async function failPremiumActivationReservation(
     .run();
 }
 
+export async function failPremiumActivationReservationForLicense(
+  c: AppContext,
+  reservationId: number,
+  licenseId: number,
+  appId: string,
+  stage: string,
+  reason: string | null,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  await c.env.merlin_db
+    .prepare(`
+      UPDATE premium_activations
+      SET
+        status = 'failed',
+        failure_stage = ?,
+        failure_reason = ?,
+        updated_at = ?
+      WHERE id = ?
+        AND license_id = ?
+        AND app_id = ?
+        AND status = 'reserved'
+    `)
+    .bind(stage, reason, nowIso, reservationId, licenseId, normalizeAppId(appId))
+    .run();
+}
+
+export async function assertPremiumActivationReservationForLicense(
+  c: AppContext,
+  reservationId: number,
+  licenseId: number,
+  appId: string,
+): Promise<void> {
+  await cleanupPremiumActivations(c);
+
+  const row = await c.env.merlin_db
+    .prepare(`
+      SELECT id
+      FROM premium_activations
+      WHERE id = ?
+        AND license_id = ?
+        AND app_id = ?
+        AND status = 'reserved'
+      LIMIT 1
+    `)
+    .bind(reservationId, licenseId, normalizeAppId(appId))
+    .first<{ id: number }>();
+
+  if (!row) {
+    throw new HTTPException(409, { message: "Premium activation reservation is not available" });
+  }
+}
+
+export async function findPremiumActivationReservationForLicense(
+  c: AppContext,
+  licenseId: number,
+  appId: string,
+): Promise<number | null> {
+  await cleanupPremiumActivations(c);
+
+  const row = await c.env.merlin_db
+    .prepare(`
+      SELECT id
+      FROM premium_activations
+      WHERE license_id = ?
+        AND app_id = ?
+        AND status = 'reserved'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `)
+    .bind(licenseId, normalizeAppId(appId))
+    .first<{ id: number }>();
+
+  return row?.id || null;
+}
+
 export async function completePremiumActivation(
   c: AppContext,
   reservationId: number,
@@ -836,6 +911,16 @@ export async function completePremiumActivation(
   };
 }
 
+export async function completePremiumActivationForLicense(
+  c: AppContext,
+  reservationId: number,
+  licenseId: number,
+  appId: string,
+): Promise<PremiumActivationCompletion> {
+  await assertPremiumActivationReservationForLicense(c, reservationId, licenseId, appId);
+  return completePremiumActivation(c, reservationId);
+}
+
 export async function assertPremiumDownloadAccess(c: AppContext, licenseId: number, appId: string): Promise<PremiumGame> {
   await cleanupPremiumActivations(c);
 
@@ -846,7 +931,7 @@ export async function assertPremiumDownloadAccess(c: AppContext, licenseId: numb
 
   const nowIso = new Date().toISOString();
   const rows = await listLicensePremiumActivations(c, licenseId, game.appId);
-  const hasCurrentActivation = rows.some((row) => isActiveActivation(row, nowIso));
+  const hasCurrentActivation = rows.some((row) => isActiveActivation(row, nowIso) || isReservedActivation(row, nowIso));
   if (!hasCurrentActivation) {
     throw new HTTPException(403, { message: "Premium activation not available for this license" });
   }

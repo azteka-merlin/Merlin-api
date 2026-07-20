@@ -20,7 +20,12 @@ export type UserActivityInput = {
   licenseId: number;
   licenseKey: string;
   userName: string;
-  action: "user_login_success" | "game_activation_success" | "game_activation_denied";
+  action:
+    | "user_login_success"
+    | "game_activation_success"
+    | "game_activation_denied"
+    | "premium_activation_success"
+    | "premium_activation_failed";
   status: "success" | "denied";
   appId?: string | null;
   gameName?: string | null;
