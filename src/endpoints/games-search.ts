@@ -22,13 +22,6 @@ type DepotboxGame = {
 	header_image_url?: string | null;
 };
 
-type FallbackCatalogGame = {
-	appid?: string | number;
-	name?: string;
-	capsule_image?: string;
-	header_image?: string;
-};
-
 type SteamBasicAppDetails = {
 	success?: boolean;
 	data?: {
@@ -47,16 +40,34 @@ type SearchItem = {
 	coverSource: string | null;
 };
 
+type SearchSourceResult = {
+	ok: boolean;
+	items: SearchItem[];
+};
+
+type GamesCatalogRow = {
+	app_id: string;
+	name: string;
+	cover_url: string | null;
+	cover_source: string | null;
+};
+
+type GamesCatalogUpsertItem = SearchItem & {
+	catalogSource: string;
+};
+
 const USER_AGENT = "Merlin/2.0";
 const DEPOTBOX_SEARCH_URL = "https://depotbox.org/api/search-games";
-const FALLBACK_GAMES_CATALOG_URL = "https://generator.ryuu.lol/files/games.json";
+const RYUU_IMAGE_URL_TEMPLATE = "https://generator.ryuu.lol/files/images/{appid}.jpg";
 const GAMES_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 const STEAM_NO_IMAGE_CACHE_TTL_MS = 60 * 1000;
+const IMAGE_VALIDATION_CACHE_TTL_MS = 30 * 60 * 1000;
+const IMAGE_VALIDATION_FAILURE_TTL_MS = 5 * 60 * 1000;
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 const STEAM_INVALID_APP_TYPE = "__invalid__";
 const SEARCH_SOURCE_TIMEOUT_MS = 3_000;
 const STEAM_SEARCH_TIMEOUT_MS = 2_500;
-const CATALOG_QUERY_MISS_CACHE_TTL_MS = 5 * 60 * 1000;
+const IMAGE_VALIDATION_TIMEOUT_MS = 1_500;
 const DEPOT_QUERY_CACHE_TTL_MS = 5 * 60 * 1000;
 const NON_PLAYABLE_NAME_PATTERNS = [
 	/\bcreation kit\b/i,
@@ -83,14 +94,6 @@ const NON_PLAYABLE_DESCRIPTION_PATTERNS = [
 	/\bdownloadable content\b/i,
 ];
 
-let gamesCatalogCache: {
-	expiresAt: number;
-	items: SearchItem[];
-} = {
-	expiresAt: 0,
-	items: [],
-};
-
 let steamDetailsCache = new Map<string, {
 	expiresAt: number;
 	type: string | null;
@@ -100,7 +103,10 @@ let steamDetailsCache = new Map<string, {
 	coverSource: string | null;
 }>();
 
-let catalogMissCache = new Map<string, number>();
+let imageValidationCache = new Map<string, {
+	expiresAt: number;
+	ok: boolean;
+}>();
 
 let depotSearchCache = new Map<string, {
 	expiresAt: number;
@@ -135,27 +141,6 @@ async function fetchWithTimeout(
 
 function normalizeSearchKey(searchTerm: string, limit: number): string {
 	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}`;
-}
-
-function hasFreshCatalogMiss(searchTerm: string, limit: number): boolean {
-	const key = normalizeSearchKey(searchTerm, limit);
-	const expiresAt = catalogMissCache.get(key) || 0;
-	if (expiresAt > Date.now()) {
-		return true;
-	}
-	catalogMissCache.delete(key);
-	return false;
-}
-
-function recordCatalogMiss(searchTerm: string, limit: number): void {
-	catalogMissCache.set(
-		normalizeSearchKey(searchTerm, limit),
-		Date.now() + CATALOG_QUERY_MISS_CACHE_TTL_MS
-	);
-}
-
-function clearCatalogMiss(searchTerm: string, limit: number): void {
-	catalogMissCache.delete(normalizeSearchKey(searchTerm, limit));
 }
 
 function getCachedDepotSearch(searchTerm: string, limit: number): SearchItem[] | null {
@@ -196,32 +181,6 @@ function normalizeDepotboxGame(entry: unknown): SearchItem | null {
 	};
 }
 
-function normalizeFallbackCatalogGame(entry: unknown): SearchItem | null {
-	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
-
-	const candidate = entry as FallbackCatalogGame;
-	const appId = String(candidate.appid || "").trim();
-	const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
-	const capsuleImage = typeof candidate.capsule_image === "string" ? candidate.capsule_image.trim() : "";
-	const headerImage = typeof candidate.header_image === "string" ? candidate.header_image.trim() : "";
-
-	if (!/^\d+$/.test(appId) || !name) return null;
-
-	const coverUrl = capsuleImage || headerImage || null;
-	const coverSource = capsuleImage
-		? "capsule_image"
-		: headerImage
-			? "header_image"
-			: null;
-
-	return {
-		appId,
-		name,
-		coverUrl,
-		coverSource,
-	};
-}
-
 function normalizeGameSearchText(value: string): string {
 	return String(value || "")
 		.normalize("NFKD")
@@ -232,59 +191,109 @@ function normalizeGameSearchText(value: string): string {
 		.toLocaleLowerCase();
 }
 
-function appIdRank(appId: string, query: string): number {
-	if (appId === query) return 0;
-	if (appId.startsWith(query)) return 1;
-	if (appId.includes(query)) return 2;
-	return 3;
+function normalizeFtsQuery(value: string): string {
+	const tokens = normalizeGameSearchText(value)
+		.split(" ")
+		.map((token) => token.trim())
+		.filter(Boolean)
+		.slice(0, 6);
+
+	return tokens.map((token) => `${token}*`).join(" ");
 }
 
-function searchCatalogLikeRyu(items: SearchItem[], searchTerm: string, limit: number): SearchItem[] {
-	const safeLimit = Math.max(1, Math.trunc(Number(limit) || 0));
-	const query = String(searchTerm || "").trim();
-	if (!query) return [];
+function mapGamesCatalogRow(row: GamesCatalogRow): SearchItem | null {
+	const appId = String(row.app_id || "").trim();
+	const name = typeof row.name === "string" ? row.name.trim() : "";
+	const coverUrl = typeof row.cover_url === "string" ? row.cover_url.trim() : "";
+	const coverSource = typeof row.cover_source === "string" ? row.cover_source.trim() : "";
 
-	const normalizedQuery = normalizeGameSearchText(query);
-	const lowerQuery = query.toLocaleLowerCase();
-	const isDigitsOnly = /^\d+$/.test(query);
+	if (!/^\d+$/.test(appId) || !name) return null;
 
-	const matches = items.filter((item) => {
-		const appId = item.appId;
-		const name = item.name;
-		if (appId.includes(query)) return true;
-		if (normalizedQuery && normalizeGameSearchText(name).includes(normalizedQuery)) return true;
-		return name.toLocaleLowerCase().includes(lowerQuery);
-	});
+	return {
+		appId,
+		name,
+		coverUrl: coverUrl || null,
+		coverSource: coverSource || null,
+	};
+}
 
-	matches.sort((a, b) => {
-		const appIdA = a.appId;
-		const appIdB = b.appId;
-		const nameA = a.name;
-		const nameB = b.name;
+function getRyuuImageUrl(appId: string): string | null {
+	const normalizedAppId = String(appId || "").trim();
+	return /^\d+$/.test(normalizedAppId)
+		? RYUU_IMAGE_URL_TEMPLATE.replace("{appid}", normalizedAppId)
+		: null;
+}
 
-		if (isDigitsOnly) {
-			const rankA = appIdRank(appIdA, query);
-			const rankB = appIdRank(appIdB, query);
-			if (rankA !== rankB) return rankA - rankB;
-			if (rankA <= 2) {
-				return (parseInt(appIdA, 10) || 0) - (parseInt(appIdB, 10) || 0);
-			}
+function withFallbackCover(item: SearchItem): SearchItem {
+	if (item.coverUrl) {
+		return item;
+	}
+
+	const fallbackCoverUrl = getRyuuImageUrl(item.appId);
+	if (!fallbackCoverUrl) {
+		return item;
+	}
+
+	return {
+		...item,
+		coverUrl: fallbackCoverUrl,
+		coverSource: "ryuu_search_image",
+	};
+}
+
+async function isImageUrlAvailable(url: string): Promise<boolean> {
+	const normalizedUrl = String(url || "").trim();
+	if (!normalizedUrl) return false;
+
+	const cached = imageValidationCache.get(normalizedUrl);
+	if (cached && cached.expiresAt > Date.now()) {
+		return cached.ok;
+	}
+	imageValidationCache.delete(normalizedUrl);
+
+	try {
+		let response = await fetchWithTimeout(normalizedUrl, {
+			method: "HEAD",
+			headers: {
+				Accept: "image/*,*/*;q=0.8",
+				"User-Agent": USER_AGENT,
+			},
+		}, IMAGE_VALIDATION_TIMEOUT_MS);
+
+		if (response.status === 405 || response.status === 403) {
+			await response.body?.cancel();
+			response = await fetchWithTimeout(normalizedUrl, {
+				method: "GET",
+				headers: {
+					Accept: "image/*,*/*;q=0.8",
+					Range: "bytes=0-0",
+					"User-Agent": USER_AGENT,
+				},
+			}, IMAGE_VALIDATION_TIMEOUT_MS);
 		}
 
-		if (normalizedQuery) {
-			const normalizedNameA = normalizeGameSearchText(nameA);
-			const normalizedNameB = normalizeGameSearchText(nameB);
-			const hitA = normalizedNameA.includes(normalizedQuery);
-			const hitB = normalizedNameB.includes(normalizedQuery);
-			if (hitA !== hitB) return hitA ? -1 : 1;
-			const byLength = normalizedNameA.length - normalizedNameB.length;
-			if (byLength !== 0) return byLength;
-		}
+		const contentType = response.headers.get("content-type") || "";
+		const ok = response.ok && (!contentType || contentType.toLocaleLowerCase().startsWith("image/"));
+		await response.body?.cancel();
+		imageValidationCache.set(normalizedUrl, {
+			expiresAt: Date.now() + (ok ? IMAGE_VALIDATION_CACHE_TTL_MS : IMAGE_VALIDATION_FAILURE_TTL_MS),
+			ok,
+		});
+		return ok;
+	} catch {
+		imageValidationCache.set(normalizedUrl, {
+			expiresAt: Date.now() + IMAGE_VALIDATION_FAILURE_TTL_MS,
+			ok: false,
+		});
+		return false;
+	}
+}
 
-		return (parseInt(appIdA, 10) || 0) - (parseInt(appIdB, 10) || 0);
-	});
-
-	return matches.slice(0, safeLimit);
+function shouldValidateCatalogCover(item: SearchItem): boolean {
+	if (!item.coverUrl) return false;
+	const source = String(item.coverSource || "").trim();
+	return source !== "steam_capsule_image"
+		&& source !== "steam_header_image";
 }
 
 function matchesDepotHeavyFilters(details: {
@@ -321,9 +330,22 @@ async function finalizeCatalogItems(items: SearchItem[]): Promise<SearchItem[]> 
 	}
 
 	const now = Date.now();
+	const catalogCoverResults = await Promise.all(
+		items.map(async (item) => {
+			if (!shouldValidateCatalogCover(item)) {
+				return { appId: item.appId, ok: Boolean(item.coverUrl) };
+			}
+
+			return {
+				appId: item.appId,
+				ok: await isImageUrlAvailable(item.coverUrl || ""),
+			};
+		})
+	);
+	const catalogCoverStatus = new Map(catalogCoverResults.map((result) => [result.appId, result.ok]));
 	const appIdsToFetch = [...new Set(
 		items
-			.filter((item) => !item.coverUrl)
+			.filter((item) => !item.coverUrl || (shouldValidateCatalogCover(item) && catalogCoverStatus.get(item.appId) === false))
 			.map((item) => item.appId)
 			.filter((appId) => {
 				const cached = steamDetailsCache.get(appId);
@@ -388,7 +410,7 @@ async function finalizeCatalogItems(items: SearchItem[]): Promise<SearchItem[]> 
 
 	return items.map((item) => {
 		const cached = steamDetailsCache.get(item.appId);
-		if (item.coverUrl) {
+		if (item.coverUrl && (!shouldValidateCatalogCover(item) || catalogCoverStatus.get(item.appId) !== false)) {
 			return item;
 		}
 
@@ -400,7 +422,7 @@ async function finalizeCatalogItems(items: SearchItem[]): Promise<SearchItem[]> 
 			};
 		}
 
-		return item;
+		return withFallbackCover(item);
 	});
 }
 
@@ -520,12 +542,12 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 				};
 			}
 
-			return {
+			return withFallbackCover({
 				...item,
 				name: cached?.name || item.name,
 				coverUrl: null,
 				coverSource: null,
-			};
+			});
 		})
 	);
 }
@@ -572,12 +594,15 @@ async function requireActiveViewerLicense(c: AppContext): Promise<void> {
 	}
 }
 
-async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: number): Promise<SearchItem[]> {
-	if (!env.DEPOTBOX_API_KEY) return [];
+async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: number): Promise<SearchSourceResult> {
+	if (!env.DEPOTBOX_API_KEY) {
+		console.warn("[games-search] depotbox api key is not configured");
+		return { ok: false, items: [] };
+	}
 
 	const cached = getCachedDepotSearch(searchTerm, limit);
 	if (cached) {
-		return cached;
+		return { ok: true, items: cached };
 	}
 
 	try {
@@ -600,15 +625,13 @@ async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: num
 		if (!response.ok) {
 			console.warn(`[games-search] depotbox returned HTTP ${response.status}`);
 			await response.body?.cancel();
-			setCachedDepotSearch(searchTerm, limit, []);
-			return [];
+			return { ok: false, items: [] };
 		}
 
 		const payload = await response.json() as { success?: boolean; games?: unknown[] };
-		if (!Array.isArray(payload.games)) {
+		if (payload.success === false || !Array.isArray(payload.games)) {
 			console.warn("[games-search] depotbox returned an invalid payload");
-			setCachedDepotSearch(searchTerm, limit, []);
-			return [];
+			return { ok: false, items: [] };
 		}
 
 		const items = payload.games
@@ -618,68 +641,121 @@ async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: num
 
 		const validatedItems = await validateDepotboxResultsWithSteam(items);
 		setCachedDepotSearch(searchTerm, limit, validatedItems);
-		return validatedItems;
+		return { ok: true, items: validatedItems };
 	} catch (error) {
 		console.warn("[games-search] depotbox request failed:", error instanceof Error ? error.message : "unknown error");
-		return [];
+		return { ok: false, items: [] };
 	}
 }
 
-async function loadFallbackCatalog(): Promise<SearchItem[]> {
-	if (gamesCatalogCache.expiresAt > Date.now() && gamesCatalogCache.items.length > 0) {
-		return gamesCatalogCache.items;
-	}
-
-	const response = await fetchWithTimeout(FALLBACK_GAMES_CATALOG_URL, {
-		headers: {
-			Accept: "application/json",
-			"User-Agent": USER_AGENT,
-		},
-	}, SEARCH_SOURCE_TIMEOUT_MS);
-
-	if (!response.ok) {
-		throw new Error(`Fallback catalog returned HTTP ${response.status}`);
-	}
-
-	const payload = await response.json();
-	if (!Array.isArray(payload)) {
-		throw new Error("Invalid games catalog payload");
-	}
-
-	const items = payload
-		.map(normalizeFallbackCatalogGame)
-		.filter((item): item is SearchItem => Boolean(item));
-
-	gamesCatalogCache = {
-		expiresAt: Date.now() + GAMES_CATALOG_CACHE_TTL_MS,
-		items,
-	};
-
-	return items;
-}
-
-async function searchFallbackCatalog(searchTerm: string, limit: number): Promise<SearchItem[]> {
+async function searchD1Catalog(c: AppContext, searchTerm: string, limit: number): Promise<SearchItem[]> {
 	const query = searchTerm.trim();
+	const safeLimit = Math.max(1, Math.trunc(Number(limit) || 0));
 	if (!query) return [];
-	if (hasFreshCatalogMiss(query, limit)) return [];
 
-	const items = await loadFallbackCatalog();
-	const matches = searchCatalogLikeRyu(items, query, limit);
-	const enrichedItems = await finalizeCatalogItems(matches);
+	const rows: GamesCatalogRow[] = [];
 
-	if (enrichedItems.length === 0) {
-		recordCatalogMiss(query, limit);
-	} else {
-		clearCatalogMiss(query, limit);
+	if (/^\d+$/.test(query)) {
+		const exact = await c.env.merlin_db
+			.prepare(
+				`
+					SELECT app_id, name, cover_url, cover_source
+					FROM games_catalog
+					WHERE app_id = ?
+					LIMIT 1
+				`,
+			)
+			.bind(query)
+			.all<GamesCatalogRow>();
+
+		rows.push(...(exact.results || []));
+		if (rows.length >= safeLimit) {
+			return finalizeCatalogItems(rows.map(mapGamesCatalogRow).filter((item): item is SearchItem => Boolean(item)));
+		}
 	}
 
-	return enrichedItems;
+	const ftsQuery = normalizeFtsQuery(query);
+	if (!ftsQuery) return [];
+
+	const result = await c.env.merlin_db
+		.prepare(
+			`
+				SELECT g.app_id, g.name, g.cover_url, g.cover_source
+				FROM games_catalog_fts f
+				JOIN games_catalog g ON g.rowid = f.rowid
+				WHERE games_catalog_fts MATCH ?
+				ORDER BY bm25(games_catalog_fts)
+				LIMIT ?
+			`,
+		)
+		.bind(ftsQuery, safeLimit)
+		.all<GamesCatalogRow>();
+
+	const seen = new Set(rows.map((row) => row.app_id));
+	for (const row of result.results || []) {
+		if (seen.has(row.app_id)) continue;
+		seen.add(row.app_id);
+		rows.push(row);
+	}
+
+	return finalizeCatalogItems(rows
+		.slice(0, safeLimit)
+		.map(mapGamesCatalogRow)
+		.filter((item): item is SearchItem => Boolean(item)));
+}
+
+async function upsertGamesCatalogItems(c: AppContext, items: GamesCatalogUpsertItem[]): Promise<void> {
+	if (items.length === 0) return;
+
+	const now = new Date().toISOString();
+	const uniqueItems = new Map<string, GamesCatalogUpsertItem>();
+	for (const item of items) {
+		if (!/^\d+$/.test(item.appId) || !item.name.trim()) continue;
+		uniqueItems.set(item.appId, item);
+	}
+
+	const statements = [...uniqueItems.values()].map((item) => c.env.merlin_db
+		.prepare(
+			`
+				INSERT INTO games_catalog (
+					app_id,
+					name,
+					type,
+					cover_url,
+					cover_source,
+					tags_json,
+					nsfw,
+					drm,
+					added_at,
+					updated_at,
+					catalog_source,
+					catalog_synced_at
+				)
+				VALUES (?, ?, 'game', ?, ?, '[]', 0, 0, NULL, NULL, ?, ?)
+				ON CONFLICT(app_id) DO UPDATE SET
+					name = excluded.name,
+					cover_url = COALESCE(excluded.cover_url, games_catalog.cover_url),
+					cover_source = COALESCE(excluded.cover_source, games_catalog.cover_source),
+					catalog_source = excluded.catalog_source,
+					catalog_synced_at = excluded.catalog_synced_at
+			`,
+		)
+		.bind(
+			item.appId,
+			item.name.trim(),
+			item.coverUrl || null,
+			item.coverSource || null,
+			item.catalogSource,
+			now,
+		));
+
+	await c.env.merlin_db.batch(statements);
 }
 
 export class GamesSearchRoute extends OpenAPIRoute {
 	schema = {
 		tags: ["Games"],
-		summary: "Search games using the catalog first and Depotbox as a filtered fallback",
+		summary: "Search games using the D1 catalog first and Depotbox as a fallback",
 		security: [{ bearerAuth: [] }],
 		request: {
 			body: {
@@ -720,24 +796,38 @@ export class GamesSearchRoute extends OpenAPIRoute {
 		const env = c.env as Env & GameSearchEnv;
 
 		try {
-			const catalogItems = await searchFallbackCatalog(searchTerm, limit);
-			if (catalogItems.length > 0) {
+			const d1CatalogItems = await searchD1Catalog(c, searchTerm, limit);
+			if (d1CatalogItems.length > 0) {
+				c.executionCtx.waitUntil(upsertGamesCatalogItems(c, d1CatalogItems.map((item) => ({
+					...item,
+					catalogSource: "catalog",
+				}))).catch((error) => {
+					console.warn("[games-search] D1 catalog refresh failed:", error instanceof Error ? error.message : "unknown error");
+				}));
+
 				return c.json({
 					success: true,
 					source: "catalog",
-					items: catalogItems,
+					items: d1CatalogItems,
 				}, 200);
 			}
 		} catch (error) {
-			console.warn("[games-search] fallback catalog request failed:", error instanceof Error ? error.message : "unknown error");
+			console.warn("[games-search] D1 catalog search failed:", error instanceof Error ? error.message : "unknown error");
 		}
 
-		const depotboxItems = await searchDepotbox(env, searchTerm, limit);
-		if (depotboxItems.length > 0) {
+		const depotboxResult = await searchDepotbox(env, searchTerm, limit);
+		if (depotboxResult.ok) {
+			c.executionCtx.waitUntil(upsertGamesCatalogItems(c, depotboxResult.items.map((item) => ({
+				...item,
+				catalogSource: "depotbox",
+			}))).catch((error) => {
+				console.warn("[games-search] D1 catalog upsert failed:", error instanceof Error ? error.message : "unknown error");
+			}));
+
 			return c.json({
 				success: true,
 				source: "depotbox",
-				items: depotboxItems,
+				items: depotboxResult.items,
 			}, 200);
 		}
 
