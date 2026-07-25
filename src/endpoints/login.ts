@@ -19,7 +19,7 @@ type LicenseRecord = {
 	id: number;
 	license_key: string;
 	name: string;
-	phone: string;
+	contact: string;
 	hwid: string | null;
 	expires_at: string;
 	status: "active" | "revoked";
@@ -33,7 +33,7 @@ async function getLicenseByKey(c: AppContext, licenseKey: string): Promise<Licen
 					id,
 					license_key,
 					name,
-					phone,
+					contact,
 					hwid,
 					expires_at,
 					status

@@ -22,6 +22,8 @@ const MANIFESTS_LIMIT_MESSAGE =
 	"O limite temporario de solicitacoes desta licenca foi atingido. Aguarde alguns instantes e tente novamente.";
 const ADMIN_LIMIT_MESSAGE =
 	"O limite temporario de solicitacoes administrativas foi atingido. Aguarde alguns instantes e tente novamente.";
+const PUBLIC_ACCESS_LIMIT_MESSAGE =
+	"O limite temporario de solicitacoes foi atingido. Aguarde alguns instantes e tente novamente.";
 
 function getRateLimiter(binding: RateLimitBinding | undefined, name: string): RateLimitBinding {
 	if (!binding) {
@@ -85,4 +87,18 @@ export async function enforceManifestsRateLimit(c: AppContext, licenseId: number
 export async function enforceAdminRateLimit(c: AppContext, adminKey: string) {
 	const env = c.env as typeof c.env & RateLimitBindings;
 	await enforceLimit(env.ADMIN_RATE_LIMITER, adminKey, ADMIN_LIMIT_MESSAGE, "admin");
+}
+
+export async function enforcePublicAccessKeyRateLimit(c: AppContext, contactKey: string) {
+	const env = c.env as typeof c.env & RateLimitBindings;
+	const clientIp = getClientIp(c);
+	const normalizedContactKey = contactKey.trim().toLowerCase();
+	const keys = [
+		clientIp ? `public-access:ip:${clientIp}` : null,
+		normalizedContactKey ? `public-access:contact:${normalizedContactKey}` : null,
+	].filter((key): key is string => Boolean(key));
+
+	for (const key of keys) {
+		await enforceLimit(env.LOGIN_RATE_LIMITER, key, PUBLIC_ACCESS_LIMIT_MESSAGE, "public-access");
+	}
 }

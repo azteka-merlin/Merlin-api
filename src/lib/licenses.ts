@@ -7,7 +7,11 @@ export type LicenseRecord = {
 	id: number;
 	license_key: string;
 	name: string;
-	phone: string;
+	contact: string;
+	contact_type: "phone" | "email" | "discord";
+	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import";
+	recovery_pin_hash: string | null;
+	recovery_notice_accepted_at: string | null;
 	hwid: string | null;
 	expires_at: string;
 	status: "active" | "revoked";
@@ -64,7 +68,11 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		id: record.id,
 		licenseKey: record.license_key,
 		name: record.name,
-		phone: record.phone,
+		contact: record.contact,
+		contactType: record.contact_type,
+		source: record.source,
+		recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
+		phone: record.contact,
 		hwid: record.hwid,
 		expiresAt: toDateOnly(record.expires_at),
 		status: record.status,
@@ -82,7 +90,11 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 					id,
 					license_key,
 					name,
-					phone,
+					contact,
+					contact_type,
+					source,
+					recovery_pin_hash,
+					recovery_notice_accepted_at,
 					hwid,
 					expires_at,
 					status,

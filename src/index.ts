@@ -66,6 +66,16 @@ import {
 } from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
+import { enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import {
+  getPublicSignupMetrics,
+  getPublicSignupSettings,
+  getPublicSignupSettingsPayload,
+  normalizePublicAccessContact,
+  recoverPublicAccessKey,
+  registerPublicAccessKey,
+  updatePublicSignupSettings,
+} from "./lib/public-access-keys";
 
 const app = new Hono<{ Bindings: AppBindings }>();
 
@@ -73,8 +83,11 @@ app.use("*", async (c, next) => {
   await next();
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
+  const isPublicDownloadRoute = c.req.path === "/download";
   const csp = isSwaggerRoute
     ? "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob: https://fastly.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    : isPublicDownloadRoute
+      ? "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
   const headers = new Headers(c.res.headers);
@@ -106,7 +119,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/settings"] as const;
+const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/settings", "/public-signup"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -114,9 +127,32 @@ const adminLoginSchema = z.object({
 });
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
-  phone: z.string().min(1),
+  contact: z.string().min(1).optional(),
+  contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
+  phone: z.string().min(1).optional(),
   expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   hwid: z.string().trim().optional().nullable(),
+}).refine((value) => Boolean(value.contact || value.phone), {
+  message: "Contact is required",
+  path: ["contact"],
+});
+const publicAccessKeySchema = z.object({
+  name: z.string().trim().min(1),
+  contact: z.string().trim().min(1),
+  contactType: z.enum(["phone", "email", "discord"]),
+  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+  acceptedRecoveryNotice: z.boolean(),
+});
+const publicAccessKeyRecoverySchema = z.object({
+  contact: z.string().trim().min(1),
+  contactType: z.enum(["phone", "email", "discord"]),
+  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+});
+const publicSignupSettingsSchema = z.object({
+  enabled: z.boolean(),
+  durationAmount: z.number().int().positive().optional().default(30),
+  durationUnit: z.enum(["days", "weeks", "months", "years"]).optional().default("days"),
+  isLifetime: z.boolean(),
 });
 const overrideUploadInitSchema = z.object({
   appId: z.string().regex(/^\d+$/),
@@ -524,6 +560,759 @@ async function servePanelApp(c: any) {
   return c.env.ASSETS.fetch(getPanelIndexRequest(c));
 }
 
+function renderPublicDownloadPage() {
+  return `<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Merlin - Download</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: #eef2ff; background: radial-gradient(circle at 16% 5%, rgba(139, 92, 246, .28), transparent 32%), radial-gradient(circle at 86% 24%, rgba(47, 125, 246, .18), transparent 28%), #070b15; }
+    main { width: min(1120px, calc(100% - 32px)); min-height: 100vh; margin: 0 auto; padding: 38px 0; display: grid; align-items: center; }
+    .hero { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(380px, 440px); gap: 26px; align-items: center; }
+    .hero.signup-closed { grid-template-columns: minmax(0, 720px); justify-content: center; }
+    .panel { border: 1px solid rgba(139, 92, 246, .42); background: linear-gradient(180deg, rgba(15, 23, 42, .92), rgba(8, 13, 26, .94)); border-radius: 20px; box-shadow: 0 24px 90px rgba(0,0,0,.38); }
+    .intro { padding: 38px; min-height: 560px; display: flex; flex-direction: column; justify-content: center; }
+    .intro-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 26px; }
+    .brand { display: inline-flex; align-items: center; gap: 12px; margin-bottom: 26px; color: #c4b5fd; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; font-size: 13px; }
+    .intro-top .brand { margin-bottom: 0; }
+    .logo { width: 42px; height: 42px; border-radius: 13px; display: grid; place-items: center; background: linear-gradient(135deg, rgba(139,92,246,.34), rgba(47,125,246,.22)); border: 1px solid rgba(196,181,253,.38); color: #fff; font-size: 23px; line-height: 1; }
+    .language-select { height: 38px; min-width: 116px; border: 1px solid rgba(148,163,184,.2); background: rgba(2,6,23,.54); color: #e5e7eb; border-radius: 10px; padding: 0 10px; font: inherit; font-size: 13px; font-weight: 850; outline: none; cursor: pointer; }
+    .language-select:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,.18); }
+    .intro h1 { margin: 0 0 14px; font-size: clamp(42px, 6vw, 76px); line-height: .94; letter-spacing: 0; }
+    .intro p { margin: 0; color: #cbd5e1; font-size: 18px; line-height: 1.6; max-width: 620px; }
+    .hero-art { width: 100%; height: 230px; margin: 28px 0 0; border-radius: 18px; object-fit: cover; object-position: center; border: 1px solid rgba(139,92,246,.3); box-shadow: 0 18px 46px rgba(0,0,0,.32); background: rgba(2,6,23,.42); }
+    .signup-closed .hero-art { height: 300px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; }
+    .button { border: 0; border-radius: 11px; padding: 12px 17px; color: white; font-weight: 900; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 44px; font: inherit; transition: transform .16s ease, border-color .16s ease, opacity .16s ease; }
+    .button:hover { transform: translateY(-1px); }
+    .button:disabled { cursor: not-allowed; opacity: .72; transform: none; }
+    .button.primary { background: linear-gradient(135deg, #8b5cf6, #2f7df6); box-shadow: 0 16px 34px rgba(47,125,246,.22); }
+    .button.download { min-height: 52px; padding: 14px 22px; font-size: 16px; }
+    .button.ghost { background: rgba(255,255,255,.075); border: 1px solid rgba(255,255,255,.12); }
+    .button.subtle { color: #cbd5e1; background: transparent; border: 1px solid rgba(148,163,184,.16); }
+    .version { margin-top: 18px; color: #b6c2d4; font-size: 13px; font-weight: 700; }
+    .benefits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 26px; padding-top: 22px; border-top: 1px solid rgba(148,163,184,.13); }
+    .benefit { display: flex; align-items: center; gap: 11px; min-height: 48px; padding: 11px 12px; color: #dbeafe; font-size: 14px; line-height: 1.25; font-weight: 850; border: 1px solid rgba(148,163,184,.12); border-radius: 13px; background: rgba(2,6,23,.34); }
+    .benefit span:first-child { flex: 0 0 22px; width: 22px; height: 22px; border-radius: 999px; display: grid; place-items: center; background: rgba(139,92,246,.2); color: #c4b5fd; font-size: 12px; }
+    .card { padding: 28px; }
+    .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 22px; padding: 5px; border-radius: 14px; background: rgba(2,6,23,.54); border: 1px solid rgba(148,163,184,.13); }
+    .tab { border: 1px solid transparent; background: transparent; color: #94a3b8; border-radius: 10px; padding: 11px; font-weight: 900; cursor: pointer; font: inherit; }
+    .tab.active { color: #fff; border-color: rgba(139,92,246,.62); background: rgba(139,92,246,.24); }
+    .form-panel { display: grid; gap: 15px; }
+    .field { display: grid; gap: 7px; color: #dbeafe; font-size: 13px; font-weight: 850; }
+    .input-wrap { position: relative; }
+    .input-icon { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px; display: grid; place-items: center; color: #9ca3af; pointer-events: none; }
+    input { width: 100%; height: 42px; border: 1px solid rgba(148,163,184,.22); background: rgba(2,6,23,.72); color: #f8fafc; border-radius: 10px; padding: 10px 12px 10px 42px; outline: none; font: inherit; font-weight: 750; }
+    input:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,.18); }
+    .segment { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; padding: 5px; border-radius: 13px; background: rgba(2,6,23,.54); border: 1px solid rgba(148,163,184,.13); }
+    .segment button { height: 37px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #94a3b8; font: inherit; font-weight: 900; cursor: pointer; }
+    .segment button.active { color: #fff; border-color: rgba(139,92,246,.62); background: rgba(139,92,246,.23); }
+    .hint { color: #a8b3c7; line-height: 1.45; font-size: 12px; font-weight: 650; margin: 0; }
+    .notice { display: flex; gap: 10px; align-items: flex-start; color: #dbeafe; font-size: 12px; line-height: 1.45; padding: 12px; border-radius: 12px; background: rgba(139,92,246,.13); border: 1px solid rgba(139,92,246,.28); font-weight: 760; }
+    .notice input { width: 18px; height: 18px; margin: 1px 0 0; padding: 0; accent-color: #8b5cf6; flex: 0 0 auto; }
+    .field-error { min-height: 16px; color: #fca5a5; font-size: 12px; font-weight: 850; }
+    .message { min-height: 18px; color: #fca5a5; font-size: 13px; font-weight: 850; }
+    .success { display: none; text-align: center; padding: 10px 0 4px; }
+    .success.active { display: block; }
+    .success-mark { width: 54px; height: 54px; margin: 0 auto 14px; border-radius: 999px; display: grid; place-items: center; background: linear-gradient(135deg, #8b5cf6, #2f7df6); font-weight: 950; font-size: 24px; box-shadow: 0 16px 34px rgba(47,125,246,.2); }
+    .success h2 { margin: 0 0 8px; font-size: 26px; line-height: 1.1; }
+    .success p { margin: 0 0 18px; color: #a8b3c7; line-height: 1.5; }
+    .key-card { margin: 0 0 16px; padding: 16px; border-radius: 15px; border: 1px solid rgba(139,92,246,.34); background: rgba(2,6,23,.55); }
+    .key-card code { display: block; color: #fff; font-size: 18px; font-weight: 900; letter-spacing: .04em; overflow-wrap: anywhere; }
+    .success-actions { display: grid; gap: 10px; }
+    [hidden] { display: none !important; }
+    @media (max-width: 920px) {
+      main { align-items: start; padding: 22px 0; }
+      .hero { grid-template-columns: 1fr; }
+      .intro { min-height: auto; padding: 28px; }
+      .card { padding: 24px; }
+    }
+    @media (max-width: 560px) {
+      main { width: min(100% - 20px, 1120px); }
+      .intro, .card { padding: 20px; border-radius: 16px; }
+      .intro-top { align-items: flex-start; flex-direction: column; }
+      .intro h1 { font-size: 42px; }
+      .hero-art, .signup-closed .hero-art { height: 190px; border-radius: 14px; }
+      .actions, .benefits { grid-template-columns: 1fr; }
+      .button { width: 100%; }
+      .benefits { display: grid; }
+      .segment button, .tab { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <section class="panel intro">
+        <div>
+          <div class="intro-top">
+            <div class="brand"><span class="logo">M</span><span>Merlin Launcher</span></div>
+            <select class="language-select" id="languageSelect" aria-label="Language">
+              <option value="en">English</option>
+              <option value="ptbr">Português</option>
+              <option value="es">Español</option>
+              <option value="fr">Français</option>
+              <option value="de">Deutsch</option>
+            </select>
+          </div>
+          <h1>Merlin</h1>
+          <p data-i18n="heroDescription">Download the latest version of Merlin and manage your access key safely.</p>
+          <img class="hero-art" src="/merlin-download-hero.png" alt="Merlin" />
+          <div class="actions">
+            <a class="button primary download" href="/api/updates/download"><span>⬇</span> <span data-i18n="download">Download Merlin</span></a>
+          </div>
+          <div class="version" id="versionText" data-i18n="versionLoading">Loading current version...</div>
+          <div class="benefits" aria-label="Beneficios do Merlin">
+            <div class="benefit"><span>✓</span><span data-i18n="benefitInstall">Simple installation</span></div>
+            <div class="benefit"><span>✓</span><span data-i18n="benefitUpdates">Automatic updates</span></div>
+            <div class="benefit signup-copy"><span>✓</span><span data-i18n="benefitRecovery">Access key recovery</span></div>
+            <div class="benefit signup-copy"><span>✓</span><span data-i18n="benefitActivation">Secure activation</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel card" id="signupCard" hidden>
+        <div class="tabs">
+          <button class="tab active" id="registerTab" type="button" data-i18n="createTab">Create key</button>
+          <button class="tab" id="recoverTab" type="button" data-i18n="recoverTab">Recover</button>
+        </div>
+
+        <form class="form-panel" id="registerForm" novalidate>
+          <div class="field" data-field="name">
+            <span data-i18n="name">Name</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">♙</span>
+              <input name="name" autocomplete="name" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <div class="field" data-field="contact">
+            <span data-i18n="contact">Contact</span>
+            <div class="input-wrap">
+              <span class="input-icon" data-contact-icon aria-hidden="true">☎</span>
+              <input name="contact" autocomplete="tel" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <div class="field">
+            <span data-i18n="contactType">Contact type</span>
+            <div class="segment" data-segment="register">
+              <button class="active" type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
+              <button type="button" data-contact-type="email" data-i18n="email">E-mail</button>
+              <button type="button" data-contact-type="discord">Discord</button>
+            </div>
+            <input name="contactType" type="hidden" value="phone" />
+          </div>
+          <div class="field" data-field="recoveryPin">
+            <span data-i18n="pin">Recovery PIN</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">#</span>
+              <input name="recoveryPin" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <p class="hint" data-i18n="contactHint">Your contact will only be used to help recover your key if you lose it.</p>
+          <p class="hint" data-i18n="pinHint">Keep this PIN. It will be required to recover your access key.</p>
+          <label class="notice">
+            <input name="acceptedRecoveryNotice" type="checkbox" required />
+            <span data-i18n="notice">I understand that if I lose my contact or PIN, it may not be possible to recover my key.</span>
+          </label>
+          <div class="field-error" data-checkbox-error></div>
+          <button class="button primary" type="submit" data-default-key="createSubmit" data-default-text="Create my access key">Create my access key</button>
+        </form>
+
+        <form class="form-panel" id="recoverForm" hidden novalidate>
+          <div class="field" data-field="contact">
+            <span data-i18n="contact">Contact</span>
+            <div class="input-wrap">
+              <span class="input-icon" data-contact-icon aria-hidden="true">☎</span>
+              <input name="contact" autocomplete="tel" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <div class="field">
+            <span data-i18n="contactType">Contact type</span>
+            <div class="segment" data-segment="recover">
+              <button class="active" type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
+              <button type="button" data-contact-type="email" data-i18n="email">E-mail</button>
+              <button type="button" data-contact-type="discord">Discord</button>
+            </div>
+            <input name="contactType" type="hidden" value="phone" />
+          </div>
+          <div class="field" data-field="recoveryPin">
+            <span data-i18n="pin">Recovery PIN</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">#</span>
+              <input name="recoveryPin" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <button class="button primary" type="submit" data-default-key="recoverSubmit" data-default-text="Recover my access key">Recover my access key</button>
+        </form>
+
+        <div class="message" id="message"></div>
+        <div class="success" id="result">
+          <div class="success-mark">✓</div>
+          <h2 id="resultTitle">Your key was created</h2>
+          <p data-i18n="successDescription">Keep your key somewhere safe. It will be used to access Merlin.</p>
+          <div class="key-card">
+            <code id="licenseKey"></code>
+          </div>
+          <div class="success-actions">
+            <button class="button ghost" id="copyKey" type="button" data-i18n="copyKey">Copy key</button>
+            <a class="button primary" href="/api/updates/download" data-i18n="download">Download Merlin</a>
+            <button class="button subtle" id="createAnother" type="button" data-i18n="createAnother">Create another key</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script src="/download.js" defer></script>
+</body>
+</html>`;
+}
+
+function renderPublicDownloadScript() {
+  return `"use strict";
+
+const messages = {
+  en: {
+    heroDescription: "Download the latest version of Merlin and manage your access key safely.",
+    heroDescriptionDownloadOnly: "Download the latest version of Merlin.",
+    download: "Download Merlin",
+    versionLoading: "Loading current version...",
+    versionCurrent: "Current version: {version}",
+    versionAvailable: "Current version available for download.",
+    downloadAvailable: "Download available.",
+    benefitInstall: "Simple installation",
+    benefitUpdates: "Automatic updates",
+    benefitRecovery: "Access key recovery",
+    benefitActivation: "Secure activation",
+    createTab: "Create key",
+    recoverTab: "Recover",
+    name: "Name",
+    contact: "Contact",
+    contactType: "Contact type",
+    phone: "Phone",
+    email: "E-mail",
+    pin: "Recovery PIN",
+    contactHint: "Your contact will only be used to help recover your key if you lose it.",
+    pinHint: "Keep this PIN. It will be required to recover your access key.",
+    notice: "I understand that if I lose my contact or PIN, it may not be possible to recover my key.",
+    createSubmit: "Create my access key",
+    recoverSubmit: "Recover my access key",
+    successCreated: "Your key was created",
+    successRecovered: "Your key was recovered",
+    successExisting: "Your access key",
+    successDescription: "Keep your key somewhere safe. It will be used to access Merlin.",
+    copyKey: "Copy key",
+    copied: "Key copied",
+    createAnother: "Create another key",
+    loading: "Please wait...",
+    errorName: "Enter your name.",
+    errorContact: "Enter your contact.",
+    errorEmail: "Enter a valid e-mail.",
+    errorPin: "Use a PIN with 4 to 8 numbers.",
+    errorNotice: "Confirm the recovery notice to continue.",
+    genericError: "Could not complete the request.",
+  },
+  ptbr: {
+    heroDescription: "Baixe a versão mais recente do Merlin e gerencie sua chave de acesso com segurança.",
+    heroDescriptionDownloadOnly: "Baixe a versão mais recente do Merlin.",
+    download: "Baixar Merlin",
+    versionLoading: "Carregando versão atual...",
+    versionCurrent: "Versão atual: {version}",
+    versionAvailable: "Versão atual disponível para download.",
+    downloadAvailable: "Download disponível.",
+    benefitInstall: "Instalação simples",
+    benefitUpdates: "Atualizações automáticas",
+    benefitRecovery: "Recuperação de chave",
+    benefitActivation: "Ativação segura",
+    createTab: "Criar chave",
+    recoverTab: "Recuperar",
+    name: "Nome",
+    contact: "Contato",
+    contactType: "Tipo de contato",
+    phone: "Telefone",
+    email: "E-mail",
+    pin: "PIN de recuperação",
+    contactHint: "Seu contato será usado apenas para ajudar a recuperar sua chave caso você a perca.",
+    pinHint: "Guarde esse PIN. Ele será necessário para recuperar sua chave de acesso.",
+    notice: "Entendo que, se eu perder meu contato ou PIN, talvez não seja possível recuperar minha chave.",
+    createSubmit: "Criar minha chave de acesso",
+    recoverSubmit: "Recuperar minha chave de acesso",
+    successCreated: "Sua chave foi criada",
+    successRecovered: "Sua chave foi recuperada",
+    successExisting: "Sua chave de acesso",
+    successDescription: "Guarde sua chave em um lugar seguro. Ela será usada para acessar o Merlin.",
+    copyKey: "Copiar chave",
+    copied: "Chave copiada",
+    createAnother: "Criar outra chave",
+    loading: "Aguarde...",
+    errorName: "Informe seu nome.",
+    errorContact: "Informe seu contato.",
+    errorEmail: "Informe um e-mail válido.",
+    errorPin: "Use um PIN com 4 a 8 números.",
+    errorNotice: "Confirme o aviso de recuperação para continuar.",
+    genericError: "Não foi possível concluir a solicitação.",
+  },
+  es: {
+    heroDescription: "Descarga la versión más reciente de Merlin y administra tu clave de acceso de forma segura.",
+    heroDescriptionDownloadOnly: "Descarga la versión más reciente de Merlin.",
+    download: "Descargar Merlin",
+    versionLoading: "Cargando versión actual...",
+    versionCurrent: "Versión actual: {version}",
+    versionAvailable: "Versión actual disponible para descargar.",
+    downloadAvailable: "Descarga disponible.",
+    benefitInstall: "Instalación simple",
+    benefitUpdates: "Actualizaciones automáticas",
+    benefitRecovery: "Recuperación de clave",
+    benefitActivation: "Activación segura",
+    createTab: "Crear clave",
+    recoverTab: "Recuperar",
+    name: "Nombre",
+    contact: "Contacto",
+    contactType: "Tipo de contacto",
+    phone: "Teléfono",
+    email: "E-mail",
+    pin: "PIN de recuperación",
+    contactHint: "Tu contacto solo se usará para ayudarte a recuperar tu clave si la pierdes.",
+    pinHint: "Guarda este PIN. Será necesario para recuperar tu clave de acceso.",
+    notice: "Entiendo que, si pierdo mi contacto o PIN, quizá no sea posible recuperar mi clave.",
+    createSubmit: "Crear mi clave de acceso",
+    recoverSubmit: "Recuperar mi clave de acceso",
+    successCreated: "Tu clave fue creada",
+    successRecovered: "Tu clave fue recuperada",
+    successExisting: "Tu clave de acceso",
+    successDescription: "Guarda tu clave en un lugar seguro. Se usará para acceder a Merlin.",
+    copyKey: "Copiar clave",
+    copied: "Clave copiada",
+    createAnother: "Crear otra clave",
+    loading: "Espera...",
+    errorName: "Ingresa tu nombre.",
+    errorContact: "Ingresa tu contacto.",
+    errorEmail: "Ingresa un e-mail válido.",
+    errorPin: "Usa un PIN de 4 a 8 números.",
+    errorNotice: "Confirma el aviso de recuperación para continuar.",
+    genericError: "No se pudo completar la solicitud.",
+  },
+  fr: {
+    heroDescription: "Téléchargez la dernière version de Merlin et gérez votre clé d'accès en toute sécurité.",
+    heroDescriptionDownloadOnly: "Téléchargez la dernière version de Merlin.",
+    download: "Télécharger Merlin",
+    versionLoading: "Chargement de la version actuelle...",
+    versionCurrent: "Version actuelle : {version}",
+    versionAvailable: "Version actuelle disponible au téléchargement.",
+    downloadAvailable: "Téléchargement disponible.",
+    benefitInstall: "Installation simple",
+    benefitUpdates: "Mises à jour automatiques",
+    benefitRecovery: "Récupération de clé",
+    benefitActivation: "Activation sécurisée",
+    createTab: "Créer une clé",
+    recoverTab: "Récupérer",
+    name: "Nom",
+    contact: "Contact",
+    contactType: "Type de contact",
+    phone: "Téléphone",
+    email: "E-mail",
+    pin: "PIN de récupération",
+    contactHint: "Votre contact servira uniquement à récupérer votre clé si vous la perdez.",
+    pinHint: "Conservez ce PIN. Il sera nécessaire pour récupérer votre clé d'accès.",
+    notice: "Je comprends que si je perds mon contact ou mon PIN, il peut être impossible de récupérer ma clé.",
+    createSubmit: "Créer ma clé d'accès",
+    recoverSubmit: "Récupérer ma clé d'accès",
+    successCreated: "Votre clé a été créée",
+    successRecovered: "Votre clé a été récupérée",
+    successExisting: "Votre clé d'accès",
+    successDescription: "Conservez votre clé dans un endroit sûr. Elle servira à accéder à Merlin.",
+    copyKey: "Copier la clé",
+    copied: "Clé copiée",
+    createAnother: "Créer une autre clé",
+    loading: "Patientez...",
+    errorName: "Indiquez votre nom.",
+    errorContact: "Indiquez votre contact.",
+    errorEmail: "Indiquez un e-mail valide.",
+    errorPin: "Utilisez un PIN de 4 à 8 chiffres.",
+    errorNotice: "Confirmez l'avis de récupération pour continuer.",
+    genericError: "Impossible de terminer la demande.",
+  },
+  de: {
+    heroDescription: "Lade die neueste Version von Merlin herunter und verwalte deinen Zugangsschlüssel sicher.",
+    heroDescriptionDownloadOnly: "Lade die neueste Version von Merlin herunter.",
+    download: "Merlin herunterladen",
+    versionLoading: "Aktuelle Version wird geladen...",
+    versionCurrent: "Aktuelle Version: {version}",
+    versionAvailable: "Aktuelle Version steht zum Download bereit.",
+    downloadAvailable: "Download verfügbar.",
+    benefitInstall: "Einfache Installation",
+    benefitUpdates: "Automatische Updates",
+    benefitRecovery: "Schlüsselwiederherstellung",
+    benefitActivation: "Sichere Aktivierung",
+    createTab: "Schlüssel erstellen",
+    recoverTab: "Wiederherstellen",
+    name: "Name",
+    contact: "Kontakt",
+    contactType: "Kontakttyp",
+    phone: "Telefon",
+    email: "E-Mail",
+    pin: "Wiederherstellungs-PIN",
+    contactHint: "Dein Kontakt wird nur verwendet, um deinen Schlüssel wiederherzustellen, falls du ihn verlierst.",
+    pinHint: "Bewahre diese PIN auf. Sie wird zur Wiederherstellung deines Zugangsschlüssels benötigt.",
+    notice: "Ich verstehe, dass mein Schlüssel möglicherweise nicht wiederhergestellt werden kann, wenn ich Kontakt oder PIN verliere.",
+    createSubmit: "Meinen Zugangsschlüssel erstellen",
+    recoverSubmit: "Meinen Zugangsschlüssel wiederherstellen",
+    successCreated: "Dein Schlüssel wurde erstellt",
+    successRecovered: "Dein Schlüssel wurde wiederhergestellt",
+    successExisting: "Dein Zugangsschlüssel",
+    successDescription: "Bewahre deinen Schlüssel sicher auf. Er wird für den Zugriff auf Merlin verwendet.",
+    copyKey: "Schlüssel kopieren",
+    copied: "Schlüssel kopiert",
+    createAnother: "Anderen Schlüssel erstellen",
+    loading: "Bitte warten...",
+    errorName: "Gib deinen Namen ein.",
+    errorContact: "Gib deinen Kontakt ein.",
+    errorEmail: "Gib eine gültige E-Mail ein.",
+    errorPin: "Verwende eine PIN mit 4 bis 8 Zahlen.",
+    errorNotice: "Bestätige den Wiederherstellungshinweis, um fortzufahren.",
+    genericError: "Die Anfrage konnte nicht abgeschlossen werden.",
+  },
+};
+
+function detectBrowserLanguage() {
+  const language = String(navigator.language || "en").toLowerCase();
+  if (language.startsWith("pt")) return "ptbr";
+  if (language.startsWith("es")) return "es";
+  if (language.startsWith("fr")) return "fr";
+  if (language.startsWith("de")) return "de";
+  return "en";
+}
+
+function resolveLanguage() {
+  const stored = localStorage.getItem("merlin_public_language");
+  if (stored && messages[stored]) return stored;
+  return detectBrowserLanguage();
+}
+
+let locale = resolveLanguage();
+let text = { ...messages.en, ...(messages[locale] || {}) };
+let versionState = { status: "loading", version: null };
+
+function t(key, values) {
+  let value = text[key] || messages.en[key] || key;
+  for (const [name, replacement] of Object.entries(values || {})) {
+    value = value.replace("{" + name + "}", String(replacement));
+  }
+  return value;
+}
+
+const registerTab = document.getElementById("registerTab");
+const recoverTab = document.getElementById("recoverTab");
+const registerForm = document.getElementById("registerForm");
+const recoverForm = document.getElementById("recoverForm");
+const signupCard = document.getElementById("signupCard");
+const languageSelect = document.getElementById("languageSelect");
+const hero = document.querySelector(".hero");
+const heroDescription = document.querySelector("[data-i18n='heroDescription']");
+const benefits = document.querySelector(".benefits");
+const message = document.getElementById("message");
+const result = document.getElementById("result");
+const resultTitle = document.getElementById("resultTitle");
+const licenseKey = document.getElementById("licenseKey");
+const copyKey = document.getElementById("copyKey");
+const createAnother = document.getElementById("createAnother");
+const versionText = document.getElementById("versionText");
+const contactIconMap = {
+  phone: "☎",
+  email: "@",
+  discord: "D",
+};
+
+function applyTranslations() {
+  document.documentElement.lang = locale === "ptbr" ? "pt-BR" : locale;
+  languageSelect.value = locale;
+  document.querySelectorAll("[data-i18n]").forEach((node) => {
+    node.textContent = t(node.dataset.i18n);
+  });
+  document.querySelectorAll("[data-default-key]").forEach((node) => {
+    node.dataset.defaultText = t(node.dataset.defaultKey);
+    if (!node.disabled) {
+      node.textContent = node.dataset.defaultText;
+    }
+  });
+  const signupEnabled = !signupCard.hidden;
+  renderVersionText();
+  versionText.hidden = false;
+  benefits.hidden = false;
+  heroDescription.textContent = signupEnabled ? t("heroDescription") : t("heroDescriptionDownloadOnly");
+}
+
+function setMode(mode) {
+  const recovering = mode === "recover";
+  result.classList.remove("active");
+  result.hidden = true;
+  registerForm.hidden = recovering;
+  recoverForm.hidden = !recovering;
+  recoverTab.classList.toggle("active", recovering);
+  registerTab.classList.toggle("active", !recovering);
+  message.textContent = "";
+  clearErrors(registerForm);
+  clearErrors(recoverForm);
+}
+
+function readForm(form) {
+  return Object.fromEntries(new FormData(form).entries());
+}
+
+function getField(form, name) {
+  return form.querySelector("[data-field='" + name + "']");
+}
+
+function setFieldError(form, name, text) {
+  const field = getField(form, name);
+  const target = field ? field.querySelector(".field-error") : null;
+  if (target) target.textContent = text || "";
+}
+
+function clearErrors(form) {
+  form.querySelectorAll(".field-error").forEach((node) => { node.textContent = ""; });
+  message.textContent = "";
+}
+
+function setCheckboxError(text) {
+  const target = registerForm.querySelector("[data-checkbox-error]");
+  if (target) target.textContent = text || "";
+}
+
+function normalizeDigits(value) {
+  return String(value || "").replace(/\\D/g, "");
+}
+
+function formatPhone(value) {
+  const digits = normalizeDigits(value).slice(0, 11);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 6) return "(" + digits.slice(0, 2) + ") " + digits.slice(2);
+  if (digits.length <= 10) return "(" + digits.slice(0, 2) + ") " + digits.slice(2, 6) + "-" + digits.slice(6);
+  return "(" + digits.slice(0, 2) + ") " + digits.slice(2, 7) + "-" + digits.slice(7);
+}
+
+function validateForm(form) {
+  clearErrors(form);
+  const data = readForm(form);
+  let valid = true;
+  if (form === registerForm && !String(data.name || "").trim()) {
+    setFieldError(form, "name", t("errorName"));
+    valid = false;
+  }
+  if (!String(data.contact || "").trim()) {
+    setFieldError(form, "contact", t("errorContact"));
+    valid = false;
+  }
+  if (data.contactType === "email" && !/^\\S+@\\S+\\.\\S+$/.test(String(data.contact || "").trim())) {
+    setFieldError(form, "contact", t("errorEmail"));
+    valid = false;
+  }
+  if (!/^\\d{4,8}$/.test(String(data.recoveryPin || "").trim())) {
+    setFieldError(form, "recoveryPin", t("errorPin"));
+    valid = false;
+  }
+  if (form === registerForm && data.acceptedRecoveryNotice !== "on") {
+    setCheckboxError(t("errorNotice"));
+    valid = false;
+  }
+  return valid;
+}
+
+function setLoading(form, loading) {
+  const button = form.querySelector("button[type='submit']");
+  if (!button) return;
+  button.disabled = loading;
+  button.textContent = loading ? t("loading") : button.dataset.defaultText;
+}
+
+async function submitJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.success === false) {
+    throw new Error(payload.error || t("genericError"));
+  }
+  return payload;
+}
+
+function showKey(title, key) {
+  resultTitle.textContent = title;
+  licenseKey.textContent = key;
+  registerForm.hidden = true;
+  recoverForm.hidden = true;
+  message.textContent = "";
+  result.hidden = false;
+  result.classList.add("active");
+}
+
+function renderVersionText() {
+  if (versionState.status === "current" && versionState.version) {
+    versionText.textContent = t("versionCurrent", { version: versionState.version });
+    return;
+  }
+
+  if (versionState.status === "available") {
+    versionText.textContent = t("versionAvailable");
+    return;
+  }
+
+  if (versionState.status === "download") {
+    versionText.textContent = t("downloadAvailable");
+    return;
+  }
+
+  versionText.textContent = t("versionLoading");
+}
+
+async function loadVersion() {
+  versionState = { status: "loading", version: null };
+  renderVersionText();
+  try {
+    const payload = await fetch("/api/updates/latest").then((response) => response.json());
+    versionState = payload.version
+      ? { status: "current", version: payload.version }
+      : { status: "available", version: null };
+  } catch {
+    versionState = { status: "download", version: null };
+  }
+  renderVersionText();
+}
+
+async function loadPublicSettings() {
+  try {
+    const payload = await fetch("/api/public/access-keys/settings").then((response) => response.json());
+    const enabled = Boolean(payload && payload.success !== false && payload.settings && payload.settings.enabled);
+    signupCard.hidden = !enabled;
+    hero.classList.toggle("signup-closed", !enabled);
+    versionText.hidden = false;
+    benefits.hidden = false;
+    heroDescription.textContent = enabled ? t("heroDescription") : t("heroDescriptionDownloadOnly");
+    document.querySelectorAll(".signup-copy").forEach((node) => {
+      node.hidden = false;
+    });
+  } catch {
+    signupCard.hidden = true;
+    hero.classList.add("signup-closed");
+    versionText.hidden = false;
+    benefits.hidden = false;
+    heroDescription.textContent = t("heroDescriptionDownloadOnly");
+    document.querySelectorAll(".signup-copy").forEach((node) => {
+      node.hidden = false;
+    });
+  }
+}
+
+function setContactType(form, type) {
+  form.querySelector("input[name='contactType']").value = type;
+  form.querySelectorAll("[data-contact-type]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.contactType === type);
+  });
+  form.querySelectorAll("[data-contact-icon]").forEach((icon) => {
+    icon.textContent = contactIconMap[type] || "?";
+  });
+  const contact = form.querySelector("input[name='contact']");
+  if (!contact) return;
+  contact.autocomplete = type === "phone" ? "tel" : type === "email" ? "email" : "off";
+  contact.inputMode = type === "phone" ? "tel" : "text";
+  if (type === "phone") {
+    contact.value = formatPhone(contact.value);
+  }
+  clearErrors(form);
+}
+
+document.querySelectorAll(".segment").forEach((segment) => {
+  const form = segment.closest("form");
+  segment.querySelectorAll("[data-contact-type]").forEach((button) => {
+    button.addEventListener("click", () => setContactType(form, button.dataset.contactType));
+  });
+});
+
+document.querySelectorAll("input[name='contact']").forEach((input) => {
+  input.addEventListener("input", () => {
+    const form = input.closest("form");
+    const type = form.querySelector("input[name='contactType']").value;
+    if (type === "phone") input.value = formatPhone(input.value);
+  });
+});
+
+registerTab.addEventListener("click", () => setMode("register"));
+recoverTab.addEventListener("click", () => setMode("recover"));
+languageSelect.addEventListener("change", () => {
+  const next = languageSelect.value;
+  if (!messages[next]) return;
+  locale = next;
+  text = { ...messages.en, ...messages[locale] };
+  localStorage.setItem("merlin_public_language", locale);
+  applyTranslations();
+});
+copyKey.addEventListener("click", async () => {
+  await navigator.clipboard.writeText(licenseKey.textContent || "");
+  copyKey.textContent = t("copied");
+  setTimeout(() => { copyKey.textContent = t("copyKey"); }, 1600);
+});
+createAnother.addEventListener("click", () => {
+  registerForm.reset();
+  recoverForm.reset();
+  setContactType(registerForm, "phone");
+  setContactType(recoverForm, "phone");
+  setMode("register");
+});
+
+registerForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!validateForm(registerForm)) return;
+  const data = readForm(registerForm);
+  setLoading(registerForm, true);
+  try {
+    const payload = await submitJson("/api/public/access-keys/register", {
+      name: data.name,
+      contact: data.contact,
+      contactType: data.contactType,
+      recoveryPin: data.recoveryPin,
+      acceptedRecoveryNotice: data.acceptedRecoveryNotice === "on",
+    });
+    showKey(payload.created ? t("successCreated") : t("successExisting"), payload.license.licenseKey);
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    setLoading(registerForm, false);
+  }
+});
+
+recoverForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!validateForm(recoverForm)) return;
+  const data = readForm(recoverForm);
+  setLoading(recoverForm, true);
+  try {
+    const payload = await submitJson("/api/public/access-keys/recover", data);
+    showKey(t("successRecovered"), payload.license.licenseKey);
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    setLoading(recoverForm, false);
+  }
+});
+
+applyTranslations();
+setContactType(registerForm, "phone");
+setContactType(recoverForm, "phone");
+loadPublicSettings();
+loadVersion();
+`;
+}
+
 function sessionPayload(sessionResult: AuthSessionResult | null) {
   if (!sessionResult) {
     return null;
@@ -737,6 +1526,19 @@ app.get("/login", async (c) => {
 
   clearAdminSessionCookie(c);
   return servePanelApp(c);
+});
+
+app.get("/download", (c) => {
+  return c.html(renderPublicDownloadPage());
+});
+
+app.get("/download.js", () => {
+  return new Response(renderPublicDownloadScript(), {
+    headers: {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "public, max-age=300",
+    },
+  });
 });
 
 for (const route of pageRoutes) {
@@ -1344,6 +2146,42 @@ app.get("/api/updates/download", async (c) => {
     status: 200,
     headers,
   });
+});
+
+app.get("/api/public/access-keys/settings", async (c) => {
+  const settings = await getPublicSignupSettings(c);
+  return c.json({ success: true, settings: { enabled: settings.enabled } }, 200);
+});
+
+app.post("/api/public/access-keys/register", async (c) => {
+  const body = parseBody(publicAccessKeySchema, await c.req.json());
+  const contact = normalizePublicAccessContact(body.contact, body.contactType);
+  await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
+  const result = await registerPublicAccessKey(c, { ...body, contact });
+  return c.json({ success: true, ...result }, result.created ? 201 : 200);
+});
+
+app.post("/api/public/access-keys/recover", async (c) => {
+  const body = parseBody(publicAccessKeyRecoverySchema, await c.req.json());
+  const contact = normalizePublicAccessContact(body.contact, body.contactType);
+  await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
+  const result = await recoverPublicAccessKey(c, { ...body, contact });
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.get("/panel-api/public-signup", async (c) => {
+  await requireAdminSession(c);
+  const settings = await getPublicSignupSettings(c);
+  const metrics = await getPublicSignupMetrics(c);
+  return c.json({ settings: getPublicSignupSettingsPayload(settings), metrics }, 200);
+});
+
+app.put("/panel-api/public-signup", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(publicSignupSettingsSchema, await c.req.json());
+  const settings = await updatePublicSignupSettings(c, body);
+  const metrics = await getPublicSignupMetrics(c);
+  return c.json({ settings: getPublicSignupSettingsPayload(settings), metrics }, 200);
 });
 
 app.get("/panel-api/updates", async (c) => {

@@ -88,17 +88,26 @@ export const CorrectionVoteResponse = z.object({
 
 export const CreateLicenseRequest = z.object({
 	name: z.string().min(1).describe("Customer name"),
-	phone: z.string().min(1).describe("Customer phone number"),
+	contact: z.string().min(1).optional().describe("Customer contact"),
+	contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
+	phone: z.string().min(1).optional().describe("Deprecated alias for contact"),
 	expiresAt: z
 		.string()
 		.regex(/^\d{4}-\d{2}-\d{2}$/)
 		.describe("License expiration date in YYYY-MM-DD format"),
+}).refine((value) => Boolean(value.contact || value.phone), {
+	message: "Contact is required",
+	path: ["contact"],
 });
 
 export const LicenseResponse = z.object({
 	id: z.number().int().positive(),
 	licenseKey: z.string().regex(/^MERLIN-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/),
 	name: z.string(),
+	contact: z.string(),
+	contactType: z.enum(["phone", "email", "discord"]),
+	source: z.string(),
+	recoveryNoticeAcceptedAt: z.string().nullable().optional(),
 	phone: z.string(),
 	hwid: z.string().nullable(),
 	expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),

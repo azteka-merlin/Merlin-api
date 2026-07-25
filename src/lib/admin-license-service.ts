@@ -1,7 +1,9 @@
-﻿import { HTTPException } from "hono/http-exception";
+import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
 import { writeAdminAuditLog } from "./admin-security";
+
+export type ContactType = "phone" | "email" | "discord";
 
 export type LicenseActionActor = {
   adminUserId: number;
@@ -14,7 +16,11 @@ export function mapLicense(record: LicenseRecord) {
     id: record.id,
     licenseKey: record.license_key,
     name: record.name,
-    phone: record.phone,
+    contact: record.contact,
+    contactType: record.contact_type,
+    source: record.source,
+    recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
+    phone: record.contact,
     hwid: record.hwid,
     expiresAt: toDateOnly(record.expires_at),
     status: record.status,
@@ -28,7 +34,7 @@ export async function listLicenses(c: AppContext) {
   const result = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, phone, hwid, expires_at, status, revoked_reason, created_at, updated_at
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
         FROM licenses
         ORDER BY id DESC
       `,
@@ -42,7 +48,7 @@ export async function getLicense(c: AppContext, id: number) {
   const license = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, phone, hwid, expires_at, status, revoked_reason, created_at, updated_at
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
         FROM licenses
         WHERE id = ?
       `,
@@ -65,20 +71,35 @@ function normalizeStoredPhone(value: string) {
   return digits.slice(0, 11);
 }
 
+export function normalizeContact(value: string, contactType: ContactType) {
+  if (contactType === "phone") {
+    return normalizeStoredPhone(value);
+  }
+  return String(value || "").trim().toLowerCase();
+}
+
+export function assertValidContact(contact: string, contactType: ContactType) {
+  if (contactType === "phone" && contact.length !== 11) {
+    throw new HTTPException(400, { message: "A valid Brazilian cellphone number with area code is required" });
+  }
+  if (contactType === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact)) {
+    throw new HTTPException(400, { message: "A valid email is required" });
+  }
+  if (contactType === "discord" && contact.length < 2) {
+    throw new HTTPException(400, { message: "A valid Discord contact is required" });
+  }
+}
+
 export async function createLicense(
   c: AppContext,
-  input: { name: string; phone: string; expiresAt: string },
+  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; expiresAt: string },
   actor?: LicenseActionActor,
 ) {
   const now = new Date().toISOString();
   const expiresAt = toIsoDateStart(input.expiresAt);
-  const normalizedPhone = normalizeStoredPhone(input.phone);
-  if (normalizedPhone.length !== 11) {
-    throw new HTTPException(400, { message: "A valid Brazilian cellphone number with area code is required" });
-  }
-  if (normalizedPhone.length !== 11) {
-    throw new HTTPException(400, { message: "A valid Brazilian cellphone number with area code is required" });
-  }
+  const contactType = input.contactType || "phone";
+  const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
+  assertValidContact(normalizedContact, contactType);
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
 
@@ -88,12 +109,12 @@ export async function createLicense(
         .prepare(
           `
             INSERT INTO licenses (
-              license_key, name, phone, hwid, expires_at, status, revoked_reason, created_at, updated_at
+              license_key, name, contact, contact_type, source, hwid, expires_at, status, revoked_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'admin', ?, ?, 'active', ?, ?, ?)
           `,
         )
-        .bind(licenseKey, input.name, normalizedPhone, null, expiresAt, null, now, now)
+        .bind(licenseKey, input.name, normalizedContact, contactType, null, expiresAt, null, now, now)
         .run();
       break;
     } catch (error) {
@@ -122,21 +143,23 @@ export async function createLicense(
 export async function updateLicense(
   c: AppContext,
   id: number,
-  input: { name: string; phone: string; expiresAt: string; hwid: string | null },
+  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; expiresAt: string; hwid: string | null },
   actor?: LicenseActionActor,
 ) {
   const current = await getLicense(c, id);
   const nextHwid = input.hwid?.trim() || null;
-  const normalizedPhone = normalizeStoredPhone(input.phone);
+  const contactType = input.contactType || current.contact_type || "phone";
+  const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
+  assertValidContact(normalizedContact, contactType);
   await c.env.merlin_db
     .prepare(
       `
         UPDATE licenses
-        SET name = ?, phone = ?, hwid = ?, expires_at = ?, updated_at = ?
+        SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(input.name, normalizedPhone, nextHwid, toIsoDateStart(input.expiresAt), new Date().toISOString(), current.id)
+    .bind(input.name, normalizedContact, contactType, nextHwid, toIsoDateStart(input.expiresAt), new Date().toISOString(), current.id)
     .run();
 
   const updated = await getLicense(c, id);

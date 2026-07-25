@@ -30,7 +30,8 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 						schema: CreateLicenseRequest,
 						example: {
 							name: "Fulano",
-							phone: "11999999999",
+							contact: "11999999999",
+							contactType: "phone",
 							expiresAt: "2026-07-20",
 						},
 					},
@@ -47,6 +48,9 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 							id: 1,
 							licenseKey: "MERLIN-GJQZ-LTQ8-HE5G",
 							name: "Fulano",
+							contact: "11999999999",
+							contactType: "phone",
+							source: "admin",
 							phone: "11999999999",
 							hwid: null,
 							expiresAt: "2026-07-20",
@@ -84,7 +88,9 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 					INSERT INTO licenses (
 						license_key,
 						name,
-						phone,
+						contact,
+						contact_type,
+						source,
 						hwid,
 						expires_at,
 						status,
@@ -92,7 +98,7 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 						created_at,
 						updated_at
 					)
-					VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+					VALUES (?, ?, ?, ?, 'admin', ?, ?, 'active', ?, ?, ?)
 				`,
 			);
 
@@ -101,7 +107,8 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 					.bind(
 						licenseKey,
 						data.body.name,
-						data.body.phone,
+						data.body.contact || data.body.phone,
+						data.body.contactType || "phone",
 						null,
 						expiresAt,
 						null,
