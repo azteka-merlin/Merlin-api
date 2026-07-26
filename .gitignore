@@ -169,3 +169,4 @@ dist
 seed-admin.sql
 update-admin-password.sql
 tmp/
+docs/

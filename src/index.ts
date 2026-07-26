@@ -10,6 +10,7 @@ import { GamesSearchRoute } from "./endpoints/games-search";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
+import { PublicEmailVerificationStartRoute, PublicEmailVerificationVerifyRoute } from "./endpoints/public-email-verification";
 import { VersionRoute } from "./endpoints/version";
 import {
   clearAdminSessionCookie,
@@ -67,6 +68,7 @@ import {
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
 import { enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
   getPublicSignupMetrics,
   getPublicSignupSettings,
@@ -608,7 +610,7 @@ function renderPublicDownloadPage() {
     .input-icon { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px; display: grid; place-items: center; color: #9ca3af; pointer-events: none; }
     input { width: 100%; height: 42px; border: 1px solid rgba(148,163,184,.22); background: rgba(2,6,23,.72); color: #f8fafc; border-radius: 10px; padding: 10px 12px 10px 42px; outline: none; font: inherit; font-weight: 750; }
     input:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139,92,246,.18); }
-    .segment { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; padding: 5px; border-radius: 13px; background: rgba(2,6,23,.54); border: 1px solid rgba(148,163,184,.13); }
+    .segment { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; padding: 5px; border-radius: 13px; background: rgba(2,6,23,.54); border: 1px solid rgba(148,163,184,.13); }
     .segment button { height: 37px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #94a3b8; font: inherit; font-weight: 900; cursor: pointer; }
     .segment button.active { color: #fff; border-color: rgba(139,92,246,.62); background: rgba(139,92,246,.23); }
     .hint { color: #a8b3c7; line-height: 1.45; font-size: 12px; font-weight: 650; margin: 0; }
@@ -616,6 +618,12 @@ function renderPublicDownloadPage() {
     .notice input { width: 18px; height: 18px; margin: 1px 0 0; padding: 0; accent-color: #8b5cf6; flex: 0 0 auto; }
     .field-error { min-height: 16px; color: #fca5a5; font-size: 12px; font-weight: 850; }
     .message { min-height: 18px; color: #fca5a5; font-size: 13px; font-weight: 850; }
+    .message.ok { color: #86efac; }
+    .verification-panel { display: grid; gap: 16px; }
+    .verification-panel h2 { margin: 0; color: #fff; font-size: 24px; line-height: 1.15; }
+    .verification-panel p { margin: 0; color: #a8b3c7; line-height: 1.5; font-size: 13px; font-weight: 700; }
+    .verification-email { color: #fff; font-weight: 900; overflow-wrap: anywhere; }
+    .verification-actions { display: grid; gap: 10px; }
     .success { display: none; text-align: center; padding: 10px 0 4px; }
     .success.active { display: block; }
     .success-mark { width: 54px; height: 54px; margin: 0 auto 14px; border-radius: 999px; display: grid; place-items: center; background: linear-gradient(135deg, #8b5cf6, #2f7df6); font-weight: 950; font-size: 24px; box-shadow: 0 16px 34px rgba(47,125,246,.2); }
@@ -623,6 +631,9 @@ function renderPublicDownloadPage() {
     .success p { margin: 0 0 18px; color: #a8b3c7; line-height: 1.5; }
     .key-card { margin: 0 0 16px; padding: 16px; border-radius: 15px; border: 1px solid rgba(139,92,246,.34); background: rgba(2,6,23,.55); }
     .key-card code { display: block; color: #fff; font-size: 18px; font-weight: 900; letter-spacing: .04em; overflow-wrap: anywhere; }
+    .pin-card { margin: 0 0 16px; padding: 14px; border-radius: 15px; border: 1px solid rgba(251,191,36,.34); background: rgba(251,191,36,.08); }
+    .pin-card p { margin: 0 0 10px; color: #fde68a; font-size: 12px; line-height: 1.45; font-weight: 850; }
+    .pin-card code { display: block; color: #fff; font-size: 18px; font-weight: 950; letter-spacing: .08em; }
     .success-actions { display: grid; gap: 10px; }
     [hidden] { display: none !important; }
     @media (max-width: 920px) {
@@ -701,11 +712,10 @@ function renderPublicDownloadPage() {
           <div class="field">
             <span data-i18n="contactType">Contact type</span>
             <div class="segment" data-segment="register">
-              <button class="active" type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
-              <button type="button" data-contact-type="email" data-i18n="email">E-mail</button>
-              <button type="button" data-contact-type="discord">Discord</button>
+              <button class="active" type="button" data-contact-type="email" data-i18n="email">E-mail</button>
+              <button type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
             </div>
-            <input name="contactType" type="hidden" value="phone" />
+            <input name="contactType" type="hidden" value="email" />
           </div>
           <div class="field" data-field="recoveryPin">
             <span data-i18n="pin">Recovery PIN</span>
@@ -725,6 +735,29 @@ function renderPublicDownloadPage() {
           <button class="button primary" type="submit" data-default-key="createSubmit" data-default-text="Create my access key">Create my access key</button>
         </form>
 
+        <form class="verification-panel" id="emailVerificationForm" hidden novalidate>
+          <div>
+            <h2 data-i18n="emailVerificationTitle">Confirm your e-mail</h2>
+            <p>
+              <span data-i18n="emailVerificationSentTo">We sent a 6-digit code to</span>
+              <span class="verification-email" id="verificationEmail"></span>.
+            </p>
+          </div>
+          <div class="field" data-field="emailCode">
+            <span data-i18n="emailCode">Verification code</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">#</span>
+              <input name="emailCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <div class="verification-actions">
+            <button class="button primary" type="submit" data-default-key="confirmEmailCode" data-default-text="Confirm code">Confirm code</button>
+            <button class="button ghost" id="resendEmailCode" type="button" data-default-key="resendEmailCode" data-default-text="Resend code">Resend code</button>
+            <button class="button subtle" id="changeEmail" type="button" data-i18n="changeEmail">Use another e-mail</button>
+          </div>
+        </form>
+
         <form class="form-panel" id="recoverForm" hidden novalidate>
           <div class="field" data-field="contact">
             <span data-i18n="contact">Contact</span>
@@ -737,11 +770,10 @@ function renderPublicDownloadPage() {
           <div class="field">
             <span data-i18n="contactType">Contact type</span>
             <div class="segment" data-segment="recover">
-              <button class="active" type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
-              <button type="button" data-contact-type="email" data-i18n="email">E-mail</button>
-              <button type="button" data-contact-type="discord">Discord</button>
+              <button class="active" type="button" data-contact-type="email" data-i18n="email">E-mail</button>
+              <button type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
             </div>
-            <input name="contactType" type="hidden" value="phone" />
+            <input name="contactType" type="hidden" value="email" />
           </div>
           <div class="field" data-field="recoveryPin">
             <span data-i18n="pin">Recovery PIN</span>
@@ -762,6 +794,10 @@ function renderPublicDownloadPage() {
           <div class="key-card">
             <code id="licenseKey"></code>
           </div>
+          <div class="pin-card" id="pinCard" hidden>
+            <p data-i18n="pinFinalNotice">Save your recovery PIN now. It will not be sent by e-mail.</p>
+            <code id="recoveryPinValue"></code>
+          </div>
           <div class="success-actions">
             <button class="button ghost" id="copyKey" type="button" data-i18n="copyKey">Copy key</button>
             <a class="button primary" href="/api/updates/download" data-i18n="download">Download Merlin</a>
@@ -771,7 +807,7 @@ function renderPublicDownloadPage() {
       </section>
     </div>
   </main>
-  <script src="/download.js" defer></script>
+  <script src="/download.js?v=20260725-email-flow-2" defer></script>
 </body>
 </html>`;
 }
@@ -809,6 +845,7 @@ const messages = {
     successRecovered: "Your key was recovered",
     successExisting: "Your access key",
     successDescription: "Keep your key somewhere safe. It will be used to access Merlin.",
+    pinFinalNotice: "Save your recovery PIN now. It will not be sent by e-mail.",
     copyKey: "Copy key",
     copied: "Key copied",
     createAnother: "Create another key",
@@ -816,8 +853,20 @@ const messages = {
     errorName: "Enter your name.",
     errorContact: "Enter your contact.",
     errorEmail: "Enter a valid e-mail.",
+    emailCode: "Verification code",
+    emailVerificationTitle: "Confirm your e-mail",
+    emailVerificationSentTo: "We sent a 6-digit code to",
+    confirmEmailCode: "Confirm code",
+    resendEmailCode: "Resend code",
+    sendingCode: "Sending code...",
+    emailCodeSent: "Code sent. Check your e-mail and, if necessary, review your spam folder.",
+    emailVerified: "E-mail verified. Creating your access key...",
+    changeEmail: "Use another e-mail",
+    errorEmailCode: "Enter the 6-digit code sent to your e-mail.",
     errorPin: "Use a PIN with 4 to 8 numbers.",
     errorNotice: "Confirm the recovery notice to continue.",
+    accessKeyUnavailable: "Could not create a new key with this information. If you already have a key, use the recovery option.",
+    recoveryUnavailable: "Could not recover a key with this information. Check your details and try again.",
     genericError: "Could not complete the request.",
   },
   ptbr: {
@@ -849,6 +898,7 @@ const messages = {
     successRecovered: "Sua chave foi recuperada",
     successExisting: "Sua chave de acesso",
     successDescription: "Guarde sua chave em um lugar seguro. Ela será usada para acessar o Merlin.",
+    pinFinalNotice: "Guarde seu PIN de recuperação agora. Ele não será enviado por e-mail.",
     copyKey: "Copiar chave",
     copied: "Chave copiada",
     createAnother: "Criar outra chave",
@@ -856,8 +906,20 @@ const messages = {
     errorName: "Informe seu nome.",
     errorContact: "Informe seu contato.",
     errorEmail: "Informe um e-mail válido.",
+    emailCode: "Código de verificação",
+    emailVerificationTitle: "Confirme seu e-mail",
+    emailVerificationSentTo: "Enviamos um código de 6 dígitos para",
+    confirmEmailCode: "Confirmar código",
+    resendEmailCode: "Reenviar código",
+    sendingCode: "Enviando código...",
+    emailCodeSent: "Código enviado. Confira seu e-mail e, se necessário, verifique a caixa de spam.",
+    emailVerified: "E-mail verificado. Criando sua chave de acesso...",
+    changeEmail: "Usar outro e-mail",
+    errorEmailCode: "Informe o código de 6 dígitos enviado para seu e-mail.",
     errorPin: "Use um PIN com 4 a 8 números.",
     errorNotice: "Confirme o aviso de recuperação para continuar.",
+    accessKeyUnavailable: "Não foi possível criar uma nova chave com esses dados. Se você já possui uma chave, use a opção Recuperar.",
+    recoveryUnavailable: "Não foi possível recuperar uma chave com esses dados. Confira as informações e tente novamente.",
     genericError: "Não foi possível concluir a solicitação.",
   },
   es: {
@@ -889,6 +951,7 @@ const messages = {
     successRecovered: "Tu clave fue recuperada",
     successExisting: "Tu clave de acceso",
     successDescription: "Guarda tu clave en un lugar seguro. Se usará para acceder a Merlin.",
+    pinFinalNotice: "Guarda tu PIN de recuperación ahora. No se enviará por e-mail.",
     copyKey: "Copiar clave",
     copied: "Clave copiada",
     createAnother: "Crear otra clave",
@@ -896,8 +959,20 @@ const messages = {
     errorName: "Ingresa tu nombre.",
     errorContact: "Ingresa tu contacto.",
     errorEmail: "Ingresa un e-mail válido.",
+    emailCode: "Código de verificación",
+    emailVerificationTitle: "Confirma tu e-mail",
+    emailVerificationSentTo: "Enviamos un código de 6 dígitos a",
+    confirmEmailCode: "Confirmar código",
+    resendEmailCode: "Reenviar código",
+    sendingCode: "Enviando código...",
+    emailCodeSent: "Código enviado. Revisa tu e-mail y, si es necesario, verifica la carpeta de spam.",
+    emailVerified: "E-mail verificado. Creando tu clave de acceso...",
+    changeEmail: "Usar otro e-mail",
+    errorEmailCode: "Ingresa el código de 6 dígitos enviado a tu e-mail.",
     errorPin: "Usa un PIN de 4 a 8 números.",
     errorNotice: "Confirma el aviso de recuperación para continuar.",
+    accessKeyUnavailable: "No se pudo crear una nueva clave con estos datos. Si ya tienes una clave, usa la opción Recuperar.",
+    recoveryUnavailable: "No se pudo recuperar una clave con estos datos. Revisa la información e inténtalo de nuevo.",
     genericError: "No se pudo completar la solicitud.",
   },
   fr: {
@@ -929,6 +1004,7 @@ const messages = {
     successRecovered: "Votre clé a été récupérée",
     successExisting: "Votre clé d'accès",
     successDescription: "Conservez votre clé dans un endroit sûr. Elle servira à accéder à Merlin.",
+    pinFinalNotice: "Conservez votre PIN de récupération maintenant. Il ne sera pas envoyé par e-mail.",
     copyKey: "Copier la clé",
     copied: "Clé copiée",
     createAnother: "Créer une autre clé",
@@ -936,8 +1012,20 @@ const messages = {
     errorName: "Indiquez votre nom.",
     errorContact: "Indiquez votre contact.",
     errorEmail: "Indiquez un e-mail valide.",
+    emailCode: "Code de vérification",
+    emailVerificationTitle: "Confirmez votre e-mail",
+    emailVerificationSentTo: "Nous avons envoyé un code à 6 chiffres à",
+    confirmEmailCode: "Confirmer le code",
+    resendEmailCode: "Renvoyer le code",
+    sendingCode: "Envoi du code...",
+    emailCodeSent: "Code envoyé. Consultez votre e-mail et, si nécessaire, vérifiez le dossier spam.",
+    emailVerified: "E-mail vérifié. Création de votre clé d'accès...",
+    changeEmail: "Utiliser un autre e-mail",
+    errorEmailCode: "Indiquez le code à 6 chiffres envoyé à votre e-mail.",
     errorPin: "Utilisez un PIN de 4 à 8 chiffres.",
     errorNotice: "Confirmez l'avis de récupération pour continuer.",
+    accessKeyUnavailable: "Impossible de créer une nouvelle clé avec ces informations. Si vous avez déjà une clé, utilisez l'option de récupération.",
+    recoveryUnavailable: "Impossible de récupérer une clé avec ces informations. Vérifiez les données et réessayez.",
     genericError: "Impossible de terminer la demande.",
   },
   de: {
@@ -969,6 +1057,7 @@ const messages = {
     successRecovered: "Dein Schlüssel wurde wiederhergestellt",
     successExisting: "Dein Zugangsschlüssel",
     successDescription: "Bewahre deinen Schlüssel sicher auf. Er wird für den Zugriff auf Merlin verwendet.",
+    pinFinalNotice: "Speichere deine Wiederherstellungs-PIN jetzt. Sie wird nicht per E-Mail gesendet.",
     copyKey: "Schlüssel kopieren",
     copied: "Schlüssel kopiert",
     createAnother: "Anderen Schlüssel erstellen",
@@ -976,8 +1065,20 @@ const messages = {
     errorName: "Gib deinen Namen ein.",
     errorContact: "Gib deinen Kontakt ein.",
     errorEmail: "Gib eine gültige E-Mail ein.",
+    emailCode: "Bestätigungscode",
+    emailVerificationTitle: "E-Mail bestätigen",
+    emailVerificationSentTo: "Wir haben einen 6-stelligen Code gesendet an",
+    confirmEmailCode: "Code bestätigen",
+    resendEmailCode: "Code erneut senden",
+    sendingCode: "Code wird gesendet...",
+    emailCodeSent: "Code gesendet. Prüfe deine E-Mail und bei Bedarf den Spam-Ordner.",
+    emailVerified: "E-Mail bestätigt. Zugangsschlüssel wird erstellt...",
+    changeEmail: "Andere E-Mail verwenden",
+    errorEmailCode: "Gib den 6-stelligen Code ein, der an deine E-Mail gesendet wurde.",
     errorPin: "Verwende eine PIN mit 4 bis 8 Zahlen.",
     errorNotice: "Bestätige den Wiederherstellungshinweis, um fortzufahren.",
+    accessKeyUnavailable: "Mit diesen Daten konnte kein neuer Schlüssel erstellt werden. Wenn du bereits einen Schlüssel hast, nutze die Wiederherstellung.",
+    recoveryUnavailable: "Mit diesen Daten konnte kein Schlüssel wiederhergestellt werden. Prüfe die Angaben und versuche es erneut.",
     genericError: "Die Anfrage konnte nicht abgeschlossen werden.",
   },
 };
@@ -1012,6 +1113,7 @@ function t(key, values) {
 const registerTab = document.getElementById("registerTab");
 const recoverTab = document.getElementById("recoverTab");
 const registerForm = document.getElementById("registerForm");
+const emailVerificationForm = document.getElementById("emailVerificationForm");
 const recoverForm = document.getElementById("recoverForm");
 const signupCard = document.getElementById("signupCard");
 const languageSelect = document.getElementById("languageSelect");
@@ -1022,13 +1124,27 @@ const message = document.getElementById("message");
 const result = document.getElementById("result");
 const resultTitle = document.getElementById("resultTitle");
 const licenseKey = document.getElementById("licenseKey");
+const pinCard = document.getElementById("pinCard");
+const recoveryPinValue = document.getElementById("recoveryPinValue");
 const copyKey = document.getElementById("copyKey");
 const createAnother = document.getElementById("createAnother");
 const versionText = document.getElementById("versionText");
+const verificationEmail = document.getElementById("verificationEmail");
+const resendEmailCode = document.getElementById("resendEmailCode");
+const changeEmail = document.getElementById("changeEmail");
 const contactIconMap = {
   phone: "☎",
   email: "@",
   discord: "D",
+};
+
+let emailVerificationState = {
+  email: "",
+  verified: false,
+  cooldownUntil: 0,
+  timer: null,
+  pendingData: null,
+  pendingMode: "register",
 };
 
 function applyTranslations() {
@@ -1048,19 +1164,27 @@ function applyTranslations() {
   versionText.hidden = false;
   benefits.hidden = false;
   heroDescription.textContent = signupEnabled ? t("heroDescription") : t("heroDescriptionDownloadOnly");
+  updateEmailVerificationCooldownUi();
 }
 
 function setMode(mode) {
   const recovering = mode === "recover";
+  const verifyingEmail = mode === "verify-email";
   result.classList.remove("active");
   result.hidden = true;
-  registerForm.hidden = recovering;
+  registerForm.hidden = recovering || verifyingEmail;
+  emailVerificationForm.hidden = !verifyingEmail;
   recoverForm.hidden = !recovering;
   recoverTab.classList.toggle("active", recovering);
   registerTab.classList.toggle("active", !recovering);
   message.textContent = "";
+  message.classList.remove("ok");
   clearErrors(registerForm);
+  clearErrors(emailVerificationForm);
   clearErrors(recoverForm);
+  if (recovering) {
+    resetEmailVerification();
+  }
 }
 
 function readForm(form) {
@@ -1080,6 +1204,26 @@ function setFieldError(form, name, text) {
 function clearErrors(form) {
   form.querySelectorAll(".field-error").forEach((node) => { node.textContent = ""; });
   message.textContent = "";
+  message.classList.remove("ok");
+}
+
+function setMessage(text, kind) {
+  message.textContent = text || "";
+  message.classList.toggle("ok", kind === "ok");
+}
+
+function getFriendlyErrorMessage(error) {
+  const rawMessage = error instanceof Error ? error.message : String(error || "");
+  if (rawMessage === "PUBLIC_ACCESS_KEY_UNAVAILABLE") {
+    return t("accessKeyUnavailable");
+  }
+  if (rawMessage === "Could not recover this access key with the provided information") {
+    return t("recoveryUnavailable");
+  }
+  if (rawMessage === "Email verification is required") {
+    return t("genericError");
+  }
+  return rawMessage || t("genericError");
 }
 
 function setCheckboxError(text) {
@@ -1097,6 +1241,42 @@ function formatPhone(value) {
   if (digits.length <= 6) return "(" + digits.slice(0, 2) + ") " + digits.slice(2);
   if (digits.length <= 10) return "(" + digits.slice(0, 2) + ") " + digits.slice(2, 6) + "-" + digits.slice(6);
   return "(" + digits.slice(0, 2) + ") " + digits.slice(2, 7) + "-" + digits.slice(7);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function resetEmailVerification() {
+  emailVerificationState.email = "";
+  emailVerificationState.verified = false;
+  emailVerificationState.cooldownUntil = 0;
+  emailVerificationState.pendingData = null;
+  emailVerificationState.pendingMode = "register";
+  if (emailVerificationState.timer) {
+    clearTimeout(emailVerificationState.timer);
+    emailVerificationState.timer = null;
+  }
+  updateEmailVerificationCooldownUi();
+}
+
+function getEmailCooldownSeconds() {
+  return Math.max(0, Math.ceil((emailVerificationState.cooldownUntil - Date.now()) / 1000));
+}
+
+function updateEmailVerificationCooldownUi() {
+  const cooldownSeconds = getEmailCooldownSeconds();
+  resendEmailCode.disabled = cooldownSeconds > 0;
+  resendEmailCode.textContent = cooldownSeconds > 0
+    ? t("resendEmailCode") + " (" + cooldownSeconds + "s)"
+    : t("resendEmailCode");
+
+  if (cooldownSeconds > 0 && !emailVerificationState.timer) {
+    emailVerificationState.timer = setTimeout(() => {
+      emailVerificationState.timer = null;
+      updateEmailVerificationCooldownUi();
+    }, 1000);
+  }
 }
 
 function validateForm(form) {
@@ -1146,10 +1326,103 @@ async function submitJson(url, body) {
   return payload;
 }
 
-function showKey(title, key) {
+function buildRegisterPayload(data) {
+  return {
+    name: data.name,
+    contact: data.contact,
+    contactType: data.contactType,
+    recoveryPin: data.recoveryPin,
+    acceptedRecoveryNotice: data.acceptedRecoveryNotice === "on",
+  };
+}
+
+function buildRecoverPayload(data) {
+  return {
+    contact: data.contact,
+    contactType: data.contactType,
+    recoveryPin: data.recoveryPin,
+  };
+}
+
+async function createAccessKeyFromPayload(payload) {
+  const response = await submitJson("/api/public/access-keys/register", payload);
+  showKey(
+    response.created ? t("successCreated") : t("successExisting"),
+    response.license.licenseKey,
+    response.created ? payload.recoveryPin : null,
+  );
+}
+
+async function recoverAccessKeyFromPayload(payload) {
+  const response = await submitJson("/api/public/access-keys/recover", payload);
+  showKey(t("successRecovered"), response.license.licenseKey);
+}
+
+async function sendEmailVerificationForPendingData() {
+  const pendingData = emailVerificationState.pendingData;
+  if (!pendingData) return;
+  const email = normalizeEmail(pendingData.contact);
+  if (!/^\\S+@\\S+\\.\\S+$/.test(email)) {
+    setFieldError(registerForm, "contact", t("errorEmail"));
+    return;
+  }
+
+  resendEmailCode.disabled = true;
+  resendEmailCode.textContent = t("sendingCode");
+  try {
+    const payload = await submitJson("/api/public/email-verification/start", { email });
+    emailVerificationState.email = email;
+    emailVerificationState.verified = false;
+    emailVerificationState.cooldownUntil = Date.now() + Number(payload.cooldownSeconds || 60) * 1000;
+    verificationEmail.textContent = email;
+    setMode("verify-email");
+    emailVerificationForm.querySelector("input[name='emailCode']").focus();
+    setMessage(t("emailCodeSent"), "ok");
+  } catch (error) {
+    setMessage(getFriendlyErrorMessage(error));
+  } finally {
+    updateEmailVerificationCooldownUi();
+  }
+}
+
+async function confirmPendingEmailCode() {
+  clearErrors(emailVerificationForm);
+  const pendingData = emailVerificationState.pendingData;
+  if (!pendingData) {
+    setMode("register");
+    return;
+  }
+  const email = normalizeEmail(pendingData.contact);
+  const data = readForm(emailVerificationForm);
+  const code = String(data.emailCode || "").trim();
+  if (!/^\\d{6}$/.test(code)) {
+    setFieldError(emailVerificationForm, "emailCode", t("errorEmailCode"));
+    return;
+  }
+
+  await submitJson("/api/public/email-verification/verify", { email, code });
+  emailVerificationState.email = email;
+  emailVerificationState.verified = true;
+  setMessage(t("emailVerified"), "ok");
+  if (emailVerificationState.pendingMode === "recover") {
+    await recoverAccessKeyFromPayload(buildRecoverPayload(pendingData));
+    return;
+  }
+  await createAccessKeyFromPayload(buildRegisterPayload(pendingData));
+}
+
+function showKey(title, key, recoveryPin) {
   resultTitle.textContent = title;
   licenseKey.textContent = key;
+  if (recoveryPin) {
+    recoveryPinValue.textContent = recoveryPin;
+    pinCard.hidden = false;
+  } else {
+    recoveryPinValue.textContent = "";
+    pinCard.hidden = true;
+  }
   registerForm.hidden = true;
+  emailVerificationForm.hidden = true;
   recoverForm.hidden = true;
   message.textContent = "";
   result.hidden = false;
@@ -1229,6 +1502,9 @@ function setContactType(form, type) {
     contact.value = formatPhone(contact.value);
   }
   clearErrors(form);
+  if (form === registerForm) {
+    resetEmailVerification();
+  }
 }
 
 document.querySelectorAll(".segment").forEach((segment) => {
@@ -1243,11 +1519,21 @@ document.querySelectorAll("input[name='contact']").forEach((input) => {
     const form = input.closest("form");
     const type = form.querySelector("input[name='contactType']").value;
     if (type === "phone") input.value = formatPhone(input.value);
+    if (form === registerForm && type === "email" && emailVerificationState.email !== normalizeEmail(input.value)) {
+      emailVerificationState.verified = false;
+    }
+    updateEmailVerificationCooldownUi();
   });
 });
 
 registerTab.addEventListener("click", () => setMode("register"));
 recoverTab.addEventListener("click", () => setMode("recover"));
+resendEmailCode.addEventListener("click", sendEmailVerificationForPendingData);
+changeEmail.addEventListener("click", () => {
+  const previousMode = emailVerificationState.pendingMode;
+  emailVerificationForm.reset();
+  setMode(previousMode === "recover" ? "recover" : "register");
+});
 languageSelect.addEventListener("change", () => {
   const next = languageSelect.value;
   if (!messages[next]) return;
@@ -1264,8 +1550,11 @@ copyKey.addEventListener("click", async () => {
 createAnother.addEventListener("click", () => {
   registerForm.reset();
   recoverForm.reset();
-  setContactType(registerForm, "phone");
-  setContactType(recoverForm, "phone");
+  recoveryPinValue.textContent = "";
+  pinCard.hidden = true;
+  resetEmailVerification();
+  setContactType(registerForm, "email");
+  setContactType(recoverForm, "email");
   setMode("register");
 });
 
@@ -1275,18 +1564,29 @@ registerForm.addEventListener("submit", async (event) => {
   const data = readForm(registerForm);
   setLoading(registerForm, true);
   try {
-    const payload = await submitJson("/api/public/access-keys/register", {
-      name: data.name,
-      contact: data.contact,
-      contactType: data.contactType,
-      recoveryPin: data.recoveryPin,
-      acceptedRecoveryNotice: data.acceptedRecoveryNotice === "on",
-    });
-    showKey(payload.created ? t("successCreated") : t("successExisting"), payload.license.licenseKey);
+    if (data.contactType === "email") {
+      emailVerificationState.pendingData = data;
+      emailVerificationState.pendingMode = "register";
+      await sendEmailVerificationForPendingData();
+      return;
+    }
+    await createAccessKeyFromPayload(buildRegisterPayload(data));
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = getFriendlyErrorMessage(error);
   } finally {
     setLoading(registerForm, false);
+  }
+});
+
+emailVerificationForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setLoading(emailVerificationForm, true);
+  try {
+    await confirmPendingEmailCode();
+  } catch (error) {
+    setMessage(getFriendlyErrorMessage(error));
+  } finally {
+    setLoading(emailVerificationForm, false);
   }
 });
 
@@ -1296,18 +1596,23 @@ recoverForm.addEventListener("submit", async (event) => {
   const data = readForm(recoverForm);
   setLoading(recoverForm, true);
   try {
-    const payload = await submitJson("/api/public/access-keys/recover", data);
-    showKey(t("successRecovered"), payload.license.licenseKey);
+    if (data.contactType === "email") {
+      emailVerificationState.pendingData = data;
+      emailVerificationState.pendingMode = "recover";
+      await sendEmailVerificationForPendingData();
+      return;
+    }
+    await recoverAccessKeyFromPayload(buildRecoverPayload(data));
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = getFriendlyErrorMessage(error);
   } finally {
     setLoading(recoverForm, false);
   }
 });
 
 applyTranslations();
-setContactType(registerForm, "phone");
-setContactType(recoverForm, "phone");
+setContactType(registerForm, "email");
+setContactType(recoverForm, "email");
 loadPublicSettings();
 loadVersion();
 `;
@@ -1337,6 +1642,12 @@ function parseBody<T>(schema: z.ZodSchema<T>, value: unknown) {
     throw new HTTPException(400, { message: "Invalid request payload" });
   }
   return parsed.data;
+}
+
+function queuePublicEmail(c: { executionCtx: { waitUntil(task: Promise<unknown>): void } }, label: string, task: Promise<unknown>) {
+  c.executionCtx.waitUntil(task.catch((error) => {
+    console.warn(`[public-email] ${label} failed`, error instanceof Error ? error.message : error);
+  }));
 }
 
 function parseLicenseId(raw: string) {
@@ -1529,14 +1840,16 @@ app.get("/login", async (c) => {
 });
 
 app.get("/download", (c) => {
-  return c.html(renderPublicDownloadPage());
+  return c.html(renderPublicDownloadPage(), 200, {
+    "cache-control": "no-store",
+  });
 });
 
 app.get("/download.js", () => {
   return new Response(renderPublicDownloadScript(), {
     headers: {
       "content-type": "application/javascript; charset=utf-8",
-      "cache-control": "public, max-age=300",
+      "cache-control": "no-store",
     },
   });
 });
@@ -2158,6 +2471,13 @@ app.post("/api/public/access-keys/register", async (c) => {
   const contact = normalizePublicAccessContact(body.contact, body.contactType);
   await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
   const result = await registerPublicAccessKey(c, { ...body, contact });
+  if (body.contactType === "email" && result.created) {
+    queuePublicEmail(c, "welcome-access-key", sendWelcomeAccessKeyEmail(c, {
+      email: contact,
+      name: result.license.name,
+      licenseKey: result.license.licenseKey,
+    }));
+  }
   return c.json({ success: true, ...result }, result.created ? 201 : 200);
 });
 
@@ -2166,6 +2486,13 @@ app.post("/api/public/access-keys/recover", async (c) => {
   const contact = normalizePublicAccessContact(body.contact, body.contactType);
   await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
   const result = await recoverPublicAccessKey(c, { ...body, contact });
+  if (body.contactType === "email") {
+    queuePublicEmail(c, "recovered-access-key", sendRecoveredAccessKeyEmail(c, {
+      email: contact,
+      name: result.license.name,
+      licenseKey: result.license.licenseKey,
+    }));
+  }
   return c.json({ success: true, ...result }, 200);
 });
 
@@ -2945,6 +3272,8 @@ openapi.get("/api/fixes/catalog", FixesCatalogRoute);
 openapi.get("/api/fixes/download", FixesDownloadRoute);
 openapi.post("/api/fixes/vote", FixesVoteRoute);
 openapi.post("/api/auth/login", LoginRoute);
+openapi.post("/api/public/email-verification/start", PublicEmailVerificationStartRoute);
+openapi.post("/api/public/email-verification/verify", PublicEmailVerificationVerifyRoute);
 
 app.onError((error, c) => {
   console.error("[merlin-api:error]", error);

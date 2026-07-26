@@ -3,6 +3,8 @@ import { z } from "zod";
 
 export interface AppBindings extends Env {
   SESSION_HASH_SECRET: string;
+  RESEND_API_KEY: string;
+  EMAIL_FROM?: string;
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
   MERLIN_WORKER_TOKEN?: string;
@@ -84,6 +86,26 @@ export const CorrectionVoteResponse = z.object({
 	upvotes: z.number().int().nonnegative(),
 	downvotes: z.number().int().nonnegative(),
 	score: z.number().int(),
+});
+
+export const PublicEmailVerificationStartRequest = z.object({
+	email: z.string().trim().email().max(254),
+});
+
+export const PublicEmailVerificationStartResponse = z.object({
+	success: z.literal(true),
+	cooldownSeconds: z.number().int().positive(),
+	expiresIn: z.number().int().positive(),
+});
+
+export const PublicEmailVerificationVerifyRequest = z.object({
+	email: z.string().trim().email().max(254),
+	code: z.string().trim().regex(/^\d{6}$/),
+});
+
+export const PublicEmailVerificationVerifyResponse = z.object({
+	success: z.literal(true),
+	verified: z.literal(true),
 });
 
 export const CreateLicenseRequest = z.object({

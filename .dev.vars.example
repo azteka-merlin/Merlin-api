@@ -2,3 +2,6 @@ DEPOTBOX_API_KEY=api_key_here_change_me
 RYUU_AUTH_CODE=api_key_here_change_me
 JWT_SECRET=merlin-local-jwt-secret-change-me
 HUBCAP_TOKEN=api_key_here_change_me
+SESSION_HASH_SECRET=merlin-local-session-hash-secret-change-me
+RESEND_API_KEY=re_xxxxxxxxx
+EMAIL_FROM=Merlin <onboarding@resend.dev>

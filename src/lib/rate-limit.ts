@@ -17,13 +17,15 @@ type LoginRateLimitInput = {
 };
 
 const LOGIN_LIMIT_MESSAGE =
-	"O limite temporario de tentativas de acesso foi atingido. Aguarde aproximadamente 1 minuto e tente novamente.";
+	"O limite temporário de tentativas de acesso foi atingido. Aguarde aproximadamente 1 minuto e tente novamente.";
 const MANIFESTS_LIMIT_MESSAGE =
-	"O limite temporario de solicitacoes desta licenca foi atingido. Aguarde alguns instantes e tente novamente.";
+	"O limite temporário de solicitações desta licença foi atingido. Aguarde alguns instantes e tente novamente.";
 const ADMIN_LIMIT_MESSAGE =
-	"O limite temporario de solicitacoes administrativas foi atingido. Aguarde alguns instantes e tente novamente.";
+	"O limite temporário de solicitações administrativas foi atingido. Aguarde alguns instantes e tente novamente.";
 const PUBLIC_ACCESS_LIMIT_MESSAGE =
-	"O limite temporario de solicitacoes foi atingido. Aguarde alguns instantes e tente novamente.";
+	"O limite temporário de solicitações foi atingido. Aguarde alguns instantes e tente novamente.";
+const PUBLIC_EMAIL_LIMIT_MESSAGE =
+	"O limite temporário de solicitações de verificação foi atingido. Aguarde alguns instantes e tente novamente.";
 
 function getRateLimiter(binding: RateLimitBinding | undefined, name: string): RateLimitBinding {
 	if (!binding) {
@@ -100,5 +102,19 @@ export async function enforcePublicAccessKeyRateLimit(c: AppContext, contactKey:
 
 	for (const key of keys) {
 		await enforceLimit(env.LOGIN_RATE_LIMITER, key, PUBLIC_ACCESS_LIMIT_MESSAGE, "public-access");
+	}
+}
+
+export async function enforcePublicEmailVerificationRateLimit(c: AppContext, email: string) {
+	const env = c.env as typeof c.env & RateLimitBindings;
+	const clientIp = getClientIp(c);
+	const normalizedEmail = email.trim().toLowerCase();
+	const keys = [
+		clientIp ? `public-email:ip:${clientIp}` : null,
+		normalizedEmail ? `public-email:email:${normalizedEmail}` : null,
+	].filter((key): key is string => Boolean(key));
+
+	for (const key of keys) {
+		await enforceLimit(env.LOGIN_RATE_LIMITER, key, PUBLIC_EMAIL_LIMIT_MESSAGE, "public-email");
 	}
 }

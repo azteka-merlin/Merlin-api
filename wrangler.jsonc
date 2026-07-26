@@ -72,7 +72,8 @@
 			"RYUU_AUTH_CODE",
 			"HUBCAP_TOKEN",
 			"JWT_SECRET",
-			"SESSION_HASH_SECRET"
+			"SESSION_HASH_SECRET",
+			"RESEND_API_KEY"
 		]
 	},
 	"d1_databases": [

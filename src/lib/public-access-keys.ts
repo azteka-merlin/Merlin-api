@@ -2,6 +2,7 @@ import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
 import { assertValidContact, normalizeContact, type ContactType } from "./admin-license-service";
+import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 
 export type PublicSignupDurationUnit = "days" | "weeks" | "months" | "years";
 
@@ -47,17 +48,17 @@ function mapPublicLicense(record: LicenseRecord) {
 
 function getPublicDescription(settings: ReturnType<typeof mapSettings>) {
   if (settings.isLifetime) {
-    return "Novas chaves de acesso serao vitalicias.";
+    return "Novas chaves de acesso serão vitalícias.";
   }
 
   const labels: Record<PublicSignupDurationUnit, string> = {
     days: settings.durationAmount === 1 ? "dia" : "dias",
     weeks: settings.durationAmount === 1 ? "semana" : "semanas",
-    months: settings.durationAmount === 1 ? "mes" : "meses",
+    months: settings.durationAmount === 1 ? "mês" : "meses",
     years: settings.durationAmount === 1 ? "ano" : "anos",
   };
 
-  return `Novas chaves de acesso vencerao em ${settings.durationAmount} ${labels[settings.durationUnit]}.`;
+  return `Novas chaves de acesso vencerão em ${settings.durationAmount} ${labels[settings.durationUnit]}.`;
 }
 
 export async function getPublicSignupSettings(c: AppContext) {
@@ -226,11 +227,17 @@ export async function registerPublicAccessKey(
   }
 
   const contact = normalizePublicAccessContact(input.contact, input.contactType);
+  const emailVerificationId = input.contactType === "email"
+    ? await assertRecentPublicEmailVerification(c, contact)
+    : null;
   const existing = await findLatestActiveLicenseByContact(c, contact, input.contactType);
   if (existing) {
     const matchesPin = await compareRecoveryPin(c, existing, recoveryPin);
     if (!matchesPin) {
-      throw new HTTPException(409, { message: "An active access key already exists for this contact" });
+      throw new HTTPException(400, { message: "PUBLIC_ACCESS_KEY_UNAVAILABLE" });
+    }
+    if (emailVerificationId) {
+      await consumePublicEmailVerification(c, emailVerificationId);
     }
     return { license: mapPublicLicense(existing), created: false };
   }
@@ -277,6 +284,9 @@ export async function registerPublicAccessKey(
   if (!created) {
     throw new HTTPException(500, { message: "Could not create access key" });
   }
+  if (emailVerificationId) {
+    await consumePublicEmailVerification(c, emailVerificationId);
+  }
 
   return { license: mapPublicLicense(created), created: true };
 }
@@ -291,6 +301,9 @@ export async function recoverPublicAccessKey(
   }
 
   const contact = normalizePublicAccessContact(input.contact, input.contactType);
+  const emailVerificationId = input.contactType === "email"
+    ? await assertRecentPublicEmailVerification(c, contact)
+    : null;
   const existing = await findLatestActiveLicenseByContact(c, contact, input.contactType);
   if (!existing) {
     throw new HTTPException(401, { message: GENERIC_RECOVERY_ERROR });
@@ -299,6 +312,9 @@ export async function recoverPublicAccessKey(
   const matchesPin = await compareRecoveryPin(c, existing, recoveryPin);
   if (!matchesPin) {
     throw new HTTPException(401, { message: GENERIC_RECOVERY_ERROR });
+  }
+  if (emailVerificationId) {
+    await consumePublicEmailVerification(c, emailVerificationId);
   }
 
   return { license: mapPublicLicense(existing) };
