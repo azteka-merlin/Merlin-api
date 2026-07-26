@@ -116,16 +116,18 @@ async function sendVerificationEmail(c: AppContext, input: { email: string; code
 	}
 
 	const message = renderVerificationEmail(input.code);
+	const from = getEmailFrom(c);
 	const response = await fetch(RESEND_API_URL, {
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${apiKey}`,
+			Accept: "application/json",
 			"Content-Type": "application/json",
 			"Idempotency-Key": input.idempotencyKey,
 			"User-Agent": "Merlin API",
 		},
 		body: JSON.stringify({
-			from: getEmailFrom(c),
+			from,
 			to: [input.email],
 			subject: message.subject,
 			html: message.html,
