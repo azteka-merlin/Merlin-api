@@ -4,15 +4,19 @@
     "private":  true,
     "scripts":  {
                     "deploy":  "wrangler deploy",
+                    "deploy-stage":  "wrangler deploy --env staging",
                     "dev":  "wrangler dev",
                     "start":  "wrangler dev",
                     "typecheck":  "tsc --noEmit",
                     "types":  "wrangler types",
+                    "types:stage":  "wrangler types --env staging",
                     "cf-typegen":  "wrangler types",
                     "admin:bootstrap":  "node scripts/bootstrap-admin.mjs",
                     "build:panel":  "npm --prefix ../merlin-admin run build",
                     "d1:migrate:remote":  "wrangler d1 migrations apply merlin-db --remote",
-                    "deploy:panel":  "npm run build:panel \u0026\u0026 npm run types \u0026\u0026 npm run deploy"
+                    "d1:migrate:stage":  "wrangler d1 migrations apply merlin-db-stage --remote --env staging",
+                    "deploy:panel":  "npm run build:panel \u0026\u0026 npm run types \u0026\u0026 npm run deploy",
+                    "deploy-stage:panel":  "npm run build:panel \u0026\u0026 npm run deploy-stage"
                 },
     "dependencies":  {
                          "chanfana":  "^3.3.0",

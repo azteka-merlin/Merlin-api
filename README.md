@@ -2,6 +2,37 @@
 
 Backend do Merlin em Cloudflare Workers + D1, servindo tanto a API publica quanto o painel administrativo.
 
+## Hierarquia dos docs
+
+Use este README como entrada principal. So abra outros `.md` quando a tarefa realmente pedir mais detalhe:
+
+1. `docs/UP.md`: rodar, subir, migrar D1, bootstrap admin e validar deploy.
+2. `docs/ENVIRONMENT.md`: variaveis, secrets e bindings Cloudflare.
+3. `docs/INTEGRATIONS.md`: integracoes externas.
+4. `docs/STAGING.md`: staging da API, cadastro publico, painel e launcher.
+5. `docs/CONTEXT.md`: arquitetura, rotas, modulos e regras para mudancas.
+
+Projeto open source: nao documente credenciais, tokens, paths pessoais, emails privados, IDs de infraestrutura ou valores sensiveis.
+
+## Comandos principais
+
+```powershell
+npm run dev
+npm run typecheck
+npm run deploy
+npm run deploy:panel
+npm run deploy-stage
+npm run deploy-stage:panel
+npm run d1:migrate:remote
+npm run d1:migrate:stage
+```
+
+- `npm run deploy`: sobe a API em producao.
+- `npm run deploy:panel`: builda `../merlin-admin`, gera types e sobe producao.
+- `npm run deploy-stage`: sobe somente a API staging.
+- `npm run deploy-stage:panel`: builda `../merlin-admin` e sobe staging sem rodar `types:stage`.
+- Overrides vivem no R2 `MERLIN_FILES` como `overrides.json`; na configuracao atual, R2 e compartilhado entre producao e staging e nao precisa migracao.
+
 ## Superficie atual
 
 - `GET /doc` Swagger / OpenAPI

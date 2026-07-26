@@ -68,7 +68,7 @@ export const GameSearchResponse = z.object({
 
 export const FixDownloadQuery = z.object({
 	appid: z.string().regex(/^\d+$/),
-	source: z.enum(["override", "depotbox"]).optional(),
+	source: z.enum(["override", "depotbox", "ryuu"]).optional(),
 });
 
 export const CorrectionVoteValue = z.enum(["up", "down"]);

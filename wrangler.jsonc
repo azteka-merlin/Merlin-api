@@ -93,6 +93,92 @@
 			"bucket_name": "merlin-activations"
 		}
 	],
+	"env": {
+		"staging": {
+			"name": "merlin-api-stage",
+			"vars": {
+				"ENVIRONMENT": "staging"
+			},
+			"secrets": {
+				"required": [
+					"DEPOTBOX_API_KEY",
+					"RYUU_AUTH_CODE",
+					"HUBCAP_TOKEN",
+					"JWT_SECRET",
+					"SESSION_HASH_SECRET",
+					"RESEND_API_KEY"
+				]
+			},
+			"assets": {
+				"directory": "../merlin-admin/dist",
+				"binding": "ASSETS",
+				"not_found_handling": "single-page-application",
+				"run_worker_first": [
+					"/",
+					"/login",
+					"/licenses",
+					"/overrides",
+					"/public-signup",
+					"/settings",
+					"/download",
+					"/download.js",
+					"/panel-api/*",
+					"/api/*",
+					"/doc*",
+					"/openapi.json*"
+				]
+			},
+			"routes": [
+				{
+					"pattern": "staging.api-merlin.com",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "merlin_db",
+					"database_name": "merlin-db-stage",
+					"database_id": "c1f04f9e-5110-4928-bc7f-f992be32cdd2"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "MERLIN_FILES",
+					"bucket_name": "merlin-files"
+				},
+				{
+					"binding": "MERLIN_ACTIVATIONS",
+					"bucket_name": "merlin-activations"
+				}
+			],
+			"ratelimits": [
+				{
+					"name": "LOGIN_RATE_LIMITER",
+					"namespace_id": "5101",
+					"simple": {
+						"limit": 10,
+						"period": 60
+					}
+				},
+				{
+					"name": "MANIFESTS_RATE_LIMITER",
+					"namespace_id": "5102",
+					"simple": {
+						"limit": 60,
+						"period": 60
+					}
+				},
+				{
+					"name": "ADMIN_RATE_LIMITER",
+					"namespace_id": "5103",
+					"simple": {
+						"limit": 20,
+						"period": 60
+					}
+				}
+			]
+		}
+	},
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

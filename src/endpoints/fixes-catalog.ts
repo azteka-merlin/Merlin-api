@@ -99,6 +99,16 @@ function isDepotboxCorrectionHref(href: string): boolean {
   }
 }
 
+function isRyuuCorrectionHref(href: string): boolean {
+  try {
+    const url = new URL(href);
+    return url.origin === "https://generator.ryuu.lol"
+      && url.pathname.startsWith("/fixes/");
+  } catch {
+    return false;
+  }
+}
+
 async function getViewerLicenseId(c: AppContext): Promise<number | null> {
   const accessToken = parseBearerToken(c.req.raw);
   if (!accessToken || !c.env.JWT_SECRET) return null;
@@ -162,8 +172,9 @@ export class FixesCatalogRoute extends OpenAPIRoute {
     const overrides = await readOverrides(c.env);
     const byAppId = new Map(remoteEntries.map((entry) => [entry.appid, entry]));
     const depotboxApiKey = typeof c.env.DEPOTBOX_API_KEY === "string" ? c.env.DEPOTBOX_API_KEY.trim() : "";
+    const ryuuAuthCode = typeof c.env.RYUU_AUTH_CODE === "string" ? c.env.RYUU_AUTH_CODE.trim() : "";
 
-    if (depotboxApiKey) {
+    if (depotboxApiKey || ryuuAuthCode) {
       for (const [appId, entry] of byAppId.entries()) {
         byAppId.set(appId, {
           ...entry,
@@ -171,6 +182,8 @@ export class FixesCatalogRoute extends OpenAPIRoute {
             ...fix,
             href: isDepotboxCorrectionHref(fix.href)
               ? `${buildDownloadHref(c.req.raw, appId)}&source=depotbox`
+              : ryuuAuthCode && isRyuuCorrectionHref(fix.href)
+                ? `${buildDownloadHref(c.req.raw, appId)}&source=ryuu`
               : fix.href,
           })),
         });
