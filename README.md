@@ -1,24 +1,110 @@
 # Merlin API
 
-Backend do Merlin em Cloudflare Workers + D1, servindo tanto a API publica quanto o painel administrativo.
+Cloudflare Workers backend for Merlin. The service exposes the public API used by the launcher and serves the administrative panel from the same Worker.
 
-## Hierarquia dos docs
+Do not document credentials, tokens, personal paths, private emails, infrastructure IDs, or secret values in this repository.
 
-Use este README como entrada principal. So abra outros `.md` quando a tarefa realmente pedir mais detalhe:
+## Architecture
 
-1. `docs/UP.md`: rodar, subir, migrar D1, bootstrap admin e validar deploy.
-2. `docs/ENVIRONMENT.md`: variaveis, secrets e bindings Cloudflare.
-3. `docs/INTEGRATIONS.md`: integracoes externas.
-4. `docs/STAGING.md`: staging da API, cadastro publico, painel e launcher.
-5. `docs/CONTEXT.md`: arquitetura, rotas, modulos e regras para mudancas.
+- The Worker handles both API requests and admin-panel asset routing.
+- Public launcher traffic is served under `/api/*`.
+- Admin-panel traffic is served under `/panel-api/*`.
+- The compiled admin frontend is served as static assets by the same Worker.
+- Administrative authentication is session-based and stays server-side.
+- Persistent data is stored in D1.
+- File-backed metadata and overrides are stored through Cloudflare bindings.
 
-Projeto open source: nao documente credenciais, tokens, paths pessoais, emails privados, IDs de infraestrutura ou valores sensiveis.
+## Main Routes
 
-## Comandos principais
+- `GET /doc`: Swagger / OpenAPI documentation.
+- `GET /api/health`: health check.
+- `GET /api/version`: deployed API version.
+- `GET /api/manifests?appid=...`: launcher manifest lookup.
+- `POST /api/auth/login`: launcher authentication.
+- `POST /panel-api/auth/login`: admin login.
+- `GET /panel-api/auth/session`: admin session lookup.
+- `POST /panel-api/auth/logout`: admin logout.
+- `GET /panel-api/licenses`: list licenses.
+- `POST /panel-api/licenses`: create license.
+- `GET /panel-api/licenses/:id`: read license details.
+- `PUT /panel-api/licenses/:id`: update license.
+- `POST /panel-api/licenses/:id/renew`: renew license.
+- `POST /panel-api/licenses/:id/revoke`: revoke license.
+- `POST /panel-api/licenses/:id/reset-hwid`: reset license hardware binding.
+
+## Project Structure
+
+- `src/index.ts`: Worker entry point, routing, public API, and admin panel integration.
+- `src/lib/admin-security.ts`: password hashing, sessions, CSRF handling, lockouts, and audit helpers.
+- `src/lib/admin-license-service.ts`: administrative license operations.
+- `migrations/`: D1 schema migrations.
+- `scripts/bootstrap-admin.mjs`: generates the SQL needed to create the first admin user.
+
+## Local Development
 
 ```powershell
-npm run dev
-npm run typecheck
+npm install
+Copy-Item wrangler.example.jsonc wrangler.jsonc
+Copy-Item .dev.vars.example .dev.vars
+npx wrangler types
+npx wrangler dev
+```
+
+The local Worker runs on Wrangler's development server. Use `/login` for the admin panel and `/doc` for Swagger.
+
+`wrangler.jsonc` and `worker-configuration.d.ts` are intentionally not committed:
+
+- `wrangler.jsonc` contains account-specific Cloudflare resource IDs, bucket names, custom domains, and optional rate-limit namespace IDs.
+- `worker-configuration.d.ts` is generated from the local Wrangler configuration with `npx wrangler types`.
+- `.dev.vars` contains local development secrets and should be created from `.dev.vars.example`.
+
+For a lightweight local setup, copy the example files and fill only the required values for the feature you are testing. If rate-limit bindings are omitted, the API runs without Cloudflare edge rate limiting and logs a warning.
+
+## Cloudflare Resource Setup
+
+Use placeholders in committed files and keep real values in your local `wrangler.jsonc` or Cloudflare account.
+
+Create a D1 database and paste its `database_name` and `database_id` into `wrangler.jsonc`:
+
+```powershell
+npx wrangler d1 create your-d1-database-name
+```
+
+Create the R2 buckets used by the API and paste their bucket names into `wrangler.jsonc`:
+
+```powershell
+npx wrangler r2 bucket create your-files-bucket
+npx wrangler r2 bucket create your-activations-bucket
+```
+
+Configure required production or staging secrets with Wrangler:
+
+```powershell
+npx wrangler secret put DEPOTBOX_API_KEY
+npx wrangler secret put RYUU_AUTH_CODE
+npx wrangler secret put HUBCAP_TOKEN
+npx wrangler secret put JWT_SECRET
+npx wrangler secret put SESSION_HASH_SECRET
+npx wrangler secret put RESEND_API_KEY
+```
+
+Rate-limit bindings are optional for local development and public clones. To enable Cloudflare edge rate limiting, create namespaces in your Cloudflare account and add the `ratelimits` block shown in `wrangler.example.jsonc`.
+
+## Admin Bootstrap
+
+Generate the first admin user with:
+
+```powershell
+npm run admin:bootstrap
+```
+
+The script prompts for a username and password, then prints SQL for a remote D1 insert. It does not write directly to the database. Passwords are never stored in plain text.
+
+## Deployment
+
+Common project commands:
+
+```powershell
 npm run deploy
 npm run deploy:panel
 npm run deploy-stage
@@ -27,100 +113,19 @@ npm run d1:migrate:remote
 npm run d1:migrate:stage
 ```
 
-- `npm run deploy`: sobe a API em producao.
-- `npm run deploy:panel`: builda `../merlin-admin`, gera types e sobe producao.
-- `npm run deploy-stage`: sobe somente a API staging.
-- `npm run deploy-stage:panel`: builda `../merlin-admin` e sobe staging sem rodar `types:stage`.
-- Overrides vivem no R2 `MERLIN_FILES` como `overrides.json`; na configuracao atual, R2 e compartilhado entre producao e staging e nao precisa migracao.
+Before deploying a fresh environment:
 
-## Superficie atual
+1. Build the admin frontend.
+2. Generate Worker types.
+3. Apply D1 migrations.
+4. Configure required secrets through Wrangler.
+5. Bootstrap the first admin user.
+6. Deploy the Worker.
 
-- `GET /doc` Swagger / OpenAPI
-- `GET /api/health`
-- `GET /api/version`
-- `GET /api/manifests?appid=...`
-- `POST /api/auth/login`
-- `POST /panel-api/auth/login`
-- `GET /panel-api/auth/session`
-- `POST /panel-api/auth/logout`
-- `GET /panel-api/licenses`
-- `POST /panel-api/licenses`
-- `GET /panel-api/licenses/:id`
-- `PUT /panel-api/licenses/:id`
-- `POST /panel-api/licenses/:id/renew`
-- `POST /panel-api/licenses/:id/revoke`
-- `POST /panel-api/licenses/:id/reset-hwid`
+## Security Notes
 
-## Arquitetura
-
-- `api-merlin.com` abre o painel admin / login
-- `api-merlin.com/api/*` continua atendendo a API publica existente
-- `api-merlin.com/doc` expoe o Swagger
-- o frontend compilado do `merlin-admin` e servido como asset pelo mesmo Worker da API
-- o token administrativo real continua server-side
-
-## Estrutura
-
-- `src/index.ts`: router principal, painel, auth admin e API publica
-- `src/lib/admin-security.ts`: hash de senha, sessoes, CSRF e auditoria admin
-- `src/lib/admin-license-service.ts`: operacoes administrativas de licenca
-- `migrations/0002_admin_auth.sql`: tabelas admin no D1
-- `scripts/bootstrap-admin.mjs`: gera o SQL do primeiro admin com hash seguro
-
-## Desenvolvimento local
-
-1. Instale dependencias da API: `npm install`
-2. Instale dependencias do front em `../merlin-admin`: `npm install`
-3. Gere os tipos do Worker: `npx wrangler types`
-4. Rode a API: `npx wrangler dev`
-5. Acesse `http://localhost:8787/login`
-6. Para Swagger, use `http://localhost:8787/doc`
-
-## Bootstrap do primeiro admin
-
-1. Gere o SQL do primeiro admin:
-   `npm run admin:bootstrap`
-2. Informe `username` e `senha`
-3. O script vai imprimir um comando pronto de `wrangler d1 execute` para inserir esse admin no banco remoto
-
-Observacoes:
-
-- a senha nunca e salva em texto puro
-- o hash segue o mesmo formato PBKDF2 usado pelo Worker
-- o script so gera o SQL; ele nao grava nada sozinho no banco
-
-## Ordem recomendada para deploy
-
-1. Build do front:
-   `cd ../merlin-admin && npm run build`
-2. Volte para a API:
-   `cd ../merlin-api`
-3. Gere os tipos do Worker:
-   `npx wrangler types`
-4. Aplique migrations no D1 remoto:
-   `npx wrangler d1 migrations apply merlin-db --remote`
-5. Configure secrets obrigatorios:
-   `npx wrangler secret put RYUU_AUTH_CODE`
-   `npx wrangler secret put HUBCAP_TOKEN`
-   `npx wrangler secret put JWT_SECRET`
-   `npx wrangler secret put SESSION_HASH_SECRET`
-6. Gere o primeiro admin:
-   `npm run admin:bootstrap`
-7. Execute no terminal o comando de `wrangler d1 execute` que o script imprimir
-8. Faça o deploy do Worker:
-   `npx wrangler deploy`
-
-## Validacao pos-deploy
-
-- `https://api-merlin.com/login` deve abrir a tela de login
-- `https://api-merlin.com/doc` deve abrir o Swagger
-- `https://api-merlin.com/api/health` deve seguir respondendo normalmente
-- sem sessao valida, `https://api-merlin.com/licenses` deve redirecionar para `/login`
-- apos login, o painel deve carregar licencas reais por `/panel-api/*`
-
-## Notas de seguranca
-
-- painel servido apenas por sessao administrativa com cookie HttpOnly + CSRF
-- o cookie `merlin_admin_session` e `HttpOnly`, `Secure` e `SameSite=Strict`
-- rotas mutaveis do painel exigem sessao valida e CSRF token
-- falhas de login sao auditadas e participam de lock por usuario e bloqueio por IP
+- Admin access uses an HttpOnly, Secure, SameSite session cookie.
+- Mutating admin routes require a valid session and CSRF token.
+- Login failures are audited and participate in user/IP lockout logic.
+- Real administrative tokens and secret values must remain server-side.
+- Public documentation should use placeholders for environment-specific infrastructure names.

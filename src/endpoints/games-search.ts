@@ -1,18 +1,11 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
-import { verifyAccessToken } from "../lib/auth";
+import { requireLauncherLicense } from "../lib/launcher-auth";
 import { type AppContext, GameSearchRequest, GameSearchResponse } from "../types";
 
 type GameSearchEnv = {
 	DEPOTBOX_API_KEY?: string;
 	JWT_SECRET?: string;
-};
-
-type ViewerLicenseLookup = {
-	id: number;
-	hwid: string | null;
-	expires_at: string;
-	status: "active" | "revoked";
 };
 
 type DepotboxGame = {
@@ -112,14 +105,6 @@ let depotSearchCache = new Map<string, {
 	expiresAt: number;
 	items: SearchItem[];
 }>();
-
-function parseBearerToken(request: Request): string | null {
-	const header = request.headers.get("authorization");
-	if (!header) return null;
-
-	const [scheme, token] = header.split(" ");
-	return scheme === "Bearer" && token ? token : null;
-}
 
 async function fetchWithTimeout(
 	input: RequestInfo | URL,
@@ -552,48 +537,6 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 	);
 }
 
-async function requireActiveViewerLicense(c: AppContext): Promise<void> {
-	const accessToken = parseBearerToken(c.req.raw);
-	if (!accessToken) {
-		throw new HTTPException(401, { message: "Missing access token" });
-	}
-
-	if (!c.env.JWT_SECRET) {
-		throw new HTTPException(500, { message: "JWT secret is not configured" });
-	}
-
-	const tokenPayload = await verifyAccessToken(accessToken, c.env.JWT_SECRET);
-	if (tokenPayload.exp <= Math.floor(Date.now() / 1000)) {
-		throw new HTTPException(401, { message: "Access token expired" });
-	}
-
-	const license = await c.env.merlin_db
-		.prepare(
-			`
-				SELECT id, hwid, expires_at, status
-				FROM licenses
-				WHERE id = ?
-			`,
-		)
-		.bind(tokenPayload.sub)
-		.first<ViewerLicenseLookup>();
-
-	if (!license) {
-		throw new HTTPException(401, { message: "License not found" });
-	}
-	if (license.status !== "active") {
-		throw new HTTPException(401, { message: "License is not active" });
-	}
-	if (!license.hwid || license.hwid !== tokenPayload.hwid) {
-		throw new HTTPException(401, { message: "HWID mismatch" });
-	}
-
-	const expiresAt = new Date(license.expires_at);
-	if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-		throw new HTTPException(401, { message: "License expired" });
-	}
-}
-
 async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: number): Promise<SearchSourceResult> {
 	if (!env.DEPOTBOX_API_KEY) {
 		console.warn("[games-search] depotbox api key is not configured");
@@ -789,7 +732,7 @@ export class GamesSearchRoute extends OpenAPIRoute {
 	};
 
 	async handle(c: AppContext) {
-		await requireActiveViewerLicense(c);
+		await requireLauncherLicense(c);
 		const data = await this.getValidatedData<typeof this.schema>();
 		const searchTerm = data.body.searchTerm.trim();
 		const limit = data.body.limit;

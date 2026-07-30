@@ -13,8 +13,8 @@
                     "cf-typegen":  "wrangler types",
                     "admin:bootstrap":  "node scripts/bootstrap-admin.mjs",
                     "build:panel":  "npm --prefix ../merlin-admin run build",
-                    "d1:migrate:remote":  "wrangler d1 migrations apply merlin-db --remote",
-                    "d1:migrate:stage":  "wrangler d1 migrations apply merlin-db-stage --remote --env staging",
+                    "d1:migrate:remote":  "node scripts/d1-migrate.mjs production",
+                    "d1:migrate:stage":  "node scripts/d1-migrate.mjs staging",
                     "deploy:panel":  "npm run build:panel \u0026\u0026 npm run types \u0026\u0026 npm run deploy",
                     "deploy-stage:panel":  "npm run build:panel \u0026\u0026 npm run deploy-stage"
                 },

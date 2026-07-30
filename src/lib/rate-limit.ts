@@ -27,21 +27,18 @@ const PUBLIC_ACCESS_LIMIT_MESSAGE =
 const PUBLIC_EMAIL_LIMIT_MESSAGE =
 	"O limite temporário de solicitações de verificação foi atingido. Aguarde alguns instantes e tente novamente.";
 
-function getRateLimiter(binding: RateLimitBinding | undefined, name: string): RateLimitBinding {
-	if (!binding) {
-		throw new HTTPException(500, { message: `${name} is not configured` });
-	}
-	return binding;
-}
-
 async function enforceLimit(
 	binding: RateLimitBinding | undefined,
 	key: string,
 	message: string,
 	logLabel: string,
 ) {
-	const limiter = getRateLimiter(binding, logLabel);
-	const { success } = await limiter.limit({ key });
+	if (!binding) {
+		console.warn(`[rate-limit] ${logLabel} binding is not configured; skipping limit`);
+		return;
+	}
+
+	const { success } = await binding.limit({ key });
 	if (success) return;
 
 	console.warn(`[rate-limit] ${logLabel} exceeded`);

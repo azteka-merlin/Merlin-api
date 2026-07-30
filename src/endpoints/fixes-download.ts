@@ -1,6 +1,8 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
+import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getFixOverrideFile, isZipHeader } from "../lib/overrides";
+import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { FixDownloadQuery, type AppContext } from "../types";
 
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
@@ -162,6 +164,7 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 	schema = {
 		tags: ["Fixes"],
 		summary: "Download a correction file from R2, Ryuu or DepotBox",
+		security: [{ bearerAuth: [] }],
 		request: {
 			query: FixDownloadQuery,
 		},
@@ -171,6 +174,12 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 			},
 			"404": {
 				description: "No override correction is configured for the requested game",
+			},
+			"401": {
+				description: "Missing, invalid or expired access token",
+			},
+			"429": {
+				description: "Too many correction download requests",
 			},
 			"502": {
 				description: "Could not load the correction file",
@@ -187,6 +196,9 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 		if (!appId) {
 			throw new HTTPException(400, { message: "Missing appid" });
 		}
+
+		const license = await requireLauncherLicense(c);
+		await enforceManifestsRateLimit(c, license.id);
 
 		if (source === "depotbox") {
 			return proxyDepotboxArchive(c, appId);

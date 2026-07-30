@@ -1,5 +1,5 @@
 import { HTTPException } from "hono/http-exception";
-import { verifyAccessToken } from "./auth";
+import { requireLauncherLicense } from "./launcher-auth";
 import type { AppContext } from "../types";
 
 type PremiumGameMetadata = {
@@ -26,15 +26,6 @@ type FallbackCatalogEntry = {
 
 type PremiumActivationStatus = "reserved" | "active" | "expired" | "failed";
 type PremiumActivationType = "steam_ticket" | "third_party";
-
-type ViewerLicenseLookup = {
-  id: number;
-  license_key: string;
-  name: string;
-  hwid: string | null;
-  expires_at: string;
-  status: "active" | "revoked";
-};
 
 type PremiumActivationRecord = {
   id: number;
@@ -241,12 +232,6 @@ function normalizeActivationLimit(value: number | null | undefined): number {
     throw new HTTPException(400, { message: "Invalid activation limit" });
   }
   return limit;
-}
-
-function parseBearerToken(request: Request): string | null {
-  const authorization = request.headers.get("authorization") || "";
-  const [scheme, token] = authorization.split(" ");
-  return scheme === "Bearer" && token ? token : null;
 }
 
 function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
@@ -503,54 +488,7 @@ export async function cleanupPremiumActivations(c: AppContext, now = new Date())
 }
 
 export async function requireAuthenticatedPremiumLicense(c: AppContext): Promise<AuthenticatedPremiumLicense> {
-  const accessToken = parseBearerToken(c.req.raw);
-  if (!accessToken) {
-    throw new HTTPException(401, { message: "Missing access token" });
-  }
-
-  if (!c.env.JWT_SECRET) {
-    throw new HTTPException(500, { message: "JWT secret is not configured" });
-  }
-
-  const payload = await verifyAccessToken(accessToken, c.env.JWT_SECRET);
-  if (payload.exp <= Math.floor(Date.now() / 1000)) {
-    throw new HTTPException(401, { message: "Access token expired" });
-  }
-
-  const license = await c.env.merlin_db
-    .prepare(`
-      SELECT id, license_key, name, hwid, expires_at, status
-      FROM licenses
-      WHERE id = ?
-      LIMIT 1
-    `)
-    .bind(payload.sub)
-    .first<ViewerLicenseLookup>();
-
-  if (!license) {
-    throw new HTTPException(401, { message: "License not found" });
-  }
-
-  if (license.status !== "active") {
-    throw new HTTPException(401, { message: "License is not active" });
-  }
-
-  if (!license.hwid || license.hwid !== payload.hwid) {
-    throw new HTTPException(401, { message: "HWID mismatch" });
-  }
-
-  const expiresAt = new Date(license.expires_at);
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-    throw new HTTPException(401, { message: "License expired" });
-  }
-
-  return {
-    id: license.id,
-    licenseKey: license.license_key,
-    name: license.name,
-    hwid: license.hwid,
-    expiresAt: license.expires_at,
-  };
+  return requireLauncherLicense(c);
 }
 
 export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {

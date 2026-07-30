@@ -36,7 +36,7 @@ import {
   updateLicense,
 } from "./lib/admin-license-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
-import { verifyAccessToken } from "./lib/auth";
+import { requireLauncherLicense } from "./lib/launcher-auth";
 import { type AppBindings, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import {
@@ -3213,44 +3213,7 @@ openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
 app.get("/api/manifests/status", async (c) => {
-  const authorization = c.req.header("authorization") || "";
-  const [scheme, token] = authorization.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    throw new HTTPException(401, { message: "Missing access token" });
-  }
-
-  if (!c.env.JWT_SECRET) {
-    throw new HTTPException(500, { message: "JWT secret is not configured" });
-  }
-
-  const payload = await verifyAccessToken(token, c.env.JWT_SECRET);
-  if (payload.exp <= Math.floor(Date.now() / 1000)) {
-    throw new HTTPException(401, { message: "Access token expired" });
-  }
-
-  const license = await c.env.merlin_db
-    .prepare(`
-      SELECT id, hwid, expires_at, status
-      FROM licenses
-      WHERE id = ?
-    `)
-    .bind(payload.sub)
-    .first<{ id: number; hwid: string | null; expires_at: string; status: "active" | "revoked" }>();
-
-  if (!license) {
-    throw new HTTPException(401, { message: "License not found" });
-  }
-  if (license.status !== "active") {
-    throw new HTTPException(401, { message: "License is not active" });
-  }
-  if (!license.hwid || license.hwid !== payload.hwid) {
-    throw new HTTPException(401, { message: "HWID mismatch" });
-  }
-
-  const expiresAt = new Date(license.expires_at);
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-    throw new HTTPException(401, { message: "License expired" });
-  }
+  await requireLauncherLicense(c);
 
   const appId = String(c.req.query("appid") || "").trim();
   if (!/^\d+$/.test(appId)) {
@@ -3276,11 +3239,22 @@ openapi.post("/api/public/email-verification/start", PublicEmailVerificationStar
 openapi.post("/api/public/email-verification/verify", PublicEmailVerificationVerifyRoute);
 
 app.onError((error, c) => {
-  console.error("[merlin-api:error]", error);
   if (error instanceof HTTPException) {
+    const logPayload = {
+      method: c.req.method,
+      path: new URL(c.req.url).pathname,
+      status: error.status,
+      message: error.message,
+    };
+    if (error.status >= 500) {
+      console.error("[merlin-api:error]", logPayload, error);
+    } else {
+      console.warn("[merlin-api:client-error]", logPayload);
+    }
     return c.json({ success: false, error: error.message }, error.status);
   }
 
+  console.error("[merlin-api:error]", error);
   return c.json({ success: false, error: "Internal Server Error" }, 500);
 });
 

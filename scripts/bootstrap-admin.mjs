@@ -2,6 +2,7 @@
 import { createHash, pbkdf2Sync, randomBytes } from "node:crypto";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output, argv } from "node:process";
+import { getD1DatabaseName } from "./wrangler-config.mjs";
 
 const PBKDF2_ITERATIONS = 100000;
 const PBKDF2_KEY_LENGTH = 32;
@@ -49,6 +50,14 @@ function readOption(name) {
   }
 
   return "";
+}
+
+function getBootstrapDatabaseName() {
+  try {
+    return getD1DatabaseName() || "<your-d1-database-name>";
+  } catch {
+    return "<your-d1-database-name>";
+  }
 }
 
 async function collectCredentials() {
@@ -105,7 +114,7 @@ async function main() {
   console.log(`Username: ${username}`);
   console.log(`Fingerprint local: ${hashPreview(username + ":" + passwordHash)}`);
   console.log("\nExecute este comando para inserir no D1 remoto:");
-  console.log(`npx wrangler d1 execute merlin-db --remote --command \"${sql.replace(/\"/g, '\\\"')}\"`);
+  console.log(`npx wrangler d1 execute ${getBootstrapDatabaseName()} --remote --command \"${sql.replace(/\"/g, '\\\"')}\"`);
   console.log("\nSQL gerado:");
   console.log(sql);
 }

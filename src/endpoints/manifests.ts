@@ -1,6 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
-import { verifyAccessToken } from "../lib/auth";
+import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { writeUserActivityLog } from "../lib/user-activity-service";
@@ -22,28 +22,11 @@ type ManifestSource = {
 	timeoutMs?: number;
 };
 
-type LicenseLookup = {
-	id: number;
-	license_key: string;
-	name: string;
-	hwid: string | null;
-	expires_at: string;
-	status: "active" | "revoked";
-};
-
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
-
-function parseBearerToken(request: Request): string | null {
-	const header = request.headers.get("authorization");
-	if (!header) return null;
-
-	const [scheme, token] = header.split(" ");
-	return scheme === "Bearer" && token ? token : null;
-}
 
 function getClientIp(c: AppContext): string | null {
 	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
@@ -244,46 +227,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 	};
 
 	async handle(c: AppContext) {
-		const accessToken = parseBearerToken(c.req.raw);
-		if (!accessToken) {
-			throw new HTTPException(401, { message: "Missing access token" });
-		}
-
-		if (!c.env.JWT_SECRET) {
-			throw new HTTPException(500, { message: "JWT secret is not configured" });
-		}
-
-		const tokenPayload = await verifyAccessToken(accessToken, c.env.JWT_SECRET);
-		if (tokenPayload.exp <= Math.floor(Date.now() / 1000)) {
-			throw new HTTPException(401, { message: "Access token expired" });
-		}
-
-		const license = await c.env.merlin_db
-			.prepare(
-				`
-					SELECT id, license_key, name, hwid, expires_at, status
-					FROM licenses
-					WHERE id = ?
-				`,
-			)
-			.bind(tokenPayload.sub)
-			.first<LicenseLookup>();
-
-		if (!license) {
-			throw new HTTPException(401, { message: "License not found" });
-		}
-		if (license.status !== "active") {
-			throw new HTTPException(401, { message: "License is not active" });
-		}
-		if (!license.hwid || license.hwid !== tokenPayload.hwid) {
-			throw new HTTPException(401, { message: "HWID mismatch" });
-		}
-
-		const expiresAt = new Date(license.expires_at);
-		if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-			throw new HTTPException(401, { message: "License expired" });
-		}
-
+		const license = await requireLauncherLicense(c);
 		await enforceManifestsRateLimit(c, license.id);
 
 		const data = await this.getValidatedData<typeof this.schema>();
@@ -298,14 +242,14 @@ export class ManifestsRoute extends OpenAPIRoute {
 		if (override) {
 			await writeUserActivityLog(c, {
 				licenseId: license.id,
-				licenseKey: license.license_key,
+				licenseKey: license.licenseKey,
 				userName: license.name,
 				action: "game_activation_success",
 				status: "success",
 				appId,
 				gameName: null,
 				ipAddress: clientIp,
-				hwid: tokenPayload.hwid,
+				hwid: license.hwid,
 				metadata: { source: "r2-override" },
 			});
 			return buildZipResponse(override.bytes, appId, "r2-override");
@@ -317,14 +261,14 @@ export class ManifestsRoute extends OpenAPIRoute {
 
 			await writeUserActivityLog(c, {
 				licenseId: license.id,
-				licenseKey: license.license_key,
+				licenseKey: license.licenseKey,
 				userName: license.name,
 				action: "game_activation_success",
 				status: "success",
 				appId,
 				gameName: null,
 				ipAddress: clientIp,
-				hwid: tokenPayload.hwid,
+				hwid: license.hwid,
 				metadata: { source: source.name },
 			});
 
@@ -333,14 +277,14 @@ export class ManifestsRoute extends OpenAPIRoute {
 
 		await writeUserActivityLog(c, {
 			licenseId: license.id,
-			licenseKey: license.license_key,
+			licenseKey: license.licenseKey,
 			userName: license.name,
 			action: "game_activation_denied",
 			status: "denied",
 			appId,
 			gameName: null,
 			ipAddress: clientIp,
-			hwid: tokenPayload.hwid,
+			hwid: license.hwid,
 			reason: "manifest_unavailable",
 		});
 

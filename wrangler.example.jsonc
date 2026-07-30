@@ -1,0 +1,176 @@
+/**
+ * Copy this file to wrangler.jsonc and replace every placeholder with values
+ * from your own Cloudflare account.
+ *
+ * Keep wrangler.jsonc local. It can contain account-specific infrastructure IDs,
+ * bucket names, database IDs, custom domains, and rate-limit namespace IDs.
+ *
+ * Cloudflare docs:
+ * - Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
+ * - Secrets: https://developers.cloudflare.com/workers/configuration/secrets/
+ * - D1: https://developers.cloudflare.com/d1/get-started/
+ * - R2: https://developers.cloudflare.com/r2/buckets/create-buckets/
+ * - Rate limiting binding: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "your-merlin-api-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-20",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"keep_vars": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"directory": "../merlin-admin/dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/",
+			"/login",
+			"/licenses",
+			"/overrides",
+			"/public-signup",
+			"/settings",
+			"/download",
+			"/download.js",
+			"/panel-api/*",
+			"/api/*",
+			"/doc*",
+			"/openapi.json*"
+		]
+	},
+	"routes": [
+		{
+			"pattern": "your-api-domain.example.com",
+			"custom_domain": true
+		}
+	],
+	"secrets": {
+		"required": [
+			"DEPOTBOX_API_KEY",
+			"RYUU_AUTH_CODE",
+			"HUBCAP_TOKEN",
+			"JWT_SECRET",
+			"SESSION_HASH_SECRET",
+			"RESEND_API_KEY"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "merlin_db",
+			"database_name": "your-d1-database-name",
+			"database_id": "00000000-0000-0000-0000-000000000000"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "MERLIN_FILES",
+			"bucket_name": "your-files-bucket"
+		},
+		{
+			"binding": "MERLIN_ACTIVATIONS",
+			"bucket_name": "your-activations-bucket"
+		}
+	],
+	/**
+	 * Optional.
+	 *
+	 * If omitted, the API runs without Cloudflare edge rate limiting and logs a warning.
+	 * To enable it, create rate-limit namespaces in Cloudflare and uncomment this block.
+	 */
+	// "ratelimits": [
+	// 	{
+	// 		"name": "LOGIN_RATE_LIMITER",
+	// 		"namespace_id": "1001",
+	// 		"simple": {
+	// 			"limit": 10,
+	// 			"period": 60
+	// 		}
+	// 	},
+	// 	{
+	// 		"name": "MANIFESTS_RATE_LIMITER",
+	// 		"namespace_id": "1002",
+	// 		"simple": {
+	// 			"limit": 60,
+	// 			"period": 60
+	// 		}
+	// 	},
+	// 	{
+	// 		"name": "ADMIN_RATE_LIMITER",
+	// 		"namespace_id": "1003",
+	// 		"simple": {
+	// 			"limit": 20,
+	// 			"period": 60
+	// 		}
+	// 	}
+	// ],
+	"env": {
+		"staging": {
+			"name": "your-merlin-api-worker-stage",
+			"vars": {
+				"ENVIRONMENT": "staging"
+			},
+			"secrets": {
+				"required": [
+					"DEPOTBOX_API_KEY",
+					"RYUU_AUTH_CODE",
+					"HUBCAP_TOKEN",
+					"JWT_SECRET",
+					"SESSION_HASH_SECRET",
+					"RESEND_API_KEY"
+				]
+			},
+			"assets": {
+				"directory": "../merlin-admin/dist",
+				"binding": "ASSETS",
+				"not_found_handling": "single-page-application",
+				"run_worker_first": [
+					"/",
+					"/login",
+					"/licenses",
+					"/overrides",
+					"/public-signup",
+					"/settings",
+					"/download",
+					"/download.js",
+					"/panel-api/*",
+					"/api/*",
+					"/doc*",
+					"/openapi.json*"
+				]
+			},
+			"routes": [
+				{
+					"pattern": "your-staging-api-domain.example.com",
+					"custom_domain": true
+				}
+			],
+			"d1_databases": [
+				{
+					"binding": "merlin_db",
+					"database_name": "your-staging-d1-database-name",
+					"database_id": "00000000-0000-0000-0000-000000000000"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "MERLIN_FILES",
+					"bucket_name": "your-staging-files-bucket"
+				},
+				{
+					"binding": "MERLIN_ACTIVATIONS",
+					"bucket_name": "your-staging-activations-bucket"
+				}
+			]
+			/**
+			 * Optional staging rate-limit block.
+			 * Add "ratelimits" here if you want staging to use separate namespaces.
+			 */
+		}
+	}
+}
