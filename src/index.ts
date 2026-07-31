@@ -573,7 +573,7 @@ function renderPublicDownloadPage() {
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; color: #eef2ff; background: radial-gradient(circle at 16% 5%, rgba(139, 92, 246, .28), transparent 32%), radial-gradient(circle at 86% 24%, rgba(47, 125, 246, .18), transparent 28%), #070b15; }
-    main { width: min(1120px, calc(100% - 32px)); min-height: 100vh; margin: 0 auto; padding: 38px 0; display: grid; align-items: center; }
+    main { width: min(1120px, calc(100% - 32px)); min-height: 100vh; margin: 0 auto; padding: 38px 0 24px; display: grid; grid-template-rows: 1fr auto; gap: 28px; align-items: center; }
     .hero { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(380px, 440px); gap: 26px; align-items: center; }
     .hero.signup-closed { grid-template-columns: minmax(0, 720px); justify-content: center; }
     .panel { border: 1px solid rgba(139, 92, 246, .42); background: linear-gradient(180deg, rgba(15, 23, 42, .92), rgba(8, 13, 26, .94)); border-radius: 20px; box-shadow: 0 24px 90px rgba(0,0,0,.38); }
@@ -635,6 +635,11 @@ function renderPublicDownloadPage() {
     .pin-card p { margin: 0 0 10px; color: #fde68a; font-size: 12px; line-height: 1.45; font-weight: 850; }
     .pin-card code { display: block; color: #fff; font-size: 18px; font-weight: 950; letter-spacing: .08em; }
     .success-actions { display: grid; gap: 10px; }
+    .site-footer { display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .social-link { width: 42px; height: 42px; display: grid; place-items: center; color: #a8b3c7; border: 1px solid rgba(148,163,184,.16); border-radius: 12px; background: rgba(15,23,42,.62); text-decoration: none; transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+    .social-link:hover { color: #fff; border-color: rgba(139,92,246,.58); background: rgba(139,92,246,.18); transform: translateY(-2px); }
+    .social-link:focus-visible { outline: 3px solid rgba(139,92,246,.34); outline-offset: 3px; }
+    .social-link svg { width: 20px; height: 20px; fill: currentColor; }
     [hidden] { display: none !important; }
     @media (max-width: 920px) {
       main { align-items: start; padding: 22px 0; }
@@ -806,6 +811,17 @@ function renderPublicDownloadPage() {
         </div>
       </section>
     </div>
+    <footer class="site-footer" aria-label="Redes sociais do Merlin">
+      <a class="social-link" href="https://www.instagram.com/merlin.launcher/" target="_blank" rel="noopener noreferrer" aria-label="Merlin no Instagram" title="Instagram">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.8 2h8.4A5.8 5.8 0 0 1 22 7.8v8.4a5.8 5.8 0 0 1-5.8 5.8H7.8A5.8 5.8 0 0 1 2 16.2V7.8A5.8 5.8 0 0 1 7.8 2Zm-.2 2A3.6 3.6 0 0 0 4 7.6v8.8A3.6 3.6 0 0 0 7.6 20h8.8a3.6 3.6 0 0 0 3.6-3.6V7.6A3.6 3.6 0 0 0 16.4 4H7.6Zm9.65 1.5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5ZM12 7a5 5 0 1 1 0 10 5 5 0 0 1 0-10Zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>
+      </a>
+      <a class="social-link" href="https://www.tiktok.com/@merlin.launcher" target="_blank" rel="noopener noreferrer" aria-label="Merlin no TikTok" title="TikTok">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 2c.35 2.05 1.5 3.48 3.7 3.62v3.16a7.4 7.4 0 0 1-3.66-.99v6.37a6.16 6.16 0 1 1-5.32-6.1c.42-.05.84-.06 1.25-.02v3.23a3 3 0 1 0 .02 5.74c.7-.23 1.14-.68 1.33-1.34.08-.25.12-.58.12-.98V2h2.56Z"/></svg>
+      </a>
+      <a class="social-link" href="https://github.com/azteka-merlin/Merlin-luncher/" target="_blank" rel="noopener noreferrer" aria-label="Código do Merlin no GitHub" title="GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.87c-2.78.6-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.64-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.56 9.56 0 0 1 12 6.82a9.5 9.5 0 0 1 2.5.34c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.86v2.75c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/></svg>
+      </a>
+    </footer>
   </main>
   <script src="/download.js?v=20260725-email-flow-2" defer></script>
 </body>
