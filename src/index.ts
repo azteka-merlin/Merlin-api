@@ -23,6 +23,7 @@ import {
   requireAdminSession,
   SESSION_COOKIE_NAME,
   setAdminSessionCookie,
+  writeAdminAuditLog,
 } from "./lib/admin-security";
 import {
   createLicense,
@@ -132,6 +133,7 @@ const updateLicenseSchema = z.object({
   contact: z.string().min(1).optional(),
   contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
   phone: z.string().min(1).optional(),
+  recoveryPin: z.string().trim().regex(/^\d{4,8}$/).optional(),
   expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   hwid: z.string().trim().optional().nullable(),
 }).refine((value) => Boolean(value.contact || value.phone), {
@@ -2656,6 +2658,13 @@ app.post("/panel-api/licenses", async (c) => {
     ipHash: session.session.ip_hash,
     userAgentHash: session.session.user_agent_hash,
   });
+  if (created.contact_type === "email") {
+    queuePublicEmail(c, "admin-welcome-access-key", sendWelcomeAccessKeyEmail(c, {
+      email: created.contact,
+      name: created.name,
+      licenseKey: created.license_key,
+    }));
+  }
   return c.json(mapLicense(created), 201);
 });
 
@@ -2671,6 +2680,31 @@ app.put("/panel-api/licenses/:id", async (c) => {
     userAgentHash: session.session.user_agent_hash,
   });
   return c.json(mapLicense(updated), 200);
+});
+
+app.post("/panel-api/licenses/:id/send-welcome-email", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const license = await getLicense(c, parseLicenseId(c.req.param("id")));
+  if (license.contact_type !== "email") {
+    throw new HTTPException(400, { message: "This license contact is not an email" });
+  }
+
+  await sendWelcomeAccessKeyEmail(c, {
+    email: license.contact,
+    name: license.name,
+    licenseKey: license.license_key,
+  });
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "license_welcome_email_sent",
+    entityType: "license",
+    entityId: String(license.id),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: { email: license.contact },
+  });
+
+  return c.json({ success: true }, 200);
 });
 
 app.post("/panel-api/licenses/:id/renew", async (c) => {

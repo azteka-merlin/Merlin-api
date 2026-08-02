@@ -113,6 +113,7 @@ export const CreateLicenseRequest = z.object({
 	contact: z.string().min(1).optional().describe("Customer contact"),
 	contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
 	phone: z.string().min(1).optional().describe("Deprecated alias for contact"),
+	recoveryPin: z.string().trim().regex(/^\d{4,8}$/).optional().describe("Optional recovery PIN with 4 to 8 digits"),
 	expiresAt: z
 		.string()
 		.regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -129,6 +130,7 @@ export const LicenseResponse = z.object({
 	contact: z.string(),
 	contactType: z.enum(["phone", "email", "discord"]),
 	source: z.string(),
+	hasRecoveryPin: z.boolean().optional(),
 	recoveryNoticeAcceptedAt: z.string().nullable().optional(),
 	phone: z.string(),
 	hwid: z.string().nullable(),

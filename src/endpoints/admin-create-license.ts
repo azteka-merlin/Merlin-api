@@ -12,6 +12,7 @@ import {
 	toIsoDateStart,
 } from "../lib/licenses";
 import { enforceAdminRateLimit } from "../lib/rate-limit";
+import { hashRecoveryPin, normalizeRecoveryPin } from "../lib/recovery-pin";
 
 export class AdminCreateLicenseRoute extends OpenAPIRoute {
 	schema = {
@@ -78,11 +79,13 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 		const data = await this.getValidatedData<typeof this.schema>();
 		const now = new Date().toISOString();
 		const expiresAt = toIsoDateStart(data.body.expiresAt);
+		const recoveryPin = normalizeRecoveryPin(data.body.recoveryPin);
 
 		let licenseKey = generateLicenseKey();
 		let insertResult: D1Result<Record<string, unknown>> | null = null;
 
 		for (let attempt = 0; attempt < 5; attempt += 1) {
+			const recoveryPinHash = recoveryPin ? await hashRecoveryPin(c, { licenseKey, recoveryPin }) : null;
 			const statement = c.env.merlin_db.prepare(
 				`
 					INSERT INTO licenses (
@@ -91,6 +94,8 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 						contact,
 						contact_type,
 						source,
+						recovery_pin_hash,
+						recovery_notice_accepted_at,
 						hwid,
 						expires_at,
 						status,
@@ -98,7 +103,7 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 						created_at,
 						updated_at
 					)
-					VALUES (?, ?, ?, ?, 'admin', ?, ?, 'active', ?, ?, ?)
+					VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, 'active', ?, ?, ?)
 				`,
 			);
 
@@ -109,6 +114,8 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 						data.body.name,
 						data.body.contact || data.body.phone,
 						data.body.contactType || "phone",
+						recoveryPinHash,
+						recoveryPin ? now : null,
 						null,
 						expiresAt,
 						null,

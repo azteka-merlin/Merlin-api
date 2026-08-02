@@ -2,6 +2,7 @@ import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
 import { writeAdminAuditLog } from "./admin-security";
+import { hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 export type ContactType = "phone" | "email" | "discord";
 
@@ -19,6 +20,7 @@ export function mapLicense(record: LicenseRecord) {
     contact: record.contact,
     contactType: record.contact_type,
     source: record.source,
+    hasRecoveryPin: Boolean(record.recovery_pin_hash),
     recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
     phone: record.contact,
     hwid: record.hwid,
@@ -92,7 +94,7 @@ export function assertValidContact(contact: string, contactType: ContactType) {
 
 export async function createLicense(
   c: AppContext,
-  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; expiresAt: string },
+  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string },
   actor?: LicenseActionActor,
 ) {
   const now = new Date().toISOString();
@@ -100,21 +102,23 @@ export async function createLicense(
   const contactType = input.contactType || "phone";
   const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
   assertValidContact(normalizedContact, contactType);
+  const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
+    const recoveryPinHash = recoveryPin ? await hashRecoveryPin(c, { licenseKey, recoveryPin }) : null;
     try {
       insertResult = await c.env.merlin_db
         .prepare(
           `
             INSERT INTO licenses (
-              license_key, name, contact, contact_type, source, hwid, expires_at, status, revoked_reason, created_at, updated_at
+              license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'admin', ?, ?, 'active', ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, 'active', ?, ?, ?)
           `,
         )
-        .bind(licenseKey, input.name, normalizedContact, contactType, null, expiresAt, null, now, now)
+        .bind(licenseKey, input.name, normalizedContact, contactType, recoveryPinHash, recoveryPin ? now : null, null, expiresAt, null, now, now)
         .run();
       break;
     } catch (error) {
@@ -143,7 +147,7 @@ export async function createLicense(
 export async function updateLicense(
   c: AppContext,
   id: number,
-  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; expiresAt: string; hwid: string | null },
+  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string; hwid: string | null },
   actor?: LicenseActionActor,
 ) {
   const current = await getLicense(c, id);
@@ -151,15 +155,20 @@ export async function updateLicense(
   const contactType = input.contactType || current.contact_type || "phone";
   const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
   assertValidContact(normalizedContact, contactType);
+  const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
+  const recoveryPinHash = recoveryPin ? await hashRecoveryPin(c, { licenseKey: current.license_key, recoveryPin }) : null;
+  const recoveryPinSql = recoveryPin ? ", recovery_pin_hash = ?, recovery_notice_accepted_at = ?" : "";
+  const recoveryPinBindings = recoveryPin ? [recoveryPinHash, new Date().toISOString()] : [];
+  const now = new Date().toISOString();
   await c.env.merlin_db
     .prepare(
       `
         UPDATE licenses
-        SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, updated_at = ?
+        SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?${recoveryPinSql}, updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(input.name, normalizedContact, contactType, nextHwid, toIsoDateStart(input.expiresAt), new Date().toISOString(), current.id)
+    .bind(input.name, normalizedContact, contactType, nextHwid, toIsoDateStart(input.expiresAt), ...recoveryPinBindings, now, current.id)
     .run();
 
   const updated = await getLicense(c, id);

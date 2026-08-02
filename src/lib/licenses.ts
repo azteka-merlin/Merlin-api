@@ -71,6 +71,7 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		contact: record.contact,
 		contactType: record.contact_type,
 		source: record.source,
+		hasRecoveryPin: Boolean(record.recovery_pin_hash),
 		recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
 		phone: record.contact,
 		hwid: record.hwid,

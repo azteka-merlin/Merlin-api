@@ -3,6 +3,7 @@ import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
 import { assertValidContact, normalizeContact, type ContactType } from "./admin-license-service";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
+import { compareRecoveryPin, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 export type PublicSignupDurationUnit = "days" | "weeks" | "months" | "years";
 
@@ -149,20 +150,6 @@ function calculateExpiresAt(settings: Awaited<ReturnType<typeof getPublicSignupS
   return addDuration(new Date(), settings.durationAmount, settings.durationUnit);
 }
 
-async function sha256Hex(value: string) {
-  const data = new TextEncoder().encode(value);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function hashRecoveryPin(c: AppContext, input: { contact: string; contactType: ContactType; recoveryPin: string }) {
-  const secret = String(c.env.SESSION_HASH_SECRET || "").trim();
-  if (!secret) {
-    throw new HTTPException(500, { message: "SESSION_HASH_SECRET is not configured" });
-  }
-  return sha256Hex(`${secret}:${input.contactType}:${input.contact}:${input.recoveryPin}`);
-}
-
 async function findLatestActiveLicenseByContact(c: AppContext, contact: string, contactType: ContactType) {
   return c.env.merlin_db
     .prepare(
@@ -179,18 +166,6 @@ async function findLatestActiveLicenseByContact(c: AppContext, contact: string, 
     )
     .bind(contact, contactType)
     .first<LicenseRecord>();
-}
-
-async function compareRecoveryPin(c: AppContext, license: LicenseRecord, recoveryPin: string) {
-  if (!license.recovery_pin_hash) {
-    return false;
-  }
-  const expected = await hashRecoveryPin(c, {
-    contact: license.contact,
-    contactType: license.contact_type,
-    recoveryPin,
-  });
-  return expected === license.recovery_pin_hash;
 }
 
 export function normalizePublicAccessContact(value: string, contactType: ContactType) {
@@ -221,8 +196,8 @@ export async function registerPublicAccessKey(
   if (!name) {
     throw new HTTPException(400, { message: "Name is required" });
   }
-  const recoveryPin = input.recoveryPin.trim();
-  if (!/^\d{4,8}$/.test(recoveryPin)) {
+  const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
+  if (!recoveryPin) {
     throw new HTTPException(400, { message: "Recovery PIN must contain 4 to 8 digits" });
   }
 
@@ -244,11 +219,11 @@ export async function registerPublicAccessKey(
 
   const now = new Date().toISOString();
   const expiresAt = toIsoDateStart(calculateExpiresAt(settings));
-  const recoveryPinHash = await hashRecoveryPin(c, { contact, contactType: input.contactType, recoveryPin });
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
+    const recoveryPinHash = await hashRecoveryPin(c, { licenseKey, recoveryPin });
     try {
       insertResult = await c.env.merlin_db
         .prepare(
@@ -295,8 +270,8 @@ export async function recoverPublicAccessKey(
   c: AppContext,
   input: { contact: string; contactType: ContactType; recoveryPin: string },
 ) {
-  const recoveryPin = input.recoveryPin.trim();
-  if (!/^\d{4,8}$/.test(recoveryPin)) {
+  const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
+  if (!recoveryPin) {
     throw new HTTPException(401, { message: GENERIC_RECOVERY_ERROR });
   }
 
