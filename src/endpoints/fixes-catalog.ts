@@ -191,6 +191,11 @@ export class FixesCatalogRoute extends OpenAPIRoute {
     }
 
     for (const [appId, entry] of Object.entries(overrides)) {
+      if (entry.hidden === true) {
+        byAppId.delete(appId);
+        continue;
+      }
+
       const fixOverride = entry.fixOverride;
       const overrideName = entry.name || fixOverride?.gameName || undefined;
       const overrideAdminNote = entry.adminNote || undefined;

@@ -56,6 +56,9 @@ export class AdminUpsertOverrideRoute extends OpenAPIRoute {
 		}
 
 		const override = await upsertOverride(c.env, appId, {
+			name: body?.name,
+			adminNote: body?.adminNote,
+			hidden: body?.hidden,
 			manifestOverride: body?.manifestOverride,
 			fixOverride: body?.fixOverride,
 		});

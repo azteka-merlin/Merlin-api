@@ -16,6 +16,7 @@ export type FixOverrideConfig = {
 export type OverrideEntry = {
 	name?: string;
 	adminNote?: string;
+	hidden?: boolean;
 	manifestOverride?: ManifestOverrideConfig;
 	fixOverride?: FixOverrideConfig;
 };
@@ -136,6 +137,10 @@ function validateEntry(
 		nextEntry.adminNote = normalizedAdminNote;
 	}
 
+	if (entry.hidden !== undefined) {
+		nextEntry.hidden = Boolean(entry.hidden);
+	}
+
 	if (entry.manifestOverride) {
 		validateManifestOverride(appId, entry.manifestOverride);
 		nextEntry.manifestOverride = {
@@ -155,7 +160,7 @@ function validateEntry(
 		};
 	}
 
-	if (!nextEntry.manifestOverride && !nextEntry.fixOverride && !nextEntry.adminNote) {
+	if (!nextEntry.manifestOverride && !nextEntry.fixOverride && !nextEntry.adminNote && nextEntry.hidden !== true) {
 		throw new HTTPException(400, { message: "At least one override detail must be provided" });
 	}
 

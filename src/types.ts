@@ -176,6 +176,7 @@ export const FixOverrideConfig = z.object({
 export const OverrideEntry = z.object({
 	name: z.string().min(1).optional(),
 	adminNote: z.string().min(1).optional(),
+	hidden: z.boolean().optional(),
 	manifestOverride: ManifestOverrideConfig.optional(),
 	fixOverride: FixOverrideConfig.optional(),
 });
@@ -189,10 +190,11 @@ export const OverrideUpsertRequest = z
 		appId: z.string().regex(/^\d+$/),
 		name: z.string().min(1),
 		adminNote: z.string().min(1).optional(),
+		hidden: z.boolean().optional(),
 		manifestOverride: ManifestOverrideConfig.optional(),
 		fixOverride: FixOverrideConfig.optional(),
 	})
-	.refine((value) => Boolean(value.adminNote || value.manifestOverride || value.fixOverride), {
+	.refine((value) => Boolean(value.adminNote || value.hidden === true || value.manifestOverride || value.fixOverride), {
 		message: "At least one override detail must be provided",
 		path: ["appId"],
 	});

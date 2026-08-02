@@ -2205,6 +2205,7 @@ app.post("/panel-api/overrides", async (c) => {
   const override = await upsertOverride(c.env, body.appId, {
     name: body.name,
     adminNote: body.adminNote,
+    hidden: body.hidden,
     manifestOverride: body.manifestOverride,
     fixOverride: body.fixOverride,
   });
