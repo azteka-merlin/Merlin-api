@@ -16,5 +16,8 @@ if (environment !== "production") {
 	args.push("--env", environment);
 }
 
-const result = spawnSync(platform === "win32" ? "npx.cmd" : "npx", args, { stdio: "inherit" });
+const env = { ...process.env, CI: process.env.CI || "1" };
+const result = platform === "win32"
+	? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", "npx", ...args], { stdio: "inherit", env })
+	: spawnSync("npx", args, { stdio: "inherit", env });
 exit(result.status ?? 1);

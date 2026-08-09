@@ -1,7 +1,7 @@
 import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
-import { assertValidContact, normalizeContact, type ContactType } from "./admin-license-service";
+import { assertValidContact, findLicenseByEmailContact, normalizeContact, type ContactType } from "./admin-license-service";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { compareRecoveryPin, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
@@ -150,6 +150,10 @@ function calculateExpiresAt(settings: Awaited<ReturnType<typeof getPublicSignupS
   return addDuration(new Date(), settings.durationAmount, settings.durationUnit);
 }
 
+function isUsablePublicLicense(record: LicenseRecord) {
+  return record.status === "active" && new Date(record.expires_at) >= new Date();
+}
+
 async function findLatestActiveLicenseByContact(c: AppContext, contact: string, contactType: ContactType) {
   return c.env.merlin_db
     .prepare(
@@ -160,6 +164,26 @@ async function findLatestActiveLicenseByContact(c: AppContext, contact: string, 
           AND contact_type = ?
           AND status = 'active'
           AND datetime(expires_at) >= datetime('now')
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+    )
+    .bind(contact, contactType)
+    .first<LicenseRecord>();
+}
+
+async function findLatestLicenseByContact(c: AppContext, contact: string, contactType: ContactType) {
+  if (contactType === "email") {
+    return findLicenseByEmailContact(c, contact);
+  }
+
+  return c.env.merlin_db
+    .prepare(
+      `
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+        FROM licenses
+        WHERE contact = ?
+          AND contact_type = ?
         ORDER BY id DESC
         LIMIT 1
       `,
@@ -205,8 +229,11 @@ export async function registerPublicAccessKey(
   const emailVerificationId = input.contactType === "email"
     ? await assertRecentPublicEmailVerification(c, contact)
     : null;
-  const existing = await findLatestActiveLicenseByContact(c, contact, input.contactType);
+  const existing = await findLatestLicenseByContact(c, contact, input.contactType);
   if (existing) {
+    if (!isUsablePublicLicense(existing)) {
+      throw new HTTPException(400, { message: "PUBLIC_ACCESS_KEY_UNAVAILABLE" });
+    }
     const matchesPin = await compareRecoveryPin(c, existing, recoveryPin);
     if (!matchesPin) {
       throw new HTTPException(400, { message: "PUBLIC_ACCESS_KEY_UNAVAILABLE" });

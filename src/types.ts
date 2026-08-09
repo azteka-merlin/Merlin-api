@@ -4,6 +4,11 @@ import { z } from "zod";
 export interface AppBindings extends Env {
   SESSION_HASH_SECRET: string;
   RESEND_API_KEY: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_MONTHLY_PRICE_ID?: string;
+  STRIPE_LIFETIME_PRICE_ID?: string;
+  STRIPE_WEBHOOK_SECRET: string;
+  STRIPE_BILLING_PORTAL_CONFIGURATION_ID?: string;
   EMAIL_FROM?: string;
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
@@ -41,6 +46,13 @@ export const LoginResponse = z.object({
 		name: z.string(),
 		expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 		status: LicenseStatus,
+		billing: z.object({
+			accessType: z.string(),
+			billingStatus: z.string(),
+			currentPeriodEnd: z.string().nullable(),
+			cancelAtPeriodEnd: z.boolean(),
+			canManageSubscription: z.boolean(),
+		}).optional(),
 	}),
 });
 
@@ -137,6 +149,16 @@ export const LicenseResponse = z.object({
 	expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 	status: LicenseStatus,
 	revokedReason: z.string().nullable(),
+	revokedOrigin: z.string().nullable().optional(),
+	revokedEventId: z.string().nullable().optional(),
+	customerId: z.number().int().positive().nullable().optional(),
+	accessType: z.string().optional(),
+	billingStatus: z.string().optional(),
+	stripeCustomerId: z.string().nullable().optional(),
+	stripeSubscriptionId: z.string().nullable().optional(),
+	stripeCheckoutSessionId: z.string().nullable().optional(),
+	billingCurrentPeriodEnd: z.string().nullable().optional(),
+	billingCancelAtPeriodEnd: z.boolean().optional(),
 	createdAt: z.string().datetime(),
 	updatedAt: z.string().datetime(),
 });

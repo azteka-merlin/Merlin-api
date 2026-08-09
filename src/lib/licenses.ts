@@ -9,13 +9,23 @@ export type LicenseRecord = {
 	name: string;
 	contact: string;
 	contact_type: "phone" | "email" | "discord";
-	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import";
+	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe";
 	recovery_pin_hash: string | null;
 	recovery_notice_accepted_at: string | null;
 	hwid: string | null;
 	expires_at: string;
 	status: "active" | "revoked";
 	revoked_reason: string | null;
+	revoked_origin?: string | null;
+	revoked_event_id?: string | null;
+	customer_id?: number | null;
+	access_type?: string | null;
+	billing_status?: string | null;
+	stripe_customer_id?: string | null;
+	stripe_subscription_id?: string | null;
+	stripe_checkout_session_id?: string | null;
+	billing_current_period_end?: string | null;
+	billing_cancel_at_period_end?: number | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -78,6 +88,16 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		expiresAt: toDateOnly(record.expires_at),
 		status: record.status,
 		revokedReason: record.revoked_reason,
+		revokedOrigin: record.revoked_origin || null,
+		revokedEventId: record.revoked_event_id || null,
+		customerId: record.customer_id ?? null,
+		accessType: record.access_type || "free",
+		billingStatus: record.billing_status || "none",
+		stripeCustomerId: record.stripe_customer_id || null,
+		stripeSubscriptionId: record.stripe_subscription_id || null,
+		stripeCheckoutSessionId: record.stripe_checkout_session_id || null,
+		billingCurrentPeriodEnd: record.billing_current_period_end || null,
+		billingCancelAtPeriodEnd: Boolean(record.billing_cancel_at_period_end),
 		createdAt: record.created_at,
 		updatedAt: record.updated_at,
 	};
@@ -100,6 +120,16 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 					expires_at,
 					status,
 					revoked_reason,
+					revoked_origin,
+					revoked_event_id,
+					customer_id,
+					access_type,
+					billing_status,
+					stripe_customer_id,
+					stripe_subscription_id,
+					stripe_checkout_session_id,
+					billing_current_period_end,
+					billing_cancel_at_period_end,
 					created_at,
 					updated_at
 				FROM licenses

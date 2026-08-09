@@ -66,7 +66,11 @@ export class AdminRevokeLicenseRoute extends OpenAPIRoute {
 			.prepare(
 				`
 					UPDATE licenses
-					SET status = 'revoked', revoked_reason = ?, updated_at = ?
+					SET status = 'revoked',
+					    revoked_reason = ?,
+					    revoked_origin = 'admin',
+					    revoked_event_id = NULL,
+					    updated_at = ?
 					WHERE id = ?
 				`,
 			)

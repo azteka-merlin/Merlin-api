@@ -12,6 +12,8 @@ export type LicenseActionActor = {
   userAgentHash: string;
 };
 
+const DUPLICATE_EMAIL_LICENSE_MESSAGE = "Este e-mail já possui uma licença cadastrada.";
+
 export function mapLicense(record: LicenseRecord) {
   return {
     id: record.id,
@@ -27,16 +29,38 @@ export function mapLicense(record: LicenseRecord) {
     expiresAt: toDateOnly(record.expires_at),
     status: record.status,
     revokedReason: record.revoked_reason,
+    revokedOrigin: record.revoked_origin || null,
+    revokedEventId: record.revoked_event_id || null,
+    customerId: record.customer_id ?? null,
+    accessType: record.access_type || "free",
+    billingStatus: record.billing_status || "none",
+    stripeCustomerId: record.stripe_customer_id || null,
+    stripeSubscriptionId: record.stripe_subscription_id || null,
+    stripeCheckoutSessionId: record.stripe_checkout_session_id || null,
+    billingCurrentPeriodEnd: record.billing_current_period_end || null,
+    billingCancelAtPeriodEnd: Boolean(record.billing_cancel_at_period_end),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
   };
 }
 
 export async function listLicenses(c: AppContext) {
+  const billingColumns = `
+    customer_id,
+    COALESCE(access_type, 'free') AS access_type,
+    COALESCE(billing_status, 'none') AS billing_status,
+    stripe_customer_id,
+    stripe_subscription_id,
+    stripe_checkout_session_id,
+    billing_current_period_end,
+    billing_cancel_at_period_end
+  `;
   const result = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          ${billingColumns},
+          created_at, updated_at
         FROM licenses
         ORDER BY id DESC
       `,
@@ -50,7 +74,16 @@ export async function getLicense(c: AppContext, id: number) {
   const license = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          customer_id,
+          COALESCE(access_type, 'free') AS access_type,
+          COALESCE(billing_status, 'none') AS billing_status,
+          stripe_customer_id,
+          stripe_subscription_id,
+          stripe_checkout_session_id,
+          billing_current_period_end,
+          billing_cancel_at_period_end,
+          created_at, updated_at
         FROM licenses
         WHERE id = ?
       `,
@@ -92,6 +125,49 @@ export function assertValidContact(contact: string, contactType: ContactType) {
   }
 }
 
+export async function findLicenseByEmailContact(c: AppContext, email: string, excludeId?: number) {
+  const normalizedEmail = normalizeContact(email, "email");
+  return c.env.merlin_db
+    .prepare(
+      `
+        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          customer_id,
+          COALESCE(access_type, 'free') AS access_type,
+          COALESCE(billing_status, 'none') AS billing_status,
+          stripe_customer_id,
+          stripe_subscription_id,
+          stripe_checkout_session_id,
+          billing_current_period_end,
+          billing_cancel_at_period_end,
+          created_at, updated_at
+        FROM licenses
+        WHERE contact_type = 'email'
+          AND lower(contact) = ?
+          AND (? IS NULL OR id <> ?)
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+    )
+    .bind(normalizedEmail, excludeId ?? null, excludeId ?? null)
+    .first<LicenseRecord>();
+}
+
+async function assertEmailContactAvailable(c: AppContext, contactType: ContactType, contact: string, excludeId?: number) {
+  if (contactType !== "email") {
+    return;
+  }
+
+  const existing = await findLicenseByEmailContact(c, contact, excludeId);
+  if (existing) {
+    throw new HTTPException(409, { message: DUPLICATE_EMAIL_LICENSE_MESSAGE });
+  }
+}
+
+function isDuplicateEmailLicenseError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return message.includes("idx_licenses_unique_email_contact");
+}
+
 export async function createLicense(
   c: AppContext,
   input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string },
@@ -102,6 +178,7 @@ export async function createLicense(
   const contactType = input.contactType || "phone";
   const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
   assertValidContact(normalizedContact, contactType);
+  await assertEmailContactAvailable(c, contactType, normalizedContact);
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
@@ -122,6 +199,9 @@ export async function createLicense(
         .run();
       break;
     } catch (error) {
+      if (isDuplicateEmailLicenseError(error)) {
+        throw new HTTPException(409, { message: DUPLICATE_EMAIL_LICENSE_MESSAGE });
+      }
       if (attempt === 4) {
         throw error;
       }
@@ -155,21 +235,29 @@ export async function updateLicense(
   const contactType = input.contactType || current.contact_type || "phone";
   const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
   assertValidContact(normalizedContact, contactType);
+  await assertEmailContactAvailable(c, contactType, normalizedContact, current.id);
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   const recoveryPinHash = recoveryPin ? await hashRecoveryPin(c, { licenseKey: current.license_key, recoveryPin }) : null;
   const recoveryPinSql = recoveryPin ? ", recovery_pin_hash = ?, recovery_notice_accepted_at = ?" : "";
   const recoveryPinBindings = recoveryPin ? [recoveryPinHash, new Date().toISOString()] : [];
   const now = new Date().toISOString();
-  await c.env.merlin_db
-    .prepare(
-      `
-        UPDATE licenses
-        SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?${recoveryPinSql}, updated_at = ?
-        WHERE id = ?
-      `,
-    )
-    .bind(input.name, normalizedContact, contactType, nextHwid, toIsoDateStart(input.expiresAt), ...recoveryPinBindings, now, current.id)
-    .run();
+  try {
+    await c.env.merlin_db
+      .prepare(
+        `
+          UPDATE licenses
+          SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?${recoveryPinSql}, updated_at = ?
+          WHERE id = ?
+        `,
+      )
+      .bind(input.name, normalizedContact, contactType, nextHwid, toIsoDateStart(input.expiresAt), ...recoveryPinBindings, now, current.id)
+      .run();
+  } catch (error) {
+    if (isDuplicateEmailLicenseError(error)) {
+      throw new HTTPException(409, { message: DUPLICATE_EMAIL_LICENSE_MESSAGE });
+    }
+    throw error;
+  }
 
   const updated = await getLicense(c, id);
   if (actor) {
@@ -209,7 +297,7 @@ export async function revokeLicense(c: AppContext, id: number, reason: string, a
   await getLicense(c, id);
   const normalizedReason = reason.trim();
   await c.env.merlin_db
-    .prepare(`UPDATE licenses SET status = 'revoked', revoked_reason = ?, updated_at = ? WHERE id = ?`)
+    .prepare(`UPDATE licenses SET status = 'revoked', revoked_reason = ?, revoked_origin = 'admin', revoked_event_id = NULL, updated_at = ? WHERE id = ?`)
     .bind(normalizedReason, new Date().toISOString(), id)
     .run();
   const updated = await getLicense(c, id);
@@ -230,7 +318,7 @@ export async function revokeLicense(c: AppContext, id: number, reason: string, a
 export async function reactivateLicense(c: AppContext, id: number, actor?: LicenseActionActor) {
   await getLicense(c, id);
   await c.env.merlin_db
-    .prepare(`UPDATE licenses SET status = 'active', revoked_reason = NULL, updated_at = ? WHERE id = ?`)
+    .prepare(`UPDATE licenses SET status = 'active', revoked_reason = NULL, revoked_origin = NULL, revoked_event_id = NULL, updated_at = ? WHERE id = ?`)
     .bind(new Date().toISOString(), id)
     .run();
   const updated = await getLicense(c, id);

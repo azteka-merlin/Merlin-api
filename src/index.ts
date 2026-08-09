@@ -36,9 +36,21 @@ import {
   reactivateLicense,
   updateLicense,
 } from "./lib/admin-license-service";
+import { getBillingSettings, updateBillingSettings } from "./lib/billing-settings";
+import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
+import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
+import { createPublicStripeCheckout } from "./lib/public-checkout";
+import {
+  getPublicCheckoutStatus,
+  getPublicCheckoutStatusByEmail,
+  parseAndVerifyStripeWebhook,
+  processStripeWebhookEvent,
+  reconcileStripeCheckoutSession,
+  reconcileStripeLicense,
+} from "./lib/stripe-webhook";
 import { requireLauncherLicense } from "./lib/launcher-auth";
-import { type AppBindings, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
+import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import {
   assertPremiumDownloadAccess,
@@ -122,7 +134,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/settings", "/public-signup"] as const;
+const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -143,13 +155,20 @@ const updateLicenseSchema = z.object({
 const publicAccessKeySchema = z.object({
   name: z.string().trim().min(1),
   contact: z.string().trim().min(1),
-  contactType: z.enum(["phone", "email", "discord"]),
+  contactType: z.literal("email"),
   recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
   acceptedRecoveryNotice: z.boolean(),
 });
+
+async function handleStripeWebhook(c: AppContext) {
+  const rawBody = await c.req.text();
+  const event = await parseAndVerifyStripeWebhook(c, rawBody);
+  const result = await processStripeWebhookEvent(c, event);
+  return c.json({ received: true, ...result }, 200);
+}
 const publicAccessKeyRecoverySchema = z.object({
   contact: z.string().trim().min(1),
-  contactType: z.enum(["phone", "email", "discord"]),
+  contactType: z.literal("email"),
   recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
 });
 const publicSignupSettingsSchema = z.object({
@@ -157,6 +176,29 @@ const publicSignupSettingsSchema = z.object({
   durationAmount: z.number().int().positive().optional().default(30),
   durationUnit: z.enum(["days", "weeks", "months", "years"]).optional().default("days"),
   isLifetime: z.boolean(),
+  billing: z.object({
+    billingEnabled: z.boolean(),
+    monthlyEnabled: z.boolean(),
+    lifetimeEnabled: z.boolean(),
+    monthlyPriceId: z.string().trim().optional().default(""),
+    lifetimePriceId: z.string().trim().optional().default(""),
+  }).optional(),
+});
+const publicCheckoutSchema = z.object({
+  name: z.string().trim().min(1),
+  contact: z.string().trim().email(),
+  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+  acceptedRecoveryNotice: z.boolean(),
+  planType: z.enum(["monthly", "lifetime"]),
+});
+const publicCheckoutStatusQuerySchema = z.object({
+  session_id: z.string().trim().min(1),
+});
+const publicCheckoutStatusByEmailSchema = z.object({
+  email: z.string().trim().email(),
+});
+const publicBillingPortalSchema = z.object({
+  email: z.string().trim().email(),
 });
 const overrideUploadInitSchema = z.object({
   appId: z.string().regex(/^\d+$/),
@@ -561,7 +603,15 @@ function getPanelIndexRequest(c: any) {
 }
 
 async function servePanelApp(c: any) {
-  return c.env.ASSETS.fetch(getPanelIndexRequest(c));
+  const response = await c.env.ASSETS.fetch(getPanelIndexRequest(c));
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function renderPublicDownloadPage() {
@@ -602,11 +652,31 @@ function renderPublicDownloadPage() {
     .benefits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 26px; padding-top: 22px; border-top: 1px solid rgba(148,163,184,.13); }
     .benefit { display: flex; align-items: center; gap: 11px; min-height: 48px; padding: 11px 12px; color: #dbeafe; font-size: 14px; line-height: 1.25; font-weight: 850; border: 1px solid rgba(148,163,184,.12); border-radius: 13px; background: rgba(2,6,23,.34); }
     .benefit span:first-child { flex: 0 0 22px; width: 22px; height: 22px; border-radius: 999px; display: grid; place-items: center; background: rgba(139,92,246,.2); color: #c4b5fd; font-size: 12px; }
+    .faq { margin-top: 18px; padding-top: 20px; border-top: 1px solid rgba(148,163,184,.13); }
+    .faq h2 { margin: 0 0 12px; color: #fff; font-size: 20px; line-height: 1.2; letter-spacing: 0; }
+    .faq-list { display: grid; gap: 9px; }
+    .faq-item { border: 1px solid rgba(148,163,184,.12); border-radius: 13px; background: rgba(2,6,23,.34); overflow: hidden; }
+    .faq-question { width: 100%; min-height: 46px; padding: 12px 13px; border: 0; background: transparent; color: #dbeafe; display: flex; align-items: center; justify-content: space-between; gap: 12px; font: inherit; font-size: 14px; line-height: 1.25; font-weight: 900; text-align: left; cursor: pointer; }
+    .faq-question:hover { background: rgba(139,92,246,.09); }
+    .faq-question span:first-child { min-width: 0; }
+    .faq-question span:last-child { flex: 0 0 auto; color: #c4b5fd; font-size: 18px; line-height: 1; transition: transform .16s ease; }
+    .faq-item.is-open .faq-question span:last-child { transform: rotate(45deg); }
+    .faq-answer { display: none; padding: 0 13px 13px; color: #a8b3c7; font-size: 13px; line-height: 1.55; font-weight: 680; }
+    .faq-item.is-open .faq-answer { display: block; }
+    .faq-answer p { margin: 0; color: inherit; font: inherit; max-width: none; }
     .card { padding: 28px; }
-    .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 22px; padding: 5px; border-radius: 14px; background: rgba(2,6,23,.54); border: 1px solid rgba(148,163,184,.13); }
-    .tab { border: 1px solid transparent; background: transparent; color: #94a3b8; border-radius: 10px; padding: 11px; font-weight: 900; cursor: pointer; font: inherit; }
-    .tab.active { color: #fff; border-color: rgba(139,92,246,.62); background: rgba(139,92,246,.24); }
+    .form-title { margin: 0 0 4px; color: #fff; font-size: 24px; line-height: 1.12; letter-spacing: 0; }
     .form-panel { display: grid; gap: 15px; }
+    .plan-selector { display: grid; gap: 10px; }
+    .plan-selector__title { margin: 0; color: #dbeafe; font-size: 13px; font-weight: 900; }
+    .plan-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .plan-option { position: relative; display: grid; gap: 5px; min-height: 92px; padding: 13px 13px 12px; border: 1px solid rgba(148,163,184,.16); border-radius: 13px; background: rgba(2,6,23,.5); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+    .plan-option:hover { transform: translateY(-1px); border-color: rgba(139,92,246,.48); background: rgba(139,92,246,.12); }
+    .plan-option.is-selected { border-color: rgba(139,92,246,.72); background: rgba(139,92,246,.2); }
+    .plan-option input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+    .plan-option strong { color: #fff; font-size: 15px; line-height: 1.2; }
+    .plan-option span { color: #c4b5fd; font-size: 14px; font-weight: 950; overflow-wrap: anywhere; }
+    .plan-option small { color: #a8b3c7; font-size: 11px; font-weight: 760; }
     .field { display: grid; gap: 7px; color: #dbeafe; font-size: 13px; font-weight: 850; }
     .input-wrap { position: relative; }
     .input-icon { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px; display: grid; place-items: center; color: #9ca3af; pointer-events: none; }
@@ -616,11 +686,23 @@ function renderPublicDownloadPage() {
     .segment button { height: 37px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #94a3b8; font: inherit; font-weight: 900; cursor: pointer; }
     .segment button.active { color: #fff; border-color: rgba(139,92,246,.62); background: rgba(139,92,246,.23); }
     .hint { color: #a8b3c7; line-height: 1.45; font-size: 12px; font-weight: 650; margin: 0; }
+    .support-links { display: grid; gap: 8px; padding-top: 2px; text-align: center; }
+    .text-link { width: 100%; min-height: 30px; border: 0; padding: 0; background: transparent; color: #c4b5fd; font: inherit; font-size: 13px; line-height: 1.35; font-weight: 850; cursor: pointer; text-decoration: none; }
+    .text-link:hover { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
     .notice { display: flex; gap: 10px; align-items: flex-start; color: #dbeafe; font-size: 12px; line-height: 1.45; padding: 12px; border-radius: 12px; background: rgba(139,92,246,.13); border: 1px solid rgba(139,92,246,.28); font-weight: 760; }
     .notice input { width: 18px; height: 18px; margin: 1px 0 0; padding: 0; accent-color: #8b5cf6; flex: 0 0 auto; }
     .field-error { min-height: 16px; color: #fca5a5; font-size: 12px; font-weight: 850; }
     .message { min-height: 18px; color: #fca5a5; font-size: 13px; font-weight: 850; }
     .message.ok { color: #86efac; }
+    .status-modal { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 18px; }
+    .status-modal__backdrop { position: absolute; inset: 0; background: rgba(2,6,23,.72); backdrop-filter: blur(10px); }
+    .status-modal__panel { position: relative; width: min(100%, 390px); display: grid; gap: 14px; padding: 24px; border-radius: 18px; border: 1px solid rgba(148,163,184,.18); background: linear-gradient(180deg, rgba(15,23,42,.98), rgba(2,6,23,.98)); box-shadow: 0 28px 80px rgba(0,0,0,.44); text-align: center; }
+    .status-modal__mark { width: 52px; height: 52px; margin: 0 auto; border-radius: 999px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #8b5cf6, #2f7df6); font-weight: 950; font-size: 20px; box-shadow: 0 16px 34px rgba(47,125,246,.2); }
+    .status-modal.is-ok .status-modal__mark { background: linear-gradient(135deg, #22c55e, #2f7df6); }
+    .status-modal.is-warn .status-modal__mark { background: linear-gradient(135deg, #f59e0b, #8b5cf6); }
+    .status-modal.is-error .status-modal__mark { background: linear-gradient(135deg, #ef4444, #8b5cf6); }
+    .status-modal h2 { margin: 0; color: #fff; font-size: 24px; line-height: 1.12; letter-spacing: 0; }
+    .status-modal p { margin: 0; color: #a8b3c7; font-size: 13px; line-height: 1.55; font-weight: 720; }
     .verification-panel { display: grid; gap: 16px; }
     .verification-panel h2 { margin: 0; color: #fff; font-size: 24px; line-height: 1.15; }
     .verification-panel p { margin: 0; color: #a8b3c7; line-height: 1.5; font-size: 13px; font-weight: 700; }
@@ -637,6 +719,13 @@ function renderPublicDownloadPage() {
     .pin-card p { margin: 0 0 10px; color: #fde68a; font-size: 12px; line-height: 1.45; font-weight: 850; }
     .pin-card code { display: block; color: #fff; font-size: 18px; font-weight: 950; letter-spacing: .08em; }
     .success-actions { display: grid; gap: 10px; }
+    .payment-status-result { display: grid; gap: 14px; text-align: center; padding: 8px 0 4px; }
+    .payment-status-mark { width: 54px; height: 54px; margin: 0 auto; border-radius: 999px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #8b5cf6, #2f7df6); font-weight: 950; font-size: 22px; box-shadow: 0 16px 34px rgba(47,125,246,.2); }
+    .payment-status-result.is-processing .payment-status-mark { background: linear-gradient(135deg, #f59e0b, #8b5cf6); }
+    .payment-status-result.is-missing .payment-status-mark { background: linear-gradient(135deg, #64748b, #334155); }
+    .payment-status-result h2 { margin: 0; color: #fff; font-size: 25px; line-height: 1.12; letter-spacing: 0; }
+    .payment-status-result p { margin: 0; color: #a8b3c7; line-height: 1.5; font-size: 13px; font-weight: 700; }
+    .payment-status-actions { display: grid; gap: 10px; }
     .site-footer { display: flex; align-items: center; justify-content: center; gap: 10px; }
     .social-link { width: 42px; height: 42px; display: grid; place-items: center; color: #a8b3c7; border: 1px solid rgba(148,163,184,.16); border-radius: 12px; background: rgba(15,23,42,.62); text-decoration: none; transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
     .social-link:hover { color: #fff; border-color: rgba(139,92,246,.58); background: rgba(139,92,246,.18); transform: translateY(-2px); }
@@ -656,9 +745,10 @@ function renderPublicDownloadPage() {
       .intro h1 { font-size: 42px; }
       .hero-art, .signup-closed .hero-art { height: 190px; border-radius: 14px; }
       .actions, .benefits { grid-template-columns: 1fr; }
+      .plan-options { grid-template-columns: 1fr; }
       .button { width: 100%; }
       .benefits { display: grid; }
-      .segment button, .tab { font-size: 13px; }
+      .segment button { font-size: 13px; }
     }
   </style>
 </head>
@@ -685,21 +775,84 @@ function renderPublicDownloadPage() {
           </div>
           <div class="version" id="versionText" data-i18n="versionLoading">Loading current version...</div>
           <div class="benefits" aria-label="Beneficios do Merlin">
-            <div class="benefit"><span>✓</span><span data-i18n="benefitInstall">Simple installation</span></div>
-            <div class="benefit"><span>✓</span><span data-i18n="benefitUpdates">Automatic updates</span></div>
-            <div class="benefit signup-copy"><span>✓</span><span data-i18n="benefitRecovery">Access key recovery</span></div>
-            <div class="benefit signup-copy"><span>✓</span><span data-i18n="benefitActivation">Secure activation</span></div>
+            <div class="benefit"><span>🎮</span><span data-i18n="benefitLibrary">Exclusive library</span></div>
+            <div class="benefit"><span>⚡</span><span data-i18n="benefitAllInOne">Everything in one place</span></div>
+            <div class="benefit signup-copy"><span>🔍</span><span data-i18n="benefitOpenCode">Open source</span></div>
+            <div class="benefit signup-copy"><span>🚀</span><span data-i18n="benefitEvolution">Always evolving</span></div>
           </div>
+          <section class="faq" aria-labelledby="faqTitle">
+            <h2 id="faqTitle" data-i18n="faqTitle">Frequently asked questions</h2>
+            <div class="faq-list">
+              <div class="faq-item is-open">
+                <button class="faq-question" type="button" aria-expanded="true">
+                  <span data-i18n="faqWhatTitle">🧙‍♂️ What is Merlin?</span>
+                  <span aria-hidden="true">+</span>
+                </button>
+                <div class="faq-answer">
+                  <p data-i18n="faqWhatBody">Merlin is a PC platform created to make downloading games much simpler. Forget complicated processes: just choose the game, download, and play.</p>
+                </div>
+              </div>
+              <div class="faq-item">
+                <button class="faq-question" type="button" aria-expanded="false">
+                  <span data-i18n="faqSafeTitle">🛡️ Is Merlin safe?</span>
+                  <span aria-hidden="true">+</span>
+                </button>
+                <div class="faq-answer">
+                  <p data-i18n="faqSafeBody">Yes. Merlin does not ask for your Steam password and is a 100% open source project, allowing anyone to review how it works.</p>
+                </div>
+              </div>
+              <div class="faq-item">
+                <button class="faq-question" type="button" aria-expanded="false">
+                  <span data-i18n="faqBanTitle">🎮 Can I get banned using Merlin?</span>
+                  <span aria-hidden="true">+</span>
+                </button>
+                <div class="faq-answer">
+                  <p data-i18n="faqBanBody">To this day, there are no known reports of bans from using this technology, which has been used by the community for years. As a preventive measure, we recommend using Merlin on a secondary Steam account during setup.</p>
+                </div>
+              </div>
+              <div class="faq-item">
+                <button class="faq-question" type="button" aria-expanded="false">
+                  <span data-i18n="faqFreeTitle">🎁 Why is Merlin free?</span>
+                  <span aria-hidden="true">+</span>
+                </button>
+                <div class="faq-answer">
+                  <p data-i18n="faqFreeBody">Merlin is still experimental. During this period, access is free so the community can test the platform, send feedback, and help develop the project.</p>
+                </div>
+              </div>
+              <div class="faq-item">
+                <button class="faq-question" type="button" aria-expanded="false">
+                  <span data-i18n="faqDifferentTitle">⭐ What makes Merlin different?</span>
+                  <span aria-hidden="true">+</span>
+                </button>
+                <div class="faq-answer">
+                  <p data-i18n="faqDifferentBody">Besides simplifying the whole process, Merlin also provides games that are part of the library officially acquired by the team. Many of these titles would normally require buying an official license at full price or relying on unreliable methods found online. Merlin's goal is to offer a much simpler, organized, and transparent experience for the community.</p>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
       </section>
 
       <section class="panel card" id="signupCard" hidden>
-        <div class="tabs">
-          <button class="tab active" id="registerTab" type="button" data-i18n="createTab">Create key</button>
-          <button class="tab" id="recoverTab" type="button" data-i18n="recoverTab">Recover</button>
-        </div>
-
         <form class="form-panel" id="registerForm" novalidate>
+          <div class="plan-selector" id="planSelector" hidden>
+            <p class="plan-selector__title" data-i18n="choosePlan">Choose your plan</p>
+            <div class="plan-options" id="planOptions">
+              <label class="plan-option" data-plan-option="monthly">
+                <input type="radio" name="planType" value="monthly" />
+                <strong data-i18n="monthlyPlan">Monthly</strong>
+                <span data-plan-price="monthly">--</span>
+                <small data-i18n="monthlyPlanHint">Renewed automatically.</small>
+              </label>
+              <label class="plan-option" data-plan-option="lifetime">
+                <input type="radio" name="planType" value="lifetime" />
+                <strong data-i18n="lifetimePlan">Lifetime</strong>
+                <span data-plan-price="lifetime">--</span>
+                <small data-i18n="lifetimePlanHint">One-time payment.</small>
+              </label>
+            </div>
+            <div class="field-error" data-plan-error></div>
+          </div>
           <div class="field" data-field="name">
             <span data-i18n="name">Name</span>
             <div class="input-wrap">
@@ -709,21 +862,14 @@ function renderPublicDownloadPage() {
             <div class="field-error"></div>
           </div>
           <div class="field" data-field="contact">
-            <span data-i18n="contact">Contact</span>
+            <span data-i18n="emailContact">E-mail</span>
             <div class="input-wrap">
-              <span class="input-icon" data-contact-icon aria-hidden="true">☎</span>
-              <input name="contact" autocomplete="tel" required />
+              <span class="input-icon" data-contact-icon aria-hidden="true">@</span>
+              <input name="contact" type="email" autocomplete="email" inputmode="email" required />
             </div>
             <div class="field-error"></div>
           </div>
-          <div class="field">
-            <span data-i18n="contactType">Contact type</span>
-            <div class="segment" data-segment="register">
-              <button class="active" type="button" data-contact-type="email" data-i18n="email">E-mail</button>
-              <button type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
-            </div>
-            <input name="contactType" type="hidden" value="email" />
-          </div>
+          <input name="contactType" type="hidden" value="email" />
           <div class="field" data-field="recoveryPin">
             <span data-i18n="pin">Recovery PIN</span>
             <div class="input-wrap">
@@ -740,6 +886,11 @@ function renderPublicDownloadPage() {
           </label>
           <div class="field-error" data-checkbox-error></div>
           <button class="button primary" type="submit" data-default-key="createSubmit" data-default-text="Create my access key">Create my access key</button>
+          <div class="support-links">
+            <button class="text-link" id="recoverLink" type="button" data-i18n="recoverInline">Already have a key? Recover access</button>
+            <button class="text-link" id="paymentStatusLink" type="button" data-i18n="paymentStatusInline">Already paid? Check payment status</button>
+            <button class="text-link" id="billingPortalLink" type="button" data-i18n="billingPortalInline">Manage monthly subscription</button>
+          </div>
         </form>
 
         <form class="verification-panel" id="emailVerificationForm" hidden novalidate>
@@ -766,22 +917,16 @@ function renderPublicDownloadPage() {
         </form>
 
         <form class="form-panel" id="recoverForm" hidden novalidate>
+          <h2 class="form-title" data-i18n="recoverTitle">Recover access</h2>
           <div class="field" data-field="contact">
-            <span data-i18n="contact">Contact</span>
+            <span data-i18n="emailContact">E-mail</span>
             <div class="input-wrap">
-              <span class="input-icon" data-contact-icon aria-hidden="true">☎</span>
-              <input name="contact" autocomplete="tel" required />
+              <span class="input-icon" data-contact-icon aria-hidden="true">@</span>
+              <input name="contact" type="email" autocomplete="email" inputmode="email" required />
             </div>
             <div class="field-error"></div>
           </div>
-          <div class="field">
-            <span data-i18n="contactType">Contact type</span>
-            <div class="segment" data-segment="recover">
-              <button class="active" type="button" data-contact-type="email" data-i18n="email">E-mail</button>
-              <button type="button" data-contact-type="phone" data-i18n="phone">Phone</button>
-            </div>
-            <input name="contactType" type="hidden" value="email" />
-          </div>
+          <input name="contactType" type="hidden" value="email" />
           <div class="field" data-field="recoveryPin">
             <span data-i18n="pin">Recovery PIN</span>
             <div class="input-wrap">
@@ -791,9 +936,70 @@ function renderPublicDownloadPage() {
             <div class="field-error"></div>
           </div>
           <button class="button primary" type="submit" data-default-key="recoverSubmit" data-default-text="Recover my access key">Recover my access key</button>
+          <button class="button subtle" data-back-to-register type="button" data-i18n="backToCreate">Back to sign up</button>
         </form>
 
+        <form class="form-panel" id="paymentStatusForm" hidden novalidate>
+          <h2 class="form-title" data-i18n="paymentStatusTitle">Check payment</h2>
+          <div class="field" data-field="contact">
+            <span data-i18n="emailContact">E-mail</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">@</span>
+              <input name="contact" type="email" autocomplete="email" inputmode="email" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <input name="contactType" type="hidden" value="email" />
+          <p class="hint" data-i18n="paymentStatusHint">Use the same e-mail used at checkout. We will send a code before showing your payment status.</p>
+          <button class="button primary" type="submit" data-default-key="paymentStatusSubmit" data-default-text="Check payment">Check payment</button>
+          <button class="button subtle" data-back-to-register type="button" data-i18n="backToCreate">Back to sign up</button>
+        </form>
+
+        <form class="form-panel" id="billingPortalForm" hidden novalidate>
+          <h2 class="form-title" data-i18n="billingPortalTitle">Manage monthly subscription</h2>
+          <div class="field" data-field="contact">
+            <span data-i18n="emailContact">E-mail</span>
+            <div class="input-wrap">
+              <span class="input-icon" aria-hidden="true">@</span>
+              <input name="contact" type="email" autocomplete="email" inputmode="email" required />
+            </div>
+            <div class="field-error"></div>
+          </div>
+          <input name="contactType" type="hidden" value="email" />
+          <p class="hint" data-i18n="billingPortalHint">Use the e-mail linked to your monthly Stripe subscription. Lifetime purchases do not have a subscription portal.</p>
+          <button class="button primary" type="submit" data-default-key="billingPortalSubmit" data-default-text="Open portal">Open portal</button>
+          <button class="button subtle" data-back-to-register type="button" data-i18n="backToCreate">Back to sign up</button>
+        </form>
+
+        <div class="payment-status-result" id="paymentStatusResult" hidden>
+          <div class="payment-status-mark" id="paymentStatusMark">...</div>
+          <div>
+            <h2 id="paymentStatusResultTitle">Payment status</h2>
+            <p id="paymentStatusResultText">Checking your payment status.</p>
+          </div>
+          <div class="key-card" id="paymentStatusKeyCard" hidden>
+            <code id="paymentStatusLicenseKey"></code>
+          </div>
+          <div class="payment-status-actions">
+            <button class="button ghost" id="copyPaymentStatusKey" type="button" data-i18n="copyKey" hidden>Copy key</button>
+            <a class="button primary" id="paymentStatusDownload" href="/api/updates/download" data-i18n="download" hidden>Download Merlin</a>
+            <button class="button primary" id="retryPaymentStatus" type="button" data-default-key="paymentStatusRetry" data-default-text="Check again">Check again</button>
+            <button class="button subtle" data-back-to-register type="button" data-i18n="backToCreate">Back to sign up</button>
+          </div>
+        </div>
+
         <div class="message" id="message"></div>
+        <div class="status-modal" id="statusModal" role="dialog" aria-modal="true" aria-labelledby="statusModalTitle" hidden>
+          <div class="status-modal__backdrop" data-close-status-modal></div>
+          <div class="status-modal__panel">
+            <div class="status-modal__mark" id="statusModalMark">i</div>
+            <div>
+              <h2 id="statusModalTitle">Status</h2>
+              <p id="statusModalText">Message</p>
+            </div>
+            <button class="button primary" id="statusModalClose" type="button" data-i18n="modalClose">OK</button>
+          </div>
+        </div>
         <div class="success" id="result">
           <div class="success-mark">✓</div>
           <h2 id="resultTitle">Your key was created</h2>
@@ -808,7 +1014,7 @@ function renderPublicDownloadPage() {
           <div class="success-actions">
             <button class="button ghost" id="copyKey" type="button" data-i18n="copyKey">Copy key</button>
             <a class="button primary" href="/api/updates/download" data-i18n="download">Download Merlin</a>
-            <button class="button subtle" id="createAnother" type="button" data-i18n="createAnother">Create another key</button>
+            <button class="button subtle" id="backToStart" type="button" data-i18n="backToStart">Back to start</button>
           </div>
         </div>
       </section>
@@ -825,7 +1031,7 @@ function renderPublicDownloadPage() {
       </a>
     </footer>
   </main>
-  <script src="/download.js?v=20260725-email-flow-2" defer></script>
+  <script src="/download.js?v=20260805-recover-copy-1" defer></script>
 </body>
 </html>`;
 }
@@ -846,15 +1052,79 @@ const messages = {
     benefitUpdates: "Automatic updates",
     benefitRecovery: "Access key recovery",
     benefitActivation: "Secure activation",
+    benefitLibrary: "Exclusive library",
+    benefitAllInOne: "Everything in one place",
+    benefitOpenCode: "Open source",
+    benefitEvolution: "Always evolving",
+    faqTitle: "Frequently asked questions",
+    faqWhatTitle: "🧙‍♂️ What is Merlin?",
+    faqWhatBody: "Merlin is a PC platform created to make downloading games much simpler. Forget complicated processes: just choose the game, download, and play.",
+    faqSafeTitle: "🛡️ Is Merlin safe?",
+    faqSafeBody: "Yes. Merlin does not ask for your Steam password and is a 100% open source project, allowing anyone to review how it works.",
+    faqBanTitle: "🎮 Can I get banned using Merlin?",
+    faqBanBody: "To this day, there are no known reports of bans from using this technology, which has been used by the community for years. As a preventive measure, we recommend using Merlin on a secondary Steam account during setup.",
+    faqFreeTitle: "🎁 Why is Merlin free?",
+    faqFreeBody: "Merlin is still experimental. During this period, access is free so the community can test the platform, send feedback, and help develop the project.",
+    faqPaidTitle: "💳 Why is Merlin paid?",
+    faqPaidBody: "The amount collected helps cover platform operating costs and, above all, keeps exclusive games coming to Merlin. Some titles would otherwise require a full-price store purchase or risky unofficial methods that can expose your computer.",
+    faqDifferentTitle: "⭐ What makes Merlin different?",
+    faqDifferentBody: "Besides simplifying the whole process, Merlin also provides games that are part of the library officially acquired by the team. Many of these titles would normally require buying an official license at full price or relying on unreliable methods found online. Merlin's goal is to offer a much simpler, organized, and transparent experience for the community.",
     createTab: "Create key",
     recoverTab: "Recover",
+    paymentStatusTab: "Payment",
+    modalClose: "Got it",
+    recoverTitle: "Recover access",
+    recoverInline: "Already have a key? Recover access",
+    paymentStatusTitle: "Check payment",
+    paymentStatusInline: "Already paid? Check payment status",
+    paymentStatusSubmit: "Check payment",
+    paymentStatusRetry: "Check again",
+    paymentStatusHint: "Use the same e-mail used at checkout. We will send a code before showing your payment status.",
+    billingPortalInline: "Manage monthly subscription",
+    billingPortalTitle: "Manage monthly subscription",
+    billingPortalHint: "Use the e-mail linked to your monthly Stripe subscription. Lifetime purchases do not have a subscription portal.",
+    billingPortalSubmit: "Open portal",
+    billingPortalLoading: "Opening portal...",
+    billingPortalRedirecting: "Redirecting to the secure Stripe portal...",
+    billingPortalUnavailable: "We could not open a monthly subscription portal for this e-mail.",
+    backToCreate: "Back to sign up",
+    choosePlan: "Choose your plan",
+    monthlyPlan: "Monthly",
+    monthlyPlanHint: "Renewed automatically.",
+    monthlyPriceSuffix: "/ month",
+    lifetimePlan: "Lifetime",
+    lifetimePlanHint: "One-time payment.",
+    checkoutSubmit: "Continue to payment",
+    checkoutLoading: "Opening secure checkout...",
+    checkoutRedirecting: "Redirecting to Stripe...",
+    checkoutReceivedTitle: "Payment received",
+    checkoutSuccessPending: "Payment confirmed by Stripe. Your access will be released after processing.",
+    checkoutCanceledTitle: "Payment canceled",
+    checkoutCanceled: "Payment was canceled. You can choose a plan and try again.",
+    checkoutStillProcessingTitle: "Access processing",
+    checkoutStillProcessing: "Payment received. Your key is still being processed. Check the payment status using the same e-mail in a moment.",
+    paymentStatusLoading: "Checking payment...",
+    paymentStatusProcessing: "Payment found. Your access is still being processed. Try again in a moment.",
+    paymentStatusNotFound: "No payment or active key was found for this e-mail yet. If you just paid, wait a moment and try again.",
+    paymentApprovedTitle: "Payment approved",
+    paymentApprovedText: "Your access is already available.",
+    paymentProcessingTitle: "Payment processing",
+    paymentProcessingText: "We found your purchase, but access is still being released. Try checking again in a moment.",
+    paymentExpiredTitle: "Checkout expired",
+    paymentExpiredText: "This payment link expired before payment was completed. Go back to sign up and generate a new checkout.",
+    paymentExistingTitle: "Key found",
+    paymentExistingText: "We found an active key for this e-mail.",
+    paymentMissingTitle: "Nothing found",
+    paymentMissingText: "We did not find a payment or active key for this e-mail. If you just paid, wait a moment and check again.",
+    errorPlan: "Choose a plan to continue.",
     name: "Name",
     contact: "Contact",
+    emailContact: "E-mail",
     contactType: "Contact type",
     phone: "Phone",
     email: "E-mail",
     pin: "Recovery PIN",
-    contactHint: "Your contact will only be used to help recover your key if you lose it.",
+    contactHint: "We use this e-mail only for your key, recovery, and important notices.",
     pinHint: "Keep this PIN. It will be required to recover your access key.",
     notice: "I understand that if I lose my contact or PIN, it may not be possible to recover my key.",
     createSubmit: "Create my access key",
@@ -866,7 +1136,7 @@ const messages = {
     pinFinalNotice: "Save your recovery PIN now. It will not be sent by e-mail.",
     copyKey: "Copy key",
     copied: "Key copied",
-    createAnother: "Create another key",
+    backToStart: "Back to start",
     loading: "Please wait...",
     errorName: "Enter your name.",
     errorContact: "Enter your contact.",
@@ -881,6 +1151,7 @@ const messages = {
     emailVerified: "E-mail verified. Creating your access key...",
     changeEmail: "Use another e-mail",
     errorEmailCode: "Enter the 6-digit code sent to your e-mail.",
+    emailVerificationRequired: "For security, confirm your e-mail again.",
     errorPin: "Use a PIN with 4 to 8 numbers.",
     errorNotice: "Confirm the recovery notice to continue.",
     accessKeyUnavailable: "Could not create a new key with this information. If you already have a key, use the recovery option.",
@@ -899,15 +1170,79 @@ const messages = {
     benefitUpdates: "Atualizações automáticas",
     benefitRecovery: "Recuperação de chave",
     benefitActivation: "Ativação segura",
+    benefitLibrary: "Biblioteca exclusiva",
+    benefitAllInOne: "Tudo em um só lugar",
+    benefitOpenCode: "Código aberto",
+    benefitEvolution: "Em constante evolução",
+    faqTitle: "Perguntas frequentes",
+    faqWhatTitle: "🧙‍♂️ O que é o Merlin?",
+    faqWhatBody: "O Merlin é uma plataforma para PC criada para tornar o download de jogos muito mais simples. Esqueça processos complicados: basta escolher o jogo, baixar e jogar.",
+    faqSafeTitle: "🛡️ O Merlin é seguro?",
+    faqSafeBody: "Sim. O Merlin não solicita sua senha da Steam e é um projeto 100% de código aberto, permitindo que qualquer pessoa analise seu funcionamento.",
+    faqBanTitle: "🎮 Posso levar ban usando o Merlin?",
+    faqBanBody: "Até hoje, não existem relatos conhecidos de banimento pelo uso dessa tecnologia, utilizada pela comunidade há anos. Como medida preventiva, recomendamos utilizar o Merlin em uma conta Steam secundária durante a configuração.",
+    faqFreeTitle: "🎁 Por que o Merlin está gratuito?",
+    faqFreeBody: "O Merlin ainda está em fase experimental. Durante esse período, o acesso é gratuito para que a comunidade possa testar a plataforma, enviar feedbacks e ajudar no desenvolvimento do projeto.",
+    faqPaidTitle: "💳 Por que a plataforma é paga?",
+    faqPaidBody: "O valor arrecadado é direcionado aos custos operacionais da plataforma e, principalmente, para garantir que jogos exclusivos continuem sendo adicionados ao Merlin. Hoje existem títulos que normalmente exigem compra pelo preço cheio nas lojas ou simplesmente ficam fora do alcance. Alguns até podem existir por meios não oficiais, mas o processo costuma ser difícil e expõe demais o computador do usuário.",
+    faqDifferentTitle: "⭐ O que torna o Merlin diferente?",
+    faqDifferentBody: "Além de simplificar todo o processo, o Merlin também disponibiliza jogos que fazem parte da biblioteca adquirida oficialmente pela equipe. Muitos desses títulos normalmente só podem ser acessados comprando uma licença oficial pelo preço cheio ou recorrendo a métodos pouco confiáveis encontrados na internet. O objetivo do Merlin é oferecer uma experiência muito mais simples, organizada e transparente para a comunidade.",
     createTab: "Criar chave",
     recoverTab: "Recuperar",
+    paymentStatusTab: "Pagamento",
+    modalClose: "Entendi",
+    recoverTitle: "Recuperar acesso",
+    recoverInline: "Já tem uma chave? Recuperar acesso",
+    paymentStatusTitle: "Consultar pagamento",
+    paymentStatusInline: "Já realizou o pagamento? Consulte o status aqui",
+    paymentStatusSubmit: "Consultar pagamento",
+    paymentStatusRetry: "Consultar novamente",
+    paymentStatusHint: "Use o mesmo e-mail usado no checkout. Vamos enviar um código antes de mostrar o status da compra.",
+    billingPortalInline: "Gerenciar mensalidade",
+    billingPortalTitle: "Gerenciar mensalidade",
+    billingPortalHint: "Use o e-mail vinculado à assinatura mensal na Stripe. Compras vitalícias não possuem portal de assinatura.",
+    billingPortalSubmit: "Abrir portal",
+    billingPortalLoading: "Abrindo portal...",
+    billingPortalRedirecting: "Redirecionando para o portal seguro da Stripe...",
+    billingPortalUnavailable: "Não foi possível abrir um portal de mensalidade para este e-mail.",
+    backToCreate: "Voltar ao cadastro",
+    choosePlan: "Escolha seu plano",
+    monthlyPlan: "Mensal",
+    monthlyPlanHint: "Renovação automática.",
+    monthlyPriceSuffix: "/ mês",
+    lifetimePlan: "Vitalício",
+    lifetimePlanHint: "Pagamento único.",
+    checkoutSubmit: "Continuar para pagamento",
+    checkoutLoading: "Abrindo checkout seguro...",
+    checkoutRedirecting: "Redirecionando para a Stripe...",
+    checkoutReceivedTitle: "Pagamento recebido",
+    checkoutSuccessPending: "Pagamento confirmado pela Stripe. Seu acesso será liberado após o processamento.",
+    checkoutCanceledTitle: "Pagamento cancelado",
+    checkoutCanceled: "Pagamento cancelado. Escolha um plano e tente novamente.",
+    checkoutStillProcessingTitle: "Acesso em processamento",
+    checkoutStillProcessing: "Pagamento recebido. Sua chave ainda está sendo processada. Consulte o pagamento usando o mesmo e-mail em alguns instantes.",
+    paymentStatusLoading: "Consultando pagamento...",
+    paymentStatusProcessing: "Pagamento encontrado. Seu acesso ainda está sendo processado. Tente novamente em alguns instantes.",
+    paymentStatusNotFound: "Nenhum pagamento ou chave ativa foi encontrado para este e-mail ainda. Se você acabou de pagar, aguarde alguns instantes e tente novamente.",
+    paymentApprovedTitle: "Pagamento aprovado",
+    paymentApprovedText: "Seu acesso já está liberado.",
+    paymentProcessingTitle: "Pagamento em processamento",
+    paymentProcessingText: "Encontramos sua compra, mas a liberação do acesso ainda está sendo concluída. Consulte novamente em alguns instantes.",
+    paymentExpiredTitle: "Checkout expirado",
+    paymentExpiredText: "Este link de pagamento expirou antes da conclusão. Volte ao cadastro e gere um novo checkout.",
+    paymentExistingTitle: "Chave encontrada",
+    paymentExistingText: "Encontramos uma chave ativa para este e-mail.",
+    paymentMissingTitle: "Nada encontrado",
+    paymentMissingText: "Não encontramos pagamento ou chave ativa para este e-mail. Se você acabou de pagar, aguarde alguns instantes e consulte novamente.",
+    errorPlan: "Escolha um plano para continuar.",
     name: "Nome",
     contact: "Contato",
+    emailContact: "E-mail",
     contactType: "Tipo de contato",
     phone: "Telefone",
     email: "E-mail",
     pin: "PIN de recuperação",
-    contactHint: "Seu contato será usado apenas para ajudar a recuperar sua chave caso você a perca.",
+    contactHint: "Usamos este e-mail apenas para sua chave, recuperação e avisos importantes.",
     pinHint: "Guarde esse PIN. Ele será necessário para recuperar sua chave de acesso.",
     notice: "Entendo que, se eu perder meu contato ou PIN, talvez não seja possível recuperar minha chave.",
     createSubmit: "Criar minha chave de acesso",
@@ -919,7 +1254,7 @@ const messages = {
     pinFinalNotice: "Guarde seu PIN de recuperação agora. Ele não será enviado por e-mail.",
     copyKey: "Copiar chave",
     copied: "Chave copiada",
-    createAnother: "Criar outra chave",
+    backToStart: "Voltar ao início",
     loading: "Aguarde...",
     errorName: "Informe seu nome.",
     errorContact: "Informe seu contato.",
@@ -934,6 +1269,7 @@ const messages = {
     emailVerified: "E-mail verificado. Criando sua chave de acesso...",
     changeEmail: "Usar outro e-mail",
     errorEmailCode: "Informe o código de 6 dígitos enviado para seu e-mail.",
+    emailVerificationRequired: "Por segurança, confirme seu e-mail novamente.",
     errorPin: "Use um PIN com 4 a 8 números.",
     errorNotice: "Confirme o aviso de recuperação para continuar.",
     accessKeyUnavailable: "Não foi possível criar uma nova chave com esses dados. Se você já possui uma chave, use a opção Recuperar.",
@@ -952,15 +1288,33 @@ const messages = {
     benefitUpdates: "Actualizaciones automáticas",
     benefitRecovery: "Recuperación de clave",
     benefitActivation: "Activación segura",
+    benefitLibrary: "Biblioteca exclusiva",
+    benefitAllInOne: "Todo en un solo lugar",
+    benefitOpenCode: "Código abierto",
+    benefitEvolution: "En constante evolución",
+    faqTitle: "Preguntas frecuentes",
+    faqWhatTitle: "🧙‍♂️ ¿Qué es Merlin?",
+    faqWhatBody: "Merlin es una plataforma para PC creada para hacer mucho más simple la descarga de juegos. Olvídate de procesos complicados: solo elige el juego, descarga y juega.",
+    faqSafeTitle: "🛡️ ¿Merlin es seguro?",
+    faqSafeBody: "Sí. Merlin no solicita tu contraseña de Steam y es un proyecto 100% de código abierto, lo que permite que cualquiera revise cómo funciona.",
+    faqBanTitle: "🎮 ¿Puedo recibir un ban usando Merlin?",
+    faqBanBody: "Hasta hoy, no existen reportes conocidos de baneos por el uso de esta tecnología, utilizada por la comunidad desde hace años. Como medida preventiva, recomendamos utilizar Merlin en una cuenta secundaria de Steam durante la configuración.",
+    faqFreeTitle: "🎁 ¿Por qué Merlin es gratis?",
+    faqFreeBody: "Merlin todavía está en fase experimental. Durante este período, el acceso es gratuito para que la comunidad pueda probar la plataforma, enviar comentarios y ayudar en el desarrollo del proyecto.",
+    faqPaidTitle: "💳 ¿Por qué la plataforma es de pago?",
+    faqPaidBody: "El valor recaudado ayuda a cubrir los costos operativos de la plataforma y, sobre todo, a garantizar que se sigan agregando juegos exclusivos a Merlin. Algunos títulos exigirían comprarlos a precio completo o recurrir a métodos no oficiales y poco seguros.",
+    faqDifferentTitle: "⭐ ¿Qué hace diferente a Merlin?",
+    faqDifferentBody: "Además de simplificar todo el proceso, Merlin también ofrece juegos que forman parte de la biblioteca adquirida oficialmente por el equipo. Muchos de estos títulos normalmente solo pueden accederse comprando una licencia oficial a precio completo o recurriendo a métodos poco confiables encontrados en internet. El objetivo de Merlin es ofrecer una experiencia mucho más simple, organizada y transparente para la comunidad.",
     createTab: "Crear clave",
     recoverTab: "Recuperar",
     name: "Nombre",
     contact: "Contacto",
+    emailContact: "E-mail",
     contactType: "Tipo de contacto",
     phone: "Teléfono",
     email: "E-mail",
     pin: "PIN de recuperación",
-    contactHint: "Tu contacto solo se usará para ayudarte a recuperar tu clave si la pierdes.",
+    contactHint: "Usamos este e-mail solo para tu clave, recuperación y avisos importantes.",
     pinHint: "Guarda este PIN. Será necesario para recuperar tu clave de acceso.",
     notice: "Entiendo que, si pierdo mi contacto o PIN, quizá no sea posible recuperar mi clave.",
     createSubmit: "Crear mi clave de acceso",
@@ -972,7 +1326,7 @@ const messages = {
     pinFinalNotice: "Guarda tu PIN de recuperación ahora. No se enviará por e-mail.",
     copyKey: "Copiar clave",
     copied: "Clave copiada",
-    createAnother: "Crear otra clave",
+    backToStart: "Volver al inicio",
     loading: "Espera...",
     errorName: "Ingresa tu nombre.",
     errorContact: "Ingresa tu contacto.",
@@ -1005,15 +1359,33 @@ const messages = {
     benefitUpdates: "Mises à jour automatiques",
     benefitRecovery: "Récupération de clé",
     benefitActivation: "Activation sécurisée",
+    benefitLibrary: "Bibliothèque exclusive",
+    benefitAllInOne: "Tout au même endroit",
+    benefitOpenCode: "Code ouvert",
+    benefitEvolution: "En constante évolution",
+    faqTitle: "Questions fréquentes",
+    faqWhatTitle: "🧙‍♂️ Qu'est-ce que Merlin ?",
+    faqWhatBody: "Merlin est une plateforme PC créée pour rendre le téléchargement de jeux beaucoup plus simple. Oubliez les processus compliqués : choisissez le jeu, téléchargez et jouez.",
+    faqSafeTitle: "🛡️ Merlin est-il sûr ?",
+    faqSafeBody: "Oui. Merlin ne demande pas votre mot de passe Steam et c'est un projet 100% open source, ce qui permet à chacun d'analyser son fonctionnement.",
+    faqBanTitle: "🎮 Puis-je être banni en utilisant Merlin ?",
+    faqBanBody: "À ce jour, il n'existe aucun signalement connu de bannissement lié à l'utilisation de cette technologie, utilisée par la communauté depuis des années. Par mesure préventive, nous recommandons d'utiliser Merlin avec un compte Steam secondaire pendant la configuration.",
+    faqFreeTitle: "🎁 Pourquoi Merlin est-il gratuit ?",
+    faqFreeBody: "Merlin est encore en phase expérimentale. Pendant cette période, l'accès est gratuit afin que la communauté puisse tester la plateforme, envoyer des retours et aider au développement du projet.",
+    faqPaidTitle: "💳 Pourquoi la plateforme est-elle payante ?",
+    faqPaidBody: "Les montants collectés couvrent les coûts opérationnels de la plateforme et permettent surtout d'ajouter des jeux exclusifs à Merlin. Certains titres demanderaient autrement un achat au prix fort ou des méthodes non officielles risquées.",
+    faqDifferentTitle: "⭐ Qu'est-ce qui rend Merlin différent ?",
+    faqDifferentBody: "En plus de simplifier tout le processus, Merlin propose aussi des jeux faisant partie de la bibliothèque officiellement acquise par l'équipe. Beaucoup de ces titres ne sont normalement accessibles qu'en achetant une licence officielle au prix fort ou en utilisant des méthodes peu fiables trouvées sur internet. L'objectif de Merlin est d'offrir à la communauté une expérience beaucoup plus simple, organisée et transparente.",
     createTab: "Créer une clé",
     recoverTab: "Récupérer",
     name: "Nom",
     contact: "Contact",
+    emailContact: "E-mail",
     contactType: "Type de contact",
     phone: "Téléphone",
     email: "E-mail",
     pin: "PIN de récupération",
-    contactHint: "Votre contact servira uniquement à récupérer votre clé si vous la perdez.",
+    contactHint: "Nous utilisons cet e-mail uniquement pour votre clé, la récupération et les avis importants.",
     pinHint: "Conservez ce PIN. Il sera nécessaire pour récupérer votre clé d'accès.",
     notice: "Je comprends que si je perds mon contact ou mon PIN, il peut être impossible de récupérer ma clé.",
     createSubmit: "Créer ma clé d'accès",
@@ -1025,7 +1397,7 @@ const messages = {
     pinFinalNotice: "Conservez votre PIN de récupération maintenant. Il ne sera pas envoyé par e-mail.",
     copyKey: "Copier la clé",
     copied: "Clé copiée",
-    createAnother: "Créer une autre clé",
+    backToStart: "Retour au début",
     loading: "Patientez...",
     errorName: "Indiquez votre nom.",
     errorContact: "Indiquez votre contact.",
@@ -1058,15 +1430,33 @@ const messages = {
     benefitUpdates: "Automatische Updates",
     benefitRecovery: "Schlüsselwiederherstellung",
     benefitActivation: "Sichere Aktivierung",
+    benefitLibrary: "Exklusive Bibliothek",
+    benefitAllInOne: "Alles an einem Ort",
+    benefitOpenCode: "Open Source",
+    benefitEvolution: "Ständig in Entwicklung",
+    faqTitle: "Häufige Fragen",
+    faqWhatTitle: "🧙‍♂️ Was ist Merlin?",
+    faqWhatBody: "Merlin ist eine PC-Plattform, die das Herunterladen von Spielen deutlich einfacher macht. Vergiss komplizierte Prozesse: Spiel auswählen, herunterladen und spielen.",
+    faqSafeTitle: "🛡️ Ist Merlin sicher?",
+    faqSafeBody: "Ja. Merlin fragt nicht nach deinem Steam-Passwort und ist ein 100% Open-Source-Projekt, sodass jeder nachvollziehen kann, wie es funktioniert.",
+    faqBanTitle: "🎮 Kann ich durch Merlin gebannt werden?",
+    faqBanBody: "Bis heute gibt es keine bekannten Berichte über Bans durch die Nutzung dieser Technologie, die seit Jahren von der Community verwendet wird. Als Vorsichtsmaßnahme empfehlen wir, Merlin während der Einrichtung mit einem sekundären Steam-Konto zu verwenden.",
+    faqFreeTitle: "🎁 Warum ist Merlin kostenlos?",
+    faqFreeBody: "Merlin befindet sich noch in einer experimentellen Phase. In dieser Zeit ist der Zugang kostenlos, damit die Community die Plattform testen, Feedback senden und bei der Entwicklung helfen kann.",
+    faqPaidTitle: "💳 Warum ist die Plattform kostenpflichtig?",
+    faqPaidBody: "Die Einnahmen decken Betriebskosten der Plattform und helfen vor allem dabei, weiterhin exklusive Spiele zu Merlin hinzuzufügen. Manche Titel wären sonst nur zum Vollpreis oder über riskante inoffizielle Methoden erreichbar.",
+    faqDifferentTitle: "⭐ Was macht Merlin anders?",
+    faqDifferentBody: "Neben der Vereinfachung des gesamten Prozesses stellt Merlin auch Spiele bereit, die Teil der offiziell vom Team erworbenen Bibliothek sind. Viele dieser Titel sind normalerweise nur über eine offizielle Lizenz zum vollen Preis oder über wenig vertrauenswürdige Methoden im Internet zugänglich. Das Ziel von Merlin ist es, der Community eine viel einfachere, organisierte und transparente Erfahrung zu bieten.",
     createTab: "Schlüssel erstellen",
     recoverTab: "Wiederherstellen",
     name: "Name",
     contact: "Kontakt",
+    emailContact: "E-Mail",
     contactType: "Kontakttyp",
     phone: "Telefon",
     email: "E-Mail",
     pin: "Wiederherstellungs-PIN",
-    contactHint: "Dein Kontakt wird nur verwendet, um deinen Schlüssel wiederherzustellen, falls du ihn verlierst.",
+    contactHint: "Wir verwenden diese E-Mail nur für deinen Schlüssel, die Wiederherstellung und wichtige Hinweise.",
     pinHint: "Bewahre diese PIN auf. Sie wird zur Wiederherstellung deines Zugangsschlüssels benötigt.",
     notice: "Ich verstehe, dass mein Schlüssel möglicherweise nicht wiederhergestellt werden kann, wenn ich Kontakt oder PIN verliere.",
     createSubmit: "Meinen Zugangsschlüssel erstellen",
@@ -1078,7 +1468,7 @@ const messages = {
     pinFinalNotice: "Speichere deine Wiederherstellungs-PIN jetzt. Sie wird nicht per E-Mail gesendet.",
     copyKey: "Schlüssel kopieren",
     copied: "Schlüssel kopiert",
-    createAnother: "Anderen Schlüssel erstellen",
+    backToStart: "Zurück zum Anfang",
     loading: "Bitte warten...",
     errorName: "Gib deinen Namen ein.",
     errorContact: "Gib deinen Kontakt ein.",
@@ -1128,24 +1518,43 @@ function t(key, values) {
   return value;
 }
 
-const registerTab = document.getElementById("registerTab");
-const recoverTab = document.getElementById("recoverTab");
+const recoverLink = document.getElementById("recoverLink");
+const paymentStatusLink = document.getElementById("paymentStatusLink");
+let billingPortalLink = document.getElementById("billingPortalLink");
 const registerForm = document.getElementById("registerForm");
 const emailVerificationForm = document.getElementById("emailVerificationForm");
 const recoverForm = document.getElementById("recoverForm");
+const paymentStatusForm = document.getElementById("paymentStatusForm");
+let billingPortalForm = document.getElementById("billingPortalForm");
+const paymentStatusResult = document.getElementById("paymentStatusResult");
+const paymentStatusMark = document.getElementById("paymentStatusMark");
+const paymentStatusResultTitle = document.getElementById("paymentStatusResultTitle");
+const paymentStatusResultText = document.getElementById("paymentStatusResultText");
+const paymentStatusKeyCard = document.getElementById("paymentStatusKeyCard");
+const paymentStatusLicenseKey = document.getElementById("paymentStatusLicenseKey");
+const copyPaymentStatusKey = document.getElementById("copyPaymentStatusKey");
+const paymentStatusDownload = document.getElementById("paymentStatusDownload");
+const retryPaymentStatus = document.getElementById("retryPaymentStatus");
 const signupCard = document.getElementById("signupCard");
+const planSelector = document.getElementById("planSelector");
+const planOptions = document.getElementById("planOptions");
 const languageSelect = document.getElementById("languageSelect");
 const hero = document.querySelector(".hero");
 const heroDescription = document.querySelector("[data-i18n='heroDescription']");
 const benefits = document.querySelector(".benefits");
 const message = document.getElementById("message");
+const statusModal = document.getElementById("statusModal");
+const statusModalMark = document.getElementById("statusModalMark");
+const statusModalTitle = document.getElementById("statusModalTitle");
+const statusModalText = document.getElementById("statusModalText");
+const statusModalClose = document.getElementById("statusModalClose");
 const result = document.getElementById("result");
 const resultTitle = document.getElementById("resultTitle");
 const licenseKey = document.getElementById("licenseKey");
 const pinCard = document.getElementById("pinCard");
 const recoveryPinValue = document.getElementById("recoveryPinValue");
 const copyKey = document.getElementById("copyKey");
-const createAnother = document.getElementById("createAnother");
+const backToStart = document.getElementById("backToStart");
 const versionText = document.getElementById("versionText");
 const verificationEmail = document.getElementById("verificationEmail");
 const resendEmailCode = document.getElementById("resendEmailCode");
@@ -1156,6 +1565,39 @@ const contactIconMap = {
   discord: "D",
 };
 
+function ensureBillingPortalUi() {
+  if (!billingPortalLink) {
+    const supportLinks = document.querySelector(".support-links");
+    if (supportLinks) {
+      supportLinks.insertAdjacentHTML("beforeend", '<button class="text-link" id="billingPortalLink" type="button" data-i18n="billingPortalInline">Manage monthly subscription</button>');
+      billingPortalLink = document.getElementById("billingPortalLink");
+    }
+  }
+
+  if (!billingPortalForm) {
+    paymentStatusForm.insertAdjacentHTML("afterend", [
+      '<form class="form-panel" id="billingPortalForm" hidden novalidate>',
+      '<h2 class="form-title" data-i18n="billingPortalTitle">Manage monthly subscription</h2>',
+      '<div class="field" data-field="contact">',
+      '<span data-i18n="emailContact">E-mail</span>',
+      '<div class="input-wrap">',
+      '<span class="input-icon" aria-hidden="true">@</span>',
+      '<input name="contact" type="email" autocomplete="email" inputmode="email" required />',
+      '</div>',
+      '<div class="field-error"></div>',
+      '</div>',
+      '<input name="contactType" type="hidden" value="email" />',
+      '<p class="hint" data-i18n="billingPortalHint">Use the e-mail linked to your monthly Stripe subscription. Lifetime purchases do not have a subscription portal.</p>',
+      '<button class="button primary" type="submit" data-default-key="billingPortalSubmit" data-default-text="Open portal">Open portal</button>',
+      '<button class="button subtle" data-back-to-register type="button" data-i18n="backToCreate">Back to sign up</button>',
+      '</form>',
+    ].join(""));
+    billingPortalForm = document.getElementById("billingPortalForm");
+  }
+}
+
+ensureBillingPortalUi();
+
 let emailVerificationState = {
   email: "",
   verified: false,
@@ -1163,6 +1605,18 @@ let emailVerificationState = {
   timer: null,
   pendingData: null,
   pendingMode: "register",
+};
+
+let paymentStatusState = {
+  email: "",
+  licenseKey: "",
+};
+
+let billingState = {
+  billingEnabled: false,
+  monthlyEnabled: false,
+  lifetimeEnabled: false,
+  prices: { monthly: null, lifetime: null },
 };
 
 function applyTranslations() {
@@ -1182,25 +1636,103 @@ function applyTranslations() {
   versionText.hidden = false;
   benefits.hidden = false;
   heroDescription.textContent = signupEnabled ? t("heroDescription") : t("heroDescriptionDownloadOnly");
+  renderBillingFaq();
+  renderBillingPlans();
   updateEmailVerificationCooldownUi();
 }
 
+function renderBillingFaq() {
+  const title = document.querySelector("[data-i18n='faqFreeTitle']");
+  const body = document.querySelector("[data-i18n='faqFreeBody']");
+  const paid = Boolean(billingState.billingEnabled);
+  if (title) title.textContent = paid ? t("faqPaidTitle") : t("faqFreeTitle");
+  if (body) body.textContent = paid ? t("faqPaidBody") : t("faqFreeBody");
+}
+
+function formatMoney(amountCents, currency) {
+  return new Intl.NumberFormat(locale === "ptbr" ? "pt-BR" : "en-US", {
+    style: "currency",
+    currency: String(currency || "brl").toUpperCase(),
+  }).format((Number(amountCents) || 0) / 100);
+}
+
+function formatPlanPrice(price, planType) {
+  if (!price) {
+    return "--";
+  }
+  const value = formatMoney(price.amountCents, price.currency);
+  return planType === "monthly" ? value + " " + t("monthlyPriceSuffix") : value;
+}
+
+function selectedPlanType() {
+  const checked = registerForm.querySelector("input[name='planType']:checked");
+  return checked ? checked.value : "";
+}
+
+function setSelectedPlan(planType) {
+  registerForm.querySelectorAll("input[name='planType']").forEach((input) => {
+    input.checked = input.value === planType;
+  });
+  renderBillingPlans();
+}
+
+function renderBillingPlans() {
+  const billingEnabled = Boolean(billingState.billingEnabled);
+  renderBillingFaq();
+  planSelector.hidden = !billingEnabled;
+  const submitButton = registerForm.querySelector("button[type='submit']");
+  if (submitButton) {
+    const key = billingEnabled ? "checkoutSubmit" : "createSubmit";
+    submitButton.dataset.defaultKey = key;
+    submitButton.dataset.defaultText = t(key);
+    if (!submitButton.disabled) {
+      submitButton.textContent = submitButton.dataset.defaultText;
+    }
+  }
+
+  ["monthly", "lifetime"].forEach((planType) => {
+    const enabled = planType === "monthly" ? billingState.monthlyEnabled : billingState.lifetimeEnabled;
+    const option = planOptions.querySelector("[data-plan-option='" + planType + "']");
+    const input = option ? option.querySelector("input[name='planType']") : null;
+    const price = option ? option.querySelector("[data-plan-price='" + planType + "']") : null;
+    if (!option || !input || !price) return;
+    option.hidden = !enabled;
+    input.disabled = !enabled;
+    option.classList.toggle("is-selected", input.checked);
+    price.textContent = formatPlanPrice(billingState.prices?.[planType], planType);
+  });
+
+  if (billingEnabled && !selectedPlanType()) {
+    const firstEnabled = billingState.monthlyEnabled ? "monthly" : billingState.lifetimeEnabled ? "lifetime" : "";
+    if (firstEnabled) {
+      setSelectedPlan(firstEnabled);
+    }
+  }
+}
+
 function setMode(mode) {
+  closeStatusModal();
   const recovering = mode === "recover";
+  const checkingPayment = mode === "payment-status";
+  const managingBilling = mode === "billing-portal";
   const verifyingEmail = mode === "verify-email";
   result.classList.remove("active");
   result.hidden = true;
-  registerForm.hidden = recovering || verifyingEmail;
+  paymentStatusResult.hidden = true;
+  paymentStatusResult.classList.remove("is-processing", "is-missing");
+  registerForm.hidden = recovering || checkingPayment || managingBilling || verifyingEmail;
   emailVerificationForm.hidden = !verifyingEmail;
   recoverForm.hidden = !recovering;
-  recoverTab.classList.toggle("active", recovering);
-  registerTab.classList.toggle("active", !recovering);
+  paymentStatusForm.hidden = !checkingPayment;
+  billingPortalForm.hidden = !managingBilling;
   message.textContent = "";
   message.classList.remove("ok");
   clearErrors(registerForm);
   clearErrors(emailVerificationForm);
   clearErrors(recoverForm);
-  if (recovering) {
+  clearErrors(paymentStatusForm);
+  clearErrors(billingPortalForm);
+  if (recovering || checkingPayment || managingBilling) {
     resetEmailVerification();
   }
 }
@@ -1230,6 +1762,30 @@ function setMessage(text, kind) {
   message.classList.toggle("ok", kind === "ok");
 }
 
+function showStatusModal(title, text, kind) {
+  statusModalTitle.textContent = title || "";
+  statusModalText.textContent = text || "";
+  statusModal.classList.remove("is-ok", "is-warn", "is-error");
+  if (kind === "ok") {
+    statusModal.classList.add("is-ok");
+    statusModalMark.textContent = "OK";
+  } else if (kind === "warn") {
+    statusModal.classList.add("is-warn");
+    statusModalMark.textContent = "!";
+  } else if (kind === "error") {
+    statusModal.classList.add("is-error");
+    statusModalMark.textContent = "!";
+  } else {
+    statusModalMark.textContent = "i";
+  }
+  statusModal.hidden = false;
+  statusModalClose.focus();
+}
+
+function closeStatusModal() {
+  statusModal.hidden = true;
+}
+
 function getFriendlyErrorMessage(error) {
   const rawMessage = error instanceof Error ? error.message : String(error || "");
   if (rawMessage === "PUBLIC_ACCESS_KEY_UNAVAILABLE") {
@@ -1239,7 +1795,7 @@ function getFriendlyErrorMessage(error) {
     return t("recoveryUnavailable");
   }
   if (rawMessage === "Email verification is required") {
-    return t("genericError");
+    return t("emailVerificationRequired");
   }
   return rawMessage || t("genericError");
 }
@@ -1313,12 +1869,17 @@ function validateForm(form) {
     setFieldError(form, "contact", t("errorEmail"));
     valid = false;
   }
-  if (!/^\\d{4,8}$/.test(String(data.recoveryPin || "").trim())) {
+  if ((form === registerForm || form === recoverForm) && !/^\\d{4,8}$/.test(String(data.recoveryPin || "").trim())) {
     setFieldError(form, "recoveryPin", t("errorPin"));
     valid = false;
   }
   if (form === registerForm && data.acceptedRecoveryNotice !== "on") {
     setCheckboxError(t("errorNotice"));
+    valid = false;
+  }
+  if (form === registerForm && billingState.billingEnabled && !selectedPlanType()) {
+    const target = registerForm.querySelector("[data-plan-error]");
+    if (target) target.textContent = t("errorPlan");
     valid = false;
   }
   return valid;
@@ -1328,7 +1889,9 @@ function setLoading(form, loading) {
   const button = form.querySelector("button[type='submit']");
   if (!button) return;
   button.disabled = loading;
-  button.textContent = loading ? t("loading") : button.dataset.defaultText;
+  button.textContent = loading
+    ? (form === registerForm && billingState.billingEnabled ? t("checkoutLoading") : form === paymentStatusForm ? t("paymentStatusLoading") : form === billingPortalForm ? t("billingPortalLoading") : t("loading"))
+    : button.dataset.defaultText;
 }
 
 async function submitJson(url, body) {
@@ -1351,6 +1914,7 @@ function buildRegisterPayload(data) {
     contactType: data.contactType,
     recoveryPin: data.recoveryPin,
     acceptedRecoveryNotice: data.acceptedRecoveryNotice === "on",
+    planType: billingState.billingEnabled ? selectedPlanType() : undefined,
   };
 }
 
@@ -1362,7 +1926,33 @@ function buildRecoverPayload(data) {
   };
 }
 
+function buildPaymentStatusPayload(data) {
+  return {
+    email: normalizeEmail(data.contact),
+  };
+}
+
+function buildBillingPortalPayload(data) {
+  return {
+    email: normalizeEmail(data.contact),
+  };
+}
+
 async function createAccessKeyFromPayload(payload) {
+  if (billingState.billingEnabled) {
+    const response = await submitJson("/api/public/checkout", {
+      name: payload.name,
+      contact: payload.contact,
+      recoveryPin: payload.recoveryPin,
+      acceptedRecoveryNotice: payload.acceptedRecoveryNotice,
+      planType: payload.planType,
+    });
+    setMessage(t("checkoutRedirecting"), "ok");
+    localStorage.setItem("merlin_checkout_email", normalizeEmail(payload.contact));
+    window.location.href = response.checkoutUrl;
+    return;
+  }
+
   const response = await submitJson("/api/public/access-keys/register", payload);
   showKey(
     response.created ? t("successCreated") : t("successExisting"),
@@ -1374,6 +1964,90 @@ async function createAccessKeyFromPayload(payload) {
 async function recoverAccessKeyFromPayload(payload) {
   const response = await submitJson("/api/public/access-keys/recover", payload);
   showKey(t("successRecovered"), response.license.licenseKey);
+}
+
+function showPaymentStatusResult(response, email) {
+  const hasLicense = Boolean(response.license && response.license.licenseKey);
+  const isExisting = response.status === "existing_license";
+  const isCompleted = response.status === "completed";
+  const isProcessing = response.status === "processing";
+  const isExpired = response.status === "expired";
+  const isMissing = response.status === "not_found";
+
+  paymentStatusState.email = normalizeEmail(email);
+  paymentStatusState.licenseKey = hasLicense ? response.license.licenseKey : "";
+  paymentStatusResult.classList.toggle("is-processing", isProcessing);
+  paymentStatusResult.classList.toggle("is-missing", isMissing || isExpired);
+  paymentStatusMark.textContent = hasLicense ? "OK" : isProcessing ? "..." : "!";
+  paymentStatusResultTitle.textContent = isCompleted
+    ? t("paymentApprovedTitle")
+    : isExisting
+      ? t("paymentExistingTitle")
+      : isProcessing
+        ? t("paymentProcessingTitle")
+        : isExpired
+          ? t("paymentExpiredTitle")
+          : t("paymentMissingTitle");
+  paymentStatusResultText.textContent = isCompleted
+    ? t("paymentApprovedText")
+    : isExisting
+      ? t("paymentExistingText")
+      : isProcessing
+        ? t("paymentProcessingText")
+        : isExpired
+          ? t("paymentExpiredText")
+          : t("paymentMissingText");
+
+  paymentStatusLicenseKey.textContent = paymentStatusState.licenseKey;
+  paymentStatusKeyCard.hidden = !hasLicense;
+  copyPaymentStatusKey.hidden = !hasLicense;
+  paymentStatusDownload.hidden = !hasLicense;
+  retryPaymentStatus.hidden = hasLicense;
+
+  registerForm.hidden = true;
+  emailVerificationForm.hidden = true;
+  recoverForm.hidden = true;
+  paymentStatusForm.hidden = true;
+  result.hidden = true;
+  result.classList.remove("active");
+  message.textContent = "";
+  message.classList.remove("ok");
+  paymentStatusResult.hidden = false;
+}
+
+async function checkPaymentStatusFromPayload(payload) {
+  const response = await submitJson("/api/public/payment-status", payload);
+  showPaymentStatusResult(response, payload.email);
+}
+
+async function retryPaymentStatusCheck() {
+  const email = normalizeEmail(paymentStatusState.email || paymentStatusForm.elements.contact.value);
+  if (!email) {
+    setMode("payment-status");
+    return;
+  }
+
+  retryPaymentStatus.disabled = true;
+  retryPaymentStatus.textContent = t("paymentStatusLoading");
+  try {
+    await checkPaymentStatusFromPayload({ email });
+  } catch (error) {
+    setMode("payment-status");
+    paymentStatusForm.elements.contact.value = email;
+    setMessage(getFriendlyErrorMessage(error));
+  } finally {
+    retryPaymentStatus.disabled = false;
+    retryPaymentStatus.textContent = t("paymentStatusRetry");
+  }
+}
+
+async function openBillingPortalFromPayload(payload) {
+  const response = await submitJson("/api/public/billing-portal", payload);
+  if (!response.portalUrl) {
+    throw new Error(t("billingPortalUnavailable"));
+  }
+  setMessage(t("billingPortalRedirecting"), "ok");
+  window.location.href = response.portalUrl;
 }
 
 async function sendEmailVerificationForPendingData() {
@@ -1421,15 +2095,24 @@ async function confirmPendingEmailCode() {
   await submitJson("/api/public/email-verification/verify", { email, code });
   emailVerificationState.email = email;
   emailVerificationState.verified = true;
-  setMessage(t("emailVerified"), "ok");
+  setMessage(billingState.billingEnabled && emailVerificationState.pendingMode === "register" ? t("checkoutLoading") : t("emailVerified"), "ok");
   if (emailVerificationState.pendingMode === "recover") {
     await recoverAccessKeyFromPayload(buildRecoverPayload(pendingData));
+    return;
+  }
+  if (emailVerificationState.pendingMode === "payment-status") {
+    await checkPaymentStatusFromPayload(buildPaymentStatusPayload(pendingData));
+    return;
+  }
+  if (emailVerificationState.pendingMode === "billing-portal") {
+    await openBillingPortalFromPayload(buildBillingPortalPayload(pendingData));
     return;
   }
   await createAccessKeyFromPayload(buildRegisterPayload(pendingData));
 }
 
 function showKey(title, key, recoveryPin) {
+  closeStatusModal();
   resultTitle.textContent = title;
   licenseKey.textContent = key;
   if (recoveryPin) {
@@ -1442,9 +2125,49 @@ function showKey(title, key, recoveryPin) {
   registerForm.hidden = true;
   emailVerificationForm.hidden = true;
   recoverForm.hidden = true;
+  paymentStatusForm.hidden = true;
+  billingPortalForm.hidden = true;
+  paymentStatusResult.hidden = true;
   message.textContent = "";
   result.hidden = false;
   result.classList.add("active");
+}
+
+function showCheckoutReturnMessage() {
+  const params = new URLSearchParams(window.location.search);
+  const checkout = params.get("checkout");
+  if (checkout === "success") {
+    showStatusModal(t("checkoutReceivedTitle"), t("checkoutSuccessPending"), "ok");
+    pollCheckoutStatus(params.get("session_id"));
+  } else if (checkout === "cancel") {
+    showStatusModal(t("checkoutCanceledTitle"), t("checkoutCanceled"), "warn");
+  }
+}
+
+async function pollCheckoutStatus(sessionId) {
+  if (!sessionId) {
+    return;
+  }
+
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    try {
+      const payload = await fetch("/api/public/checkout-status?session_id=" + encodeURIComponent(sessionId)).then((response) => response.json());
+      if (payload && payload.success !== false && payload.status === "completed" && payload.license) {
+        showKey(t("successCreated"), payload.license.licenseKey, null);
+        return;
+      }
+    } catch {
+      // Keep polling for a short period; the webhook may still be processing.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  setMode("payment-status");
+  const email = localStorage.getItem("merlin_checkout_email") || "";
+  if (email) {
+    paymentStatusForm.elements.contact.value = email;
+  }
+  showStatusModal(t("checkoutStillProcessingTitle"), t("checkoutStillProcessing"), "warn");
 }
 
 function renderVersionText() {
@@ -1482,8 +2205,14 @@ async function loadVersion() {
 
 async function loadPublicSettings() {
   try {
-    const payload = await fetch("/api/public/access-keys/settings").then((response) => response.json());
+    const payload = await fetch("/api/billing/settings-public").then((response) => response.json());
     const enabled = Boolean(payload && payload.success !== false && payload.settings && payload.settings.enabled);
+    billingState = {
+      billingEnabled: Boolean(payload?.billing?.billingEnabled),
+      monthlyEnabled: Boolean(payload?.billing?.monthlyEnabled),
+      lifetimeEnabled: Boolean(payload?.billing?.lifetimeEnabled),
+      prices: payload?.billing?.prices || { monthly: null, lifetime: null },
+    };
     signupCard.hidden = !enabled;
     hero.classList.toggle("signup-closed", !enabled);
     versionText.hidden = false;
@@ -1492,7 +2221,9 @@ async function loadPublicSettings() {
     document.querySelectorAll(".signup-copy").forEach((node) => {
       node.hidden = false;
     });
+    renderBillingPlans();
   } catch {
+    billingState = { billingEnabled: false, monthlyEnabled: false, lifetimeEnabled: false, prices: { monthly: null, lifetime: null } };
     signupCard.hidden = true;
     hero.classList.add("signup-closed");
     versionText.hidden = false;
@@ -1501,42 +2232,30 @@ async function loadPublicSettings() {
     document.querySelectorAll(".signup-copy").forEach((node) => {
       node.hidden = false;
     });
+    renderBillingPlans();
   }
 }
 
 function setContactType(form, type) {
-  form.querySelector("input[name='contactType']").value = type;
-  form.querySelectorAll("[data-contact-type]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.contactType === type);
-  });
+  form.querySelector("input[name='contactType']").value = "email";
   form.querySelectorAll("[data-contact-icon]").forEach((icon) => {
-    icon.textContent = contactIconMap[type] || "?";
+    icon.textContent = "@";
   });
   const contact = form.querySelector("input[name='contact']");
   if (!contact) return;
-  contact.autocomplete = type === "phone" ? "tel" : type === "email" ? "email" : "off";
-  contact.inputMode = type === "phone" ? "tel" : "text";
-  if (type === "phone") {
-    contact.value = formatPhone(contact.value);
-  }
+  contact.type = "email";
+  contact.autocomplete = "email";
+  contact.inputMode = "email";
   clearErrors(form);
   if (form === registerForm) {
     resetEmailVerification();
   }
 }
 
-document.querySelectorAll(".segment").forEach((segment) => {
-  const form = segment.closest("form");
-  segment.querySelectorAll("[data-contact-type]").forEach((button) => {
-    button.addEventListener("click", () => setContactType(form, button.dataset.contactType));
-  });
-});
-
 document.querySelectorAll("input[name='contact']").forEach((input) => {
   input.addEventListener("input", () => {
     const form = input.closest("form");
     const type = form.querySelector("input[name='contactType']").value;
-    if (type === "phone") input.value = formatPhone(input.value);
     if (form === registerForm && type === "email" && emailVerificationState.email !== normalizeEmail(input.value)) {
       emailVerificationState.verified = false;
     }
@@ -1544,13 +2263,53 @@ document.querySelectorAll("input[name='contact']").forEach((input) => {
   });
 });
 
-registerTab.addEventListener("click", () => setMode("register"));
-recoverTab.addEventListener("click", () => setMode("recover"));
+planOptions.querySelectorAll("input[name='planType']").forEach((input) => {
+  input.addEventListener("change", () => {
+    const target = registerForm.querySelector("[data-plan-error]");
+    if (target) target.textContent = "";
+    renderBillingPlans();
+  });
+});
+
+document.querySelectorAll(".faq-question").forEach((button) => {
+  button.addEventListener("click", () => {
+    const item = button.closest(".faq-item");
+    const shouldOpen = !item.classList.contains("is-open");
+    document.querySelectorAll(".faq-item").forEach((entry) => {
+      entry.classList.remove("is-open");
+      entry.querySelector(".faq-question")?.setAttribute("aria-expanded", "false");
+    });
+    if (shouldOpen) {
+      item.classList.add("is-open");
+      button.setAttribute("aria-expanded", "true");
+    }
+  });
+});
+
+recoverLink.addEventListener("click", () => setMode("recover"));
+paymentStatusLink.addEventListener("click", () => setMode("payment-status"));
+billingPortalLink.addEventListener("click", () => setMode("billing-portal"));
+statusModalClose.addEventListener("click", closeStatusModal);
+statusModal.querySelector("[data-close-status-modal]").addEventListener("click", closeStatusModal);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !statusModal.hidden) {
+    closeStatusModal();
+  }
+});
+document.querySelectorAll("[data-back-to-register]").forEach((button) => {
+  button.addEventListener("click", () => setMode("register"));
+});
 resendEmailCode.addEventListener("click", sendEmailVerificationForPendingData);
 changeEmail.addEventListener("click", () => {
   const previousMode = emailVerificationState.pendingMode;
   emailVerificationForm.reset();
-  setMode(previousMode === "recover" ? "recover" : "register");
+  setMode(previousMode === "recover"
+    ? "recover"
+    : previousMode === "payment-status"
+      ? "payment-status"
+      : previousMode === "billing-portal"
+        ? "billing-portal"
+        : "register");
 });
 languageSelect.addEventListener("change", () => {
   const next = languageSelect.value;
@@ -1565,17 +2324,27 @@ copyKey.addEventListener("click", async () => {
   copyKey.textContent = t("copied");
   setTimeout(() => { copyKey.textContent = t("copyKey"); }, 1600);
 });
-createAnother.addEventListener("click", () => {
+copyPaymentStatusKey.addEventListener("click", async () => {
+  await navigator.clipboard.writeText(paymentStatusState.licenseKey || paymentStatusLicenseKey.textContent || "");
+  copyPaymentStatusKey.textContent = t("copied");
+  setTimeout(() => { copyPaymentStatusKey.textContent = t("copyKey"); }, 1600);
+});
+retryPaymentStatus.addEventListener("click", retryPaymentStatusCheck);
+backToStart.addEventListener("click", () => {
   registerForm.reset();
   recoverForm.reset();
+  paymentStatusForm.reset();
+  billingPortalForm.reset();
   recoveryPinValue.textContent = "";
   pinCard.hidden = true;
+  paymentStatusState = { email: "", licenseKey: "" };
   resetEmailVerification();
   setContactType(registerForm, "email");
   setContactType(recoverForm, "email");
+  setContactType(paymentStatusForm, "email");
+  setContactType(billingPortalForm, "email");
   setMode("register");
 });
-
 registerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!validateForm(registerForm)) return;
@@ -1628,9 +2397,44 @@ recoverForm.addEventListener("submit", async (event) => {
   }
 });
 
+paymentStatusForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!validateForm(paymentStatusForm)) return;
+  const data = readForm(paymentStatusForm);
+  setLoading(paymentStatusForm, true);
+  try {
+    emailVerificationState.pendingData = data;
+    emailVerificationState.pendingMode = "payment-status";
+    await sendEmailVerificationForPendingData();
+  } catch (error) {
+    message.textContent = getFriendlyErrorMessage(error);
+  } finally {
+    setLoading(paymentStatusForm, false);
+  }
+});
+
+billingPortalForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!validateForm(billingPortalForm)) return;
+  const data = readForm(billingPortalForm);
+  setLoading(billingPortalForm, true);
+  try {
+    emailVerificationState.pendingData = data;
+    emailVerificationState.pendingMode = "billing-portal";
+    await sendEmailVerificationForPendingData();
+  } catch (error) {
+    message.textContent = getFriendlyErrorMessage(error);
+  } finally {
+    setLoading(billingPortalForm, false);
+  }
+});
+
 applyTranslations();
 setContactType(registerForm, "email");
 setContactType(recoverForm, "email");
+setContactType(paymentStatusForm, "email");
+setContactType(billingPortalForm, "email");
+showCheckoutReturnMessage();
 loadPublicSettings();
 loadVersion();
 `;
@@ -1660,6 +2464,30 @@ function parseBody<T>(schema: z.ZodSchema<T>, value: unknown) {
     throw new HTTPException(400, { message: "Invalid request payload" });
   }
   return parsed.data;
+}
+
+function getPublicBillingPayload(billing: Awaited<ReturnType<typeof getBillingSettings>>) {
+  const mapPrice = (price: typeof billing.prices.monthly) => price
+    ? {
+        productName: price.productName,
+        amountCents: price.amountCents,
+        currency: price.currency,
+        recurringInterval: price.recurringInterval,
+        active: price.active,
+        syncedAt: price.syncedAt,
+        stale: price.stale,
+      }
+    : null;
+
+  return {
+    billingEnabled: billing.billingEnabled,
+    monthlyEnabled: billing.monthlyEnabled,
+    lifetimeEnabled: billing.lifetimeEnabled,
+    prices: {
+      monthly: mapPrice(billing.prices.monthly),
+      lifetime: mapPrice(billing.prices.lifetime),
+    },
+  };
 }
 
 function queuePublicEmail(c: { executionCtx: { waitUntil(task: Promise<unknown>): void } }, label: string, task: Promise<unknown>) {
@@ -2142,7 +2970,7 @@ app.post("/panel-api/premium/games/upload", async (c) => {
 
   const target = resolvePremiumGameUploadTarget(appId, uploadName);
   if (sizeBytes <= 0) {
-    throw new HTTPException(400, { message: "O arquivo enviado esta vazio." });
+    throw new HTTPException(400, { message: "O arquivo enviado está vazio." });
   }
 
   await c.env.MERLIN_ACTIVATIONS.put(target.objectKey, uploadBody, {
@@ -2358,7 +3186,7 @@ app.post("/panel-api/overrides/upload", async (c) => {
   }
 
   if (sizeBytes <= 0) {
-    throw new HTTPException(400, { message: "O arquivo enviado esta vazio." });
+    throw new HTTPException(400, { message: "O arquivo enviado está vazio." });
   }
 
   const folder = kind === "manifest" ? "manifests" : "fixes";
@@ -2482,11 +3310,68 @@ app.get("/api/updates/download", async (c) => {
 
 app.get("/api/public/access-keys/settings", async (c) => {
   const settings = await getPublicSignupSettings(c);
-  return c.json({ success: true, settings: { enabled: settings.enabled } }, 200);
+  const billing = await getBillingSettings(c);
+  return c.json({
+    success: true,
+    settings: { enabled: settings.enabled },
+    billing: getPublicBillingPayload(billing),
+  }, 200);
 });
+
+app.get("/api/billing/settings-public", async (c) => {
+  const settings = await getPublicSignupSettings(c);
+  const billing = await getBillingSettings(c);
+  return c.json({
+    success: true,
+    settings: { enabled: settings.enabled },
+    billing: getPublicBillingPayload(billing),
+  }, 200);
+});
+
+app.post("/api/public/checkout", async (c) => {
+  const body = parseBody(publicCheckoutSchema, await c.req.json());
+  try {
+    const result = await createPublicStripeCheckout(c, body);
+    return c.json({ success: true, ...result }, 201);
+  } catch (error) {
+    if (error instanceof HTTPException) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error || "Unknown checkout error");
+    console.error("[public-checkout:error]", { message });
+    if (c.env.ENVIRONMENT === "staging") {
+      return c.json({ success: false, error: `Checkout debug: ${message}` }, 500);
+    }
+    throw error;
+  }
+});
+
+app.get("/api/public/checkout-status", async (c) => {
+  const query = parseBody(publicCheckoutStatusQuerySchema, c.req.query());
+  const result = await getPublicCheckoutStatus(c, query.session_id);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.post("/api/public/payment-status", async (c) => {
+  const body = parseBody(publicCheckoutStatusByEmailSchema, await c.req.json());
+  const result = await getPublicCheckoutStatusByEmail(c, body.email);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.post("/api/public/billing-portal", async (c) => {
+  const body = parseBody(publicBillingPortalSchema, await c.req.json());
+  const result = await createPublicBillingPortalSession(c, body.email);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.on("POST", ["/api/stripe/webhook", "/payment/webhooks/stripe"], handleStripeWebhook);
 
 app.post("/api/public/access-keys/register", async (c) => {
   const body = parseBody(publicAccessKeySchema, await c.req.json());
+  const billing = await getBillingSettings(c);
+  if (billing.billingEnabled) {
+    throw new HTTPException(409, { message: "Pagamento público está ativo para novos cadastros." });
+  }
   const contact = normalizePublicAccessContact(body.contact, body.contactType);
   await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
   const result = await registerPublicAccessKey(c, { ...body, contact });
@@ -2518,16 +3403,49 @@ app.post("/api/public/access-keys/recover", async (c) => {
 app.get("/panel-api/public-signup", async (c) => {
   await requireAdminSession(c);
   const settings = await getPublicSignupSettings(c);
+  const billing = await getBillingSettings(c);
   const metrics = await getPublicSignupMetrics(c);
-  return c.json({ settings: getPublicSignupSettingsPayload(settings), metrics }, 200);
+  return c.json({ settings: getPublicSignupSettingsPayload(settings), billing, metrics }, 200);
 });
 
 app.put("/panel-api/public-signup", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const body = parseBody(publicSignupSettingsSchema, await c.req.json());
   const settings = await updatePublicSignupSettings(c, body);
+  const billing = body.billing
+    ? await updateBillingSettings(c, { ...body.billing, publicSignupEnabled: body.enabled })
+    : await getBillingSettings(c);
   const metrics = await getPublicSignupMetrics(c);
-  return c.json({ settings: getPublicSignupSettingsPayload(settings), metrics }, 200);
+  return c.json({ settings: getPublicSignupSettingsPayload(settings), billing, metrics }, 200);
+});
+
+app.get("/panel-api/payments", async (c) => {
+  await requireAdminSession(c);
+  const limit = Number(c.req.query("limit") || "120");
+  const payload = await listAdminPaymentLogs(c, Number.isFinite(limit) ? limit : 120);
+  return c.json(payload, 200);
+});
+
+app.post("/panel-api/payments/checkouts/:sessionId/sync-stripe", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const sessionId = c.req.param("sessionId");
+  const result = await reconcileStripeCheckoutSession(c, sessionId);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "payment_checkout_synced",
+    entityType: "checkout",
+    entityId: sessionId,
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: {
+      sessionId,
+      paymentStatus: result.paymentStatus,
+      stripeStatus: result.stripeStatus,
+      subscriptionId: result.subscriptionId,
+      invoiceId: result.invoiceId,
+    },
+  });
+  return c.json({ success: true, result }, 200);
 });
 
 app.get("/panel-api/updates", async (c) => {
@@ -2748,6 +3666,27 @@ app.post("/panel-api/licenses/:id/reset-hwid", async (c) => {
     userAgentHash: session.session.user_agent_hash,
   });
   return c.json(mapLicense(updated), 200);
+});
+
+app.post("/panel-api/licenses/:id/sync-stripe", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const result = await reconcileStripeLicense(c, licenseId);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "payment_license_synced",
+    entityType: "license",
+    entityId: String(licenseId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: {
+      licenseId,
+      sessionId: result.checkout?.sessionId || null,
+      subscriptionId: result.subscriptionId,
+    },
+  });
+  const updated = await getLicense(c, licenseId);
+  return c.json({ success: true, result, license: mapLicense(updated) }, 200);
 });
 
 app.get("/api/premium/catalog", async (c) => {
@@ -3281,6 +4220,12 @@ app.get("/api/manifests/status", async (c) => {
   }, 200);
 });
 
+app.post("/api/launcher/billing-portal", async (c) => {
+  const license = await requireLauncherLicense(c);
+  const result = await createLauncherBillingPortalSession(c, license.id);
+  return c.json({ success: true, ...result }, 200);
+});
+
 openapi.get("/api/manifests", ManifestsRoute);
 openapi.get("/api/fixes/catalog", FixesCatalogRoute);
 openapi.get("/api/fixes/download", FixesDownloadRoute);
@@ -3290,19 +4235,22 @@ openapi.post("/api/public/email-verification/start", PublicEmailVerificationStar
 openapi.post("/api/public/email-verification/verify", PublicEmailVerificationVerifyRoute);
 
 app.onError((error, c) => {
-  if (error instanceof HTTPException) {
+  const status = getErrorStatus(error);
+  if (error instanceof HTTPException || status) {
+    const errorStatus = status || (error as HTTPException).status;
+    const message = error instanceof Error ? error.message : "Request failed";
     const logPayload = {
       method: c.req.method,
       path: new URL(c.req.url).pathname,
-      status: error.status,
-      message: error.message,
+      status: errorStatus,
+      message,
     };
-    if (error.status >= 500) {
+    if (errorStatus >= 500) {
       console.error("[merlin-api:error]", logPayload, error);
     } else {
       console.warn("[merlin-api:client-error]", logPayload);
     }
-    return c.json({ success: false, error: error.message }, error.status);
+    return c.json({ success: false, error: message }, errorStatus as 400 | 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503);
   }
 
   console.error("[merlin-api:error]", error);

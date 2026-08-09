@@ -33,7 +33,12 @@
 			"/",
 			"/login",
 			"/licenses",
+			"/activity",
+			"/audit",
 			"/overrides",
+			"/premium",
+			"/polls",
+			"/payments",
 			"/public-signup",
 			"/settings",
 			"/download",
@@ -57,7 +62,9 @@
 			"HUBCAP_TOKEN",
 			"JWT_SECRET",
 			"SESSION_HASH_SECRET",
-			"RESEND_API_KEY"
+			"RESEND_API_KEY",
+			"STRIPE_SECRET_KEY",
+			"STRIPE_WEBHOOK_SECRET"
 		]
 	},
 	"d1_databases": [
@@ -122,7 +129,9 @@
 					"HUBCAP_TOKEN",
 					"JWT_SECRET",
 					"SESSION_HASH_SECRET",
-					"RESEND_API_KEY"
+					"RESEND_API_KEY",
+					"STRIPE_SECRET_KEY",
+					"STRIPE_WEBHOOK_SECRET"
 				]
 			},
 			"assets": {
@@ -133,7 +142,12 @@
 					"/",
 					"/login",
 					"/licenses",
+					"/activity",
+					"/audit",
 					"/overrides",
+					"/premium",
+					"/polls",
+					"/payments",
 					"/public-signup",
 					"/settings",
 					"/download",

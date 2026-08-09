@@ -51,6 +51,16 @@ export class AdminListLicensesRoute extends OpenAPIRoute {
 						expires_at,
 						status,
 						revoked_reason,
+						revoked_origin,
+						revoked_event_id,
+						customer_id,
+						COALESCE(access_type, 'free') AS access_type,
+						COALESCE(billing_status, 'none') AS billing_status,
+						stripe_customer_id,
+						stripe_subscription_id,
+						stripe_checkout_session_id,
+						billing_current_period_end,
+						billing_cancel_at_period_end,
 						created_at,
 						updated_at
 					FROM licenses
@@ -63,13 +73,23 @@ export class AdminListLicensesRoute extends OpenAPIRoute {
 				name: string;
 				contact: string;
 				contact_type: "phone" | "email" | "discord";
-				source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import";
+				source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe";
 				recovery_pin_hash: string | null;
 				recovery_notice_accepted_at: string | null;
 				hwid: string | null;
 				expires_at: string;
 				status: "active" | "revoked";
 				revoked_reason: string | null;
+				revoked_origin: string | null;
+				revoked_event_id: string | null;
+				customer_id: number | null;
+				access_type: string | null;
+				billing_status: string | null;
+				stripe_customer_id: string | null;
+				stripe_subscription_id: string | null;
+				stripe_checkout_session_id: string | null;
+				billing_current_period_end: string | null;
+				billing_cancel_at_period_end: number | null;
 				created_at: string;
 				updated_at: string;
 			}>();
