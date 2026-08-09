@@ -13,7 +13,14 @@ type LegacyRecoveryPinHashInput = {
 	recoveryPin: string;
 };
 
-const RECOVERY_PIN_PATTERN = /^\d{4,8}$/;
+const LEGACY_RECOVERY_PIN_PATTERN = /^\d{4,8}$/;
+const RECOVERY_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,8}$/;
+
+export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.";
+
+export function isValidRecoverySecret(value: string) {
+	return LEGACY_RECOVERY_PIN_PATTERN.test(value) || RECOVERY_PASSWORD_PATTERN.test(value);
+}
 
 async function sha256Hex(value: string) {
 	const data = new TextEncoder().encode(value);
@@ -32,8 +39,8 @@ function getRecoveryPinSecret(c: AppContext) {
 export function normalizeRecoveryPin(value?: string | null) {
 	const recoveryPin = String(value || "").trim();
 	if (!recoveryPin) return null;
-	if (!RECOVERY_PIN_PATTERN.test(recoveryPin)) {
-		throw new HTTPException(400, { message: "Recovery PIN must contain 4 to 8 digits" });
+	if (!isValidRecoverySecret(recoveryPin)) {
+		throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
 	}
 	return recoveryPin;
 }

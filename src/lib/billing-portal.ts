@@ -114,6 +114,25 @@ function stripeBillingPortalConfigurationId(c: AppContext) {
   return String(c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || "").trim();
 }
 
+export async function createStripeBillingPortalSession(c: AppContext, input: { stripeCustomerId: string; returnPath: string }) {
+  const params = new URLSearchParams();
+  params.set("customer", input.stripeCustomerId);
+  params.set("return_url", `${requestOrigin(c)}${input.returnPath}`);
+  const configurationId = stripeBillingPortalConfigurationId(c);
+  if (configurationId) {
+    params.set("configuration", configurationId);
+  }
+
+  const session = await stripePost<StripePortalSession>(c, "/billing_portal/sessions", params);
+  if (session.object !== "billing_portal.session" || !session.url) {
+    throw new HTTPException(502, { message: "Sessao do portal Stripe invalida." });
+  }
+
+  return {
+    portalUrl: session.url,
+  };
+}
+
 export async function createPublicBillingPortalSession(c: AppContext, email: string) {
   const emailNormalized = normalizeContact(email, "email");
   await assertRecentPublicEmailVerification(c, emailNormalized);
@@ -128,22 +147,10 @@ export async function createPublicBillingPortalSession(c: AppContext, email: str
     throw new HTTPException(409, { message: "Este e-mail nao possui assinatura mensal ativa para gerenciar." });
   }
 
-  const params = new URLSearchParams();
-  params.set("customer", customer.stripe_customer_id);
-  params.set("return_url", `${requestOrigin(c)}/download?portal=return`);
-  const configurationId = stripeBillingPortalConfigurationId(c);
-  if (configurationId) {
-    params.set("configuration", configurationId);
-  }
-
-  const session = await stripePost<StripePortalSession>(c, "/billing_portal/sessions", params);
-  if (session.object !== "billing_portal.session" || !session.url) {
-    throw new HTTPException(502, { message: "Sessao do portal Stripe invalida." });
-  }
-
-  return {
-    portalUrl: session.url,
-  };
+  return createStripeBillingPortalSession(c, {
+    stripeCustomerId: customer.stripe_customer_id,
+    returnPath: "/download?portal=return",
+  });
 }
 
 export async function createLauncherBillingPortalSession(c: AppContext, licenseId: number) {
@@ -166,20 +173,8 @@ export async function createLauncherBillingPortalSession(c: AppContext, licenseI
     throw new HTTPException(409, { message: "Esta licenca nao possui assinatura mensal Stripe para gerenciar." });
   }
 
-  const params = new URLSearchParams();
-  params.set("customer", license.stripe_customer_id);
-  params.set("return_url", `${requestOrigin(c)}/download?portal=launcher-return`);
-  const configurationId = stripeBillingPortalConfigurationId(c);
-  if (configurationId) {
-    params.set("configuration", configurationId);
-  }
-
-  const session = await stripePost<StripePortalSession>(c, "/billing_portal/sessions", params);
-  if (session.object !== "billing_portal.session" || !session.url) {
-    throw new HTTPException(502, { message: "Sessao do portal Stripe invalida." });
-  }
-
-  return {
-    portalUrl: session.url,
-  };
+  return createStripeBillingPortalSession(c, {
+    stripeCustomerId: license.stripe_customer_id,
+    returnPath: "/download?portal=launcher-return",
+  });
 }

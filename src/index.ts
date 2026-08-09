@@ -40,6 +40,7 @@ import { getBillingSettings, updateBillingSettings } from "./lib/billing-setting
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
+import { createPublicAccessBillingPortal, createPublicAccessUpgradeCheckout, getPublicAccessDetails, getPublicAccessUpgradeStatus } from "./lib/public-access-management";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
 import {
   getPublicCheckoutStatus,
@@ -52,6 +53,7 @@ import {
 import { requireLauncherLicense } from "./lib/launcher-auth";
 import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
+import { isValidRecoverySecret } from "./lib/recovery-pin";
 import {
   assertPremiumDownloadAccess,
   assertPremiumActivationReservationForLicense,
@@ -98,11 +100,11 @@ app.use("*", async (c, next) => {
   await next();
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
-  const isPublicDownloadRoute = c.req.path === "/download";
+  const isPublicDownloadRoute = c.req.path === "/" || c.req.path === "/download" || c.req.path === "/download/";
   const csp = isSwaggerRoute
     ? "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob: https://fastly.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     : isPublicDownloadRoute
-      ? "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+      ? "default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src https://www.youtube-nocookie.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://checkout.stripe.com"
     : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
   const headers = new Headers(c.res.headers);
@@ -134,18 +136,21 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup"] as const;
+const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
   rememberMe: z.boolean().optional().default(false),
+});
+const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
+  message: "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.",
 });
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
   contact: z.string().min(1).optional(),
   contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
   phone: z.string().min(1).optional(),
-  recoveryPin: z.string().trim().regex(/^\d{4,8}$/).optional(),
+  recoveryPin: recoverySecretSchema.optional(),
   expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   hwid: z.string().trim().optional().nullable(),
 }).refine((value) => Boolean(value.contact || value.phone), {
@@ -156,7 +161,7 @@ const publicAccessKeySchema = z.object({
   name: z.string().trim().min(1),
   contact: z.string().trim().min(1),
   contactType: z.literal("email"),
-  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+  recoveryPin: recoverySecretSchema,
   acceptedRecoveryNotice: z.boolean(),
 });
 
@@ -169,7 +174,7 @@ async function handleStripeWebhook(c: AppContext) {
 const publicAccessKeyRecoverySchema = z.object({
   contact: z.string().trim().min(1),
   contactType: z.literal("email"),
-  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+  recoveryPin: recoverySecretSchema,
 });
 const publicSignupSettingsSchema = z.object({
   enabled: z.boolean(),
@@ -187,7 +192,7 @@ const publicSignupSettingsSchema = z.object({
 const publicCheckoutSchema = z.object({
   name: z.string().trim().min(1),
   contact: z.string().trim().email(),
-  recoveryPin: z.string().trim().regex(/^\d{4,8}$/),
+  recoveryPin: recoverySecretSchema,
   acceptedRecoveryNotice: z.boolean(),
   planType: z.enum(["monthly", "lifetime"]),
 });
@@ -199,6 +204,13 @@ const publicCheckoutStatusByEmailSchema = z.object({
 });
 const publicBillingPortalSchema = z.object({
   email: z.string().trim().email(),
+});
+const publicAccessMeSchema = z.object({
+  email: z.string().trim().email(),
+  recoveryPin: recoverySecretSchema,
+});
+const publicAccessUpgradeStatusQuerySchema = z.object({
+  session_id: z.string().trim().min(1),
 });
 const overrideUploadInitSchema = z.object({
   appId: z.string().regex(/^\d+$/),
@@ -612,6 +624,47 @@ async function servePanelApp(c: any) {
     statusText: response.statusText,
     headers,
   });
+}
+
+async function servePublicDownloadApp(c: any) {
+  const requestUrl = new URL(c.req.url);
+  const shouldUseMerlinPublic = requestUrl.hostname === "api-merlin.com"
+    || requestUrl.hostname === "staging.api-merlin.com"
+    || c.env.ENVIRONMENT === "staging";
+
+  if (!shouldUseMerlinPublic) {
+    return c.html(renderPublicDownloadPage(), 200, {
+      "cache-control": "no-store",
+      "x-merlin-public-bridge": "legacy-fallback",
+    });
+  }
+
+  return c.html(renderMerlinPublicDownloadShell(), 200, {
+    "cache-control": "no-store",
+    "x-merlin-public-bridge": "merlin-public-shell",
+  });
+}
+
+function renderMerlinPublicDownloadShell() {
+  return `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Merlin - Seu próximo jogo começa aqui</title>
+    <meta name="description" content="Plataforma para PC com acesso a uma biblioteca de jogos e grandes lançamentos por uma assinatura que cabe no bolso." />
+    <meta property="og:title" content="Merlin - Seu próximo jogo começa aqui" />
+    <meta property="og:description" content="Acesse uma biblioteca com grandes jogos e lançamentos através do launcher do Merlin." />
+    <link rel="icon" href="/download-assets/favicon.ico" sizes="any" />
+    <link rel="icon" href="/download-assets/icons/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/download-assets/apple-touch-icon.png" />
+    <script type="module" crossorigin src="/download-assets/assets/index-CFe7Hlkj.js"></script>
+    <link rel="stylesheet" crossorigin href="/download-assets/assets/index-DXdJbOZw.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>`;
 }
 
 function renderPublicDownloadPage() {
@@ -2678,18 +2731,16 @@ async function handleProtectedPage(c: any) {
 app.get("/login", async (c) => {
   const session = await readAdminSession(c, { touch: false, rotate: false });
   if (session) {
-    return c.redirect("/", 302);
+    return c.redirect("/overview", 302);
   }
 
   clearAdminSessionCookie(c);
   return servePanelApp(c);
 });
 
-app.get("/download", (c) => {
-  return c.html(renderPublicDownloadPage(), 200, {
-    "cache-control": "no-store",
-  });
-});
+app.get("/", servePublicDownloadApp);
+app.get("/download", servePublicDownloadApp);
+app.get("/download/", servePublicDownloadApp);
 
 app.get("/download.js", () => {
   return new Response(renderPublicDownloadScript(), {
@@ -3361,6 +3412,30 @@ app.post("/api/public/payment-status", async (c) => {
 app.post("/api/public/billing-portal", async (c) => {
   const body = parseBody(publicBillingPortalSchema, await c.req.json());
   const result = await createPublicBillingPortalSession(c, body.email);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.post("/api/public/access/me", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  const result = await getPublicAccessDetails(c, body);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.post("/api/public/access/upgrade-checkout", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  const result = await createPublicAccessUpgradeCheckout(c, body);
+  return c.json({ success: true, ...result }, 201);
+});
+
+app.post("/api/public/access/billing-portal", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  const result = await createPublicAccessBillingPortal(c, body);
+  return c.json({ success: true, ...result }, 200);
+});
+
+app.get("/api/public/access/upgrade-status", async (c) => {
+  const query = parseBody(publicAccessUpgradeStatusQuerySchema, c.req.query());
+  const result = await getPublicAccessUpgradeStatus(c, query.session_id);
   return c.json({ success: true, ...result }, 200);
 });
 

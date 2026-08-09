@@ -5,7 +5,7 @@ import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, typ
 import { findLicenseByEmailContact, normalizeContact } from "./admin-license-service";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { generateLicenseKey } from "./licenses";
-import { hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
@@ -447,7 +447,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
 
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   if (!recoveryPin) {
-    throw new HTTPException(400, { message: "PIN de recuperacao precisa conter 4 a 8 digitos." });
+    throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
 
   const planEnabled = input.planType === "monthly" ? billing.monthlyEnabled : billing.lifetimeEnabled;

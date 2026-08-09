@@ -3,9 +3,9 @@ import { Buffer } from "node:buffer";
 import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { assertRecentPublicEmailVerification } from "./email-verification";
+import { LIFETIME_EXPIRES_AT, UPGRADE_OPERATION } from "./public-access-management";
 
 const PROVIDER_STRIPE = "stripe";
-const LIFETIME_EXPIRES_AT = "9999-12-31T00:00:00.000Z";
 const SIGNATURE_TOLERANCE_SECONDS = 300;
 
 type StripeEvent = {
@@ -27,6 +27,10 @@ type CheckoutRow = {
   payment_status: string | null;
   license_id: number | null;
   reactivation_license_id: number | null;
+  operation_type: string | null;
+  upgrade_license_id: number | null;
+  upgrade_subscription_id: string | null;
+  upgrade_processed_at: string | null;
   pending_license_key: string | null;
   pending_name: string | null;
   pending_recovery_pin_hash: string | null;
@@ -47,6 +51,9 @@ type LicenseRow = {
   contact: string;
   expires_at: string;
   status: string;
+  access_type?: string | null;
+  customer_id?: number | null;
+  stripe_subscription_id?: string | null;
 };
 
 type StripeCharge = {
@@ -301,6 +308,7 @@ async function getCheckoutBySessionId(c: AppContext, sessionId: string) {
     .prepare(
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
+          operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
           pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at
         FROM checkout_sessions
         WHERE provider = ?
@@ -317,6 +325,7 @@ async function getCheckoutBySubscriptionId(c: AppContext, subscriptionId: string
     .prepare(
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
+          operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
           pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at
         FROM checkout_sessions
         WHERE provider = ?
@@ -334,6 +343,7 @@ async function getLatestCheckoutByEmail(c: AppContext, emailNormalized: string) 
     .prepare(
       `
         SELECT cs.id, cs.customer_id, cs.provider_session_id, cs.provider_price_id, cs.provider_subscription_id, cs.plan_type, cs.mode, cs.status, cs.payment_status, cs.license_id, cs.reactivation_license_id,
+          cs.operation_type, cs.upgrade_license_id, cs.upgrade_subscription_id, cs.upgrade_processed_at,
           cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at
         FROM checkout_sessions cs
         JOIN customers cst ON cst.id = cs.customer_id
@@ -683,6 +693,109 @@ async function savePayment(
     .run();
 }
 
+async function getUpgradeLicenseById(c: AppContext, licenseId: number) {
+  return c.env.merlin_db
+    .prepare(
+      `
+        SELECT id, license_key, name, contact, expires_at, status, access_type, customer_id, stripe_subscription_id
+        FROM licenses
+        WHERE id = ?
+        LIMIT 1
+      `,
+    )
+    .bind(licenseId)
+    .first<LicenseRow>();
+}
+
+async function handleLifetimeUpgradeCheckoutCompleted(c: AppContext, checkout: CheckoutRow, session: Record<string, unknown>) {
+  if (checkout.upgrade_processed_at) {
+    return;
+  }
+  const upgradeLicenseId = checkout.upgrade_license_id || checkout.license_id;
+  if (!upgradeLicenseId) {
+    throw new Error(`Upgrade checkout ${checkout.provider_session_id} is missing upgrade license id`);
+  }
+
+  const license = await getUpgradeLicenseById(c, upgradeLicenseId);
+  if (!license) {
+    throw new Error(`Upgrade license ${upgradeLicenseId} not found`);
+  }
+  if (license.customer_id !== checkout.customer_id) {
+    throw new Error(`Upgrade checkout ${checkout.provider_session_id} customer mismatch`);
+  }
+
+  const now = new Date().toISOString();
+  if (license.access_type !== "paid_lifetime" && license.access_type !== "legacy_lifetime") {
+    if (license.status !== "active" || license.access_type !== "monthly_subscription") {
+      throw new Error(`License ${license.id} is not eligible for upgrade`);
+    }
+
+    await c.env.merlin_db
+      .prepare(
+        `
+          UPDATE licenses
+          SET access_type = 'paid_lifetime',
+              billing_status = 'active',
+              expires_at = ?,
+              stripe_subscription_id = NULL,
+              stripe_checkout_session_id = ?,
+              billing_current_period_end = NULL,
+              billing_cancel_at_period_end = 0,
+              updated_at = ?
+          WHERE id = ?
+        `,
+      )
+      .bind(LIFETIME_EXPIRES_AT, checkout.provider_session_id, now, license.id)
+      .run();
+  }
+
+  await c.env.merlin_db
+    .prepare(
+      `
+        UPDATE checkout_sessions
+        SET license_id = ?,
+            status = 'completed',
+            payment_status = 'paid',
+            completed_at = COALESCE(completed_at, ?),
+            upgrade_processed_at = COALESCE(upgrade_processed_at, ?)
+        WHERE id = ?
+      `,
+    )
+    .bind(license.id, now, now, checkout.id)
+    .run();
+
+  await savePayment(c, {
+    customerId: checkout.customer_id,
+    licenseId: license.id,
+    paymentId: getStripeId(session.payment_intent) || getString(session.id),
+    checkoutSessionId: checkout.provider_session_id,
+    subscriptionId: null,
+    amountCents: getNumber(session.amount_total) || 0,
+    currency: getString(session.currency) || "brl",
+    status: "paid",
+    paymentType: "one_time",
+  });
+
+  try {
+    await cancelCustomerSubscriptionsAtPeriodEnd(c, checkout.customer_id);
+    await c.env.merlin_db
+      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = NULL WHERE id = ?`)
+      .bind(checkout.id)
+      .run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || "Unknown Stripe cancellation error");
+    console.warn("[stripe-webhook] lifetime upgrade converted but subscription cancellation failed", {
+      checkoutSessionId: checkout.provider_session_id,
+      licenseId: license.id,
+      message,
+    });
+    await c.env.merlin_db
+      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = ? WHERE id = ?`)
+      .bind(message.slice(0, 500), checkout.id)
+      .run();
+  }
+}
+
 async function handleCheckoutCompleted(c: AppContext, session: Record<string, unknown>) {
   const sessionId = getString(session.id);
   if (!sessionId) {
@@ -706,6 +819,13 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
     )
     .bind(getString(session.status) || "complete", paymentStatus, subscriptionId, new Date().toISOString(), checkout.id)
     .run();
+
+  if (checkout.operation_type === UPGRADE_OPERATION) {
+    if (paymentStatus === "paid") {
+      await handleLifetimeUpgradeCheckoutCompleted(c, checkout, session);
+    }
+    return;
+  }
 
   if (checkout.plan_type === "lifetime" && paymentStatus === "paid") {
     const license = await activateLicenseFromCheckout(c, checkout, {

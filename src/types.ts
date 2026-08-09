@@ -1,5 +1,6 @@
 import type { Context } from "hono";
 import { z } from "zod";
+import { isValidRecoverySecret } from "./lib/recovery-pin";
 
 export interface AppBindings extends Env {
   SESSION_HASH_SECRET: string;
@@ -120,12 +121,16 @@ export const PublicEmailVerificationVerifyResponse = z.object({
 	verified: z.literal(true),
 });
 
+const RecoverySecretRequest = z.string().trim().refine(isValidRecoverySecret, {
+	message: "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.",
+});
+
 export const CreateLicenseRequest = z.object({
 	name: z.string().min(1).describe("Customer name"),
 	contact: z.string().min(1).optional().describe("Customer contact"),
 	contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
 	phone: z.string().min(1).optional().describe("Deprecated alias for contact"),
-	recoveryPin: z.string().trim().regex(/^\d{4,8}$/).optional().describe("Optional recovery PIN with 4 to 8 digits"),
+	recoveryPin: RecoverySecretRequest.optional().describe("Optional recovery password. Legacy PINs with 4 to 8 digits are still supported."),
 	expiresAt: z
 		.string()
 		.regex(/^\d{4}-\d{2}-\d{2}$/)

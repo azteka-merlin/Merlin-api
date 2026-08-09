@@ -3,7 +3,7 @@ import type { AppContext } from "../types";
 import { generateLicenseKey, toDateOnly, toIsoDateStart, type LicenseRecord } from "./licenses";
 import { assertValidContact, findLicenseByEmailContact, normalizeContact, type ContactType } from "./admin-license-service";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
-import { compareRecoveryPin, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { RECOVERY_SECRET_DESCRIPTION, compareRecoveryPin, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 export type PublicSignupDurationUnit = "days" | "weeks" | "months" | "years";
 
@@ -222,7 +222,7 @@ export async function registerPublicAccessKey(
   }
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   if (!recoveryPin) {
-    throw new HTTPException(400, { message: "Recovery PIN must contain 4 to 8 digits" });
+    throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
 
   const contact = normalizePublicAccessContact(input.contact, input.contactType);
