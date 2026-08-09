@@ -658,8 +658,8 @@ function renderMerlinPublicDownloadShell() {
     <link rel="icon" href="/download-assets/favicon.ico" sizes="any" />
     <link rel="icon" href="/download-assets/icons/favicon-32.png" type="image/png" sizes="32x32" />
     <link rel="apple-touch-icon" href="/download-assets/apple-touch-icon.png" />
-    <script type="module" crossorigin src="/download-assets/assets/index-CFe7Hlkj.js"></script>
-    <link rel="stylesheet" crossorigin href="/download-assets/assets/index-DXdJbOZw.css" />
+    <script type="module" crossorigin src="/download-assets/assets/app.js"></script>
+    <link rel="stylesheet" crossorigin href="/download-assets/assets/app.css" />
   </head>
   <body>
     <div id="root"></div>
