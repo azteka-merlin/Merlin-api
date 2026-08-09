@@ -122,7 +122,7 @@ export const PublicEmailVerificationVerifyResponse = z.object({
 });
 
 const RecoverySecretRequest = z.string().trim().refine(isValidRecoverySecret, {
-	message: "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.",
+	message: "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.",
 });
 
 export const CreateLicenseRequest = z.object({

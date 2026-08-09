@@ -14,9 +14,9 @@ type LegacyRecoveryPinHashInput = {
 };
 
 const LEGACY_RECOVERY_PIN_PATTERN = /^\d{4,8}$/;
-const RECOVERY_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,8}$/;
+const RECOVERY_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{4,8}$/;
 
-export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.";
+export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.";
 
 export function isValidRecoverySecret(value: string) {
 	return LEGACY_RECOVERY_PIN_PATTERN.test(value) || RECOVERY_PASSWORD_PATTERN.test(value);

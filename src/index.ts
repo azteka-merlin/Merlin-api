@@ -143,7 +143,7 @@ const adminLoginSchema = z.object({
   rememberMe: z.boolean().optional().default(false),
 });
 const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
-  message: "Use 4 a 8 numeros ou uma senha com 6 a 8 letras/numeros.",
+  message: "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.",
 });
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
