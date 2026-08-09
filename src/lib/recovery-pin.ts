@@ -13,13 +13,12 @@ type LegacyRecoveryPinHashInput = {
 	recoveryPin: string;
 };
 
-const LEGACY_RECOVERY_PIN_PATTERN = /^\d{4,8}$/;
-const RECOVERY_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{4,8}$/;
+const RECOVERY_SECRET_PATTERN = /^\S{4,8}$/;
 
-export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.";
+export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 caracteres, sem espacos. PINs numericos antigos continuam funcionando.";
 
 export function isValidRecoverySecret(value: string) {
-	return LEGACY_RECOVERY_PIN_PATTERN.test(value) || RECOVERY_PASSWORD_PATTERN.test(value);
+	return RECOVERY_SECRET_PATTERN.test(value);
 }
 
 async function sha256Hex(value: string) {

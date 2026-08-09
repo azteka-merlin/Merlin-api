@@ -122,7 +122,7 @@ export const PublicEmailVerificationVerifyResponse = z.object({
 });
 
 const RecoverySecretRequest = z.string().trim().refine(isValidRecoverySecret, {
-	message: "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.",
+	message: "Use 4 a 8 caracteres, sem espacos. PINs numericos antigos continuam funcionando.",
 });
 
 export const CreateLicenseRequest = z.object({
@@ -130,7 +130,7 @@ export const CreateLicenseRequest = z.object({
 	contact: z.string().min(1).optional().describe("Customer contact"),
 	contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
 	phone: z.string().min(1).optional().describe("Deprecated alias for contact"),
-	recoveryPin: RecoverySecretRequest.optional().describe("Optional recovery password. Legacy PINs with 4 to 8 digits are still supported."),
+	recoveryPin: RecoverySecretRequest.optional().describe("Optional recovery secret. Use 4 to 8 non-space characters. Legacy numeric PINs are still supported."),
 	expiresAt: z
 		.string()
 		.regex(/^\d{4}-\d{2}-\d{2}$/)

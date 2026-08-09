@@ -143,7 +143,7 @@ const adminLoginSchema = z.object({
   rememberMe: z.boolean().optional().default(false),
 });
 const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
-  message: "Use 4 a 8 numeros ou uma senha com 4 a 8 letras/numeros.",
+  message: "Use 4 a 8 caracteres, sem espacos. PINs numericos antigos continuam funcionando.",
 });
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
@@ -927,7 +927,7 @@ function renderPublicDownloadPage() {
             <span data-i18n="pin">Recovery PIN</span>
             <div class="input-wrap">
               <span class="input-icon" aria-hidden="true">#</span>
-              <input name="recoveryPin" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required />
+              <input name="recoveryPin" inputmode="text" pattern="\\S{4,8}" maxlength="8" required />
             </div>
             <div class="field-error"></div>
           </div>
@@ -984,7 +984,7 @@ function renderPublicDownloadPage() {
             <span data-i18n="pin">Recovery PIN</span>
             <div class="input-wrap">
               <span class="input-icon" aria-hidden="true">#</span>
-              <input name="recoveryPin" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required />
+              <input name="recoveryPin" inputmode="text" pattern="\\S{4,8}" maxlength="8" required />
             </div>
             <div class="field-error"></div>
           </div>
@@ -1205,7 +1205,7 @@ const messages = {
     changeEmail: "Use another e-mail",
     errorEmailCode: "Enter the 6-digit code sent to your e-mail.",
     emailVerificationRequired: "For security, confirm your e-mail again.",
-    errorPin: "Use a PIN with 4 to 8 numbers.",
+    errorPin: "Use 4 to 8 characters, without spaces.",
     errorNotice: "Confirm the recovery notice to continue.",
     accessKeyUnavailable: "Could not create a new key with this information. If you already have a key, use the recovery option.",
     recoveryUnavailable: "Could not recover a key with this information. Check your details and try again.",
@@ -1323,7 +1323,7 @@ const messages = {
     changeEmail: "Usar outro e-mail",
     errorEmailCode: "Informe o código de 6 dígitos enviado para seu e-mail.",
     emailVerificationRequired: "Por segurança, confirme seu e-mail novamente.",
-    errorPin: "Use um PIN com 4 a 8 números.",
+    errorPin: "Use 4 a 8 caracteres, sem espaços.",
     errorNotice: "Confirme o aviso de recuperação para continuar.",
     accessKeyUnavailable: "Não foi possível criar uma nova chave com esses dados. Se você já possui uma chave, use a opção Recuperar.",
     recoveryUnavailable: "Não foi possível recuperar uma chave com esses dados. Confira as informações e tente novamente.",
@@ -1394,7 +1394,7 @@ const messages = {
     emailVerified: "E-mail verificado. Creando tu clave de acceso...",
     changeEmail: "Usar otro e-mail",
     errorEmailCode: "Ingresa el código de 6 dígitos enviado a tu e-mail.",
-    errorPin: "Usa un PIN de 4 a 8 números.",
+    errorPin: "Usa de 4 a 8 caracteres, sin espacios.",
     errorNotice: "Confirma el aviso de recuperación para continuar.",
     accessKeyUnavailable: "No se pudo crear una nueva clave con estos datos. Si ya tienes una clave, usa la opción Recuperar.",
     recoveryUnavailable: "No se pudo recuperar una clave con estos datos. Revisa la información e inténtalo de nuevo.",
@@ -1465,7 +1465,7 @@ const messages = {
     emailVerified: "E-mail vérifié. Création de votre clé d'accès...",
     changeEmail: "Utiliser un autre e-mail",
     errorEmailCode: "Indiquez le code à 6 chiffres envoyé à votre e-mail.",
-    errorPin: "Utilisez un PIN de 4 à 8 chiffres.",
+    errorPin: "Utilisez 4 à 8 caractères, sans espaces.",
     errorNotice: "Confirmez l'avis de récupération pour continuer.",
     accessKeyUnavailable: "Impossible de créer une nouvelle clé avec ces informations. Si vous avez déjà une clé, utilisez l'option de récupération.",
     recoveryUnavailable: "Impossible de récupérer une clé avec ces informations. Vérifiez les données et réessayez.",
@@ -1536,7 +1536,7 @@ const messages = {
     emailVerified: "E-Mail bestätigt. Zugangsschlüssel wird erstellt...",
     changeEmail: "Andere E-Mail verwenden",
     errorEmailCode: "Gib den 6-stelligen Code ein, der an deine E-Mail gesendet wurde.",
-    errorPin: "Verwende eine PIN mit 4 bis 8 Zahlen.",
+    errorPin: "Nutze 4 bis 8 Zeichen, ohne Leerzeichen.",
     errorNotice: "Bestätige den Wiederherstellungshinweis, um fortzufahren.",
     accessKeyUnavailable: "Mit diesen Daten konnte kein neuer Schlüssel erstellt werden. Wenn du bereits einen Schlüssel hast, nutze die Wiederherstellung.",
     recoveryUnavailable: "Mit diesen Daten konnte kein Schlüssel wiederhergestellt werden. Prüfe die Angaben und versuche es erneut.",
@@ -1922,7 +1922,7 @@ function validateForm(form) {
     setFieldError(form, "contact", t("errorEmail"));
     valid = false;
   }
-  if ((form === registerForm || form === recoverForm) && !/^\\d{4,8}$/.test(String(data.recoveryPin || "").trim())) {
+  if ((form === registerForm || form === recoverForm) && !/^\\S{4,8}$/.test(String(data.recoveryPin || "").trim())) {
     setFieldError(form, "recoveryPin", t("errorPin"));
     valid = false;
   }
