@@ -591,6 +591,9 @@ export async function votePoll(c: AppContext, value: string | number, licenseId:
   const optionId = input.optionId ? Number(input.optionId) : null;
   const contributionOptionId = input.contributionOptionId ? Number(input.contributionOptionId) : null;
   const contributionSkipped = input.contributionSkipped === true;
+  if (poll.type === "game_request" && contributionSkipped) {
+    throw new HTTPException(400, { message: "Contribution option is required" });
+  }
   const existing = await c.env.merlin_db
     .prepare(`
       SELECT id, poll_id, license_id, option_id, contribution_option_id, contribution_skipped, created_at, updated_at

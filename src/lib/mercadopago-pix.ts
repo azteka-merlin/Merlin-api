@@ -1320,7 +1320,8 @@ export async function parseAndVerifyMercadoPagoWebhook(c: AppContext, rawBody: s
   }
 
   if (!validSignature) {
-    if (isLikelyMercadoPagoPixOrderSignal({
+    const allowProviderVerificationFallback = c.env.ENVIRONMENT === "staging" && runtimeEnvironment === "test";
+    if (allowProviderVerificationFallback && isLikelyMercadoPagoPixOrderSignal({
       type: payloadType,
       action: payloadAction,
       dataId: resourceDataId,
