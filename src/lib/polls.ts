@@ -57,6 +57,21 @@ type ContributionVoteCountRow = {
   count: number;
 };
 
+type PollVoterRow = {
+  vote_id: number;
+  option_id: number;
+  contribution_option_id: number | null;
+  contribution_skipped: number;
+  voted_at: string;
+  vote_updated_at: string;
+  license_id: number;
+  license_key: string;
+  license_name: string | null;
+  license_contact: string | null;
+  license_contact_type: string | null;
+  customer_email: string | null;
+};
+
 export type PollInput = {
   type: PollType;
   question: string;
@@ -420,6 +435,99 @@ export async function getPoll(c: AppContext, value: string | number, licenseId?:
     throw new HTTPException(404, { message: "Poll not found" });
   }
   return mapped;
+}
+
+export async function getPollResults(c: AppContext, value: string | number) {
+  const poll = await getPoll(c, value);
+  const voterRows = await c.env.merlin_db
+    .prepare(`
+      SELECT
+        pv.id AS vote_id,
+        pv.option_id,
+        pv.contribution_option_id,
+        pv.contribution_skipped,
+        pv.created_at AS voted_at,
+        pv.updated_at AS vote_updated_at,
+        l.id AS license_id,
+        l.license_key,
+        l.name AS license_name,
+        l.contact AS license_contact,
+        l.contact_type AS license_contact_type,
+        cst.email AS customer_email
+      FROM poll_votes pv
+      JOIN licenses l ON l.id = pv.license_id
+      LEFT JOIN customers cst ON cst.id = l.customer_id
+      WHERE pv.poll_id = ?
+      ORDER BY pv.option_id ASC, pv.created_at DESC, pv.id DESC
+    `)
+    .bind(poll.id)
+    .all<PollVoterRow>();
+
+  const contributionOptionsById = new Map((poll.contributionOptions || []).map((option) => [option.id, option]));
+  const votersByOptionId = new Map<number, Array<{
+    id: number;
+    name: string | null;
+    email: string | null;
+    licenseId: number;
+    licenseKey: string;
+    contributionOptionId: number | null;
+    contributionLabel: string | null;
+    contributionMinAmount: number | null;
+    contributionMaxAmount: number | null;
+    contributionSkipped: boolean;
+    votedAt: string;
+    updatedAt: string;
+  }>>();
+
+  for (const row of voterRows.results || []) {
+    const email = row.license_contact_type === "email"
+      ? row.license_contact
+      : row.customer_email;
+    const contributionOption = row.contribution_option_id
+      ? contributionOptionsById.get(row.contribution_option_id)
+      : null;
+    const voters = votersByOptionId.get(row.option_id) || [];
+    voters.push({
+      id: row.vote_id,
+      name: row.license_name || null,
+      email: email || null,
+      licenseId: row.license_id,
+      licenseKey: row.license_key,
+      contributionOptionId: row.contribution_option_id || null,
+      contributionLabel: contributionOption?.label || null,
+      contributionMinAmount: contributionOption?.minAmount ?? null,
+      contributionMaxAmount: contributionOption?.maxAmount ?? null,
+      contributionSkipped: Boolean(row.contribution_skipped),
+      votedAt: row.voted_at,
+      updatedAt: row.vote_updated_at,
+    });
+    votersByOptionId.set(row.option_id, voters);
+  }
+
+  const options = (poll.options || []).map((option) => ({
+    ...option,
+    voters: votersByOptionId.get(option.id) || [],
+  }));
+  const leader = options.reduce<typeof options[number] | null>((current, option) => {
+    if (!current || (option.votes || 0) > (current.votes || 0)) return option;
+    return current;
+  }, null);
+
+  return {
+    poll: {
+      ...poll,
+      optionCount: options.length,
+      leader: leader && (leader.votes || 0) > 0
+        ? {
+          id: leader.id,
+          label: leader.label,
+          votes: leader.votes,
+          percent: leader.percent,
+        }
+        : null,
+    },
+    options,
+  };
 }
 
 export async function updatePoll(c: AppContext, value: string | number, input: PollInput) {

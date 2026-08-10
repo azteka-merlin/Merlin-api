@@ -81,6 +81,7 @@ import {
 import {
   createPoll,
   deletePoll,
+  getPollResults,
   listActivePolls,
   listPolls,
   setPollStatus,
@@ -1205,6 +1206,12 @@ app.get("/panel-api/polls", async (c) => {
   await requireAdminSession(c);
   const polls = await listPolls(c);
   return c.json({ polls }, 200);
+});
+
+app.get("/panel-api/polls/:id/results", async (c) => {
+  await requireAdminSession(c);
+  const results = await getPollResults(c, c.req.param("id"));
+  return c.json({ success: true, ...results }, 200);
 });
 
 app.post("/panel-api/polls", async (c) => {
