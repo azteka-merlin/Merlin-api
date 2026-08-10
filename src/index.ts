@@ -37,6 +37,7 @@ import {
   updateLicense,
 } from "./lib/admin-license-service";
 import { getBillingSettings, updateBillingSettings } from "./lib/billing-settings";
+import { runBillingNotificationCron } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
@@ -2546,4 +2547,9 @@ app.notFound((c) => {
   return c.env.ASSETS.fetch(c.req.raw);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
+    await runBillingNotificationCron(env);
+  },
+};

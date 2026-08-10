@@ -2,6 +2,7 @@ import { HTTPException } from "hono/http-exception";
 import { Buffer } from "node:buffer";
 import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
+import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePaymentFailedNotification } from "./billing-notifications";
 import { assertRecentPublicEmailVerification } from "./email-verification";
 import { LIFETIME_EXPIRES_AT, UPGRADE_OPERATION } from "./public-access-management";
 
@@ -292,6 +293,11 @@ function dateOrLifetime(value: string | null) {
 
 function getSubscriptionEffectivePeriodEnd(subscription: Pick<StripeSubscription, "current_period_end" | "cancel_at">) {
   return unixToIso(subscription.current_period_end) || unixToIso(subscription.cancel_at);
+}
+
+function requestOrigin(c: AppContext) {
+  const url = new URL(c.req.raw.url);
+  return `${url.protocol}//${url.host}`;
 }
 
 function isSubscriptionCancelScheduled(subscription: Pick<StripeSubscription, "cancel_at_period_end" | "cancel_at">) {
@@ -1051,6 +1057,14 @@ async function handleInvoiceFailed(c: AppContext, invoice: Record<string, unknow
     .prepare(`UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
     .bind(new Date().toISOString(), PROVIDER_STRIPE, subscriptionId)
     .run();
+
+  c.executionCtx.waitUntil(sendStripeInvoicePaymentFailedNotification(c, {
+    subscriptionId,
+    invoice,
+    origin: requestOrigin(c),
+  }).catch((error) => {
+    console.warn("[stripe-webhook] payment failed email failed", error instanceof Error ? error.message : error);
+  }));
 }
 
 async function handleInvoicePaymentActionRequired(c: AppContext, invoice: Record<string, unknown>) {
@@ -1067,6 +1081,13 @@ async function handleInvoicePaymentActionRequired(c: AppContext, invoice: Record
     .prepare(`UPDATE subscriptions SET status = 'action_required', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
     .bind(now, PROVIDER_STRIPE, subscriptionId)
     .run();
+
+  c.executionCtx.waitUntil(sendStripeInvoicePaymentActionRequiredNotification(c, {
+    subscriptionId,
+    invoice,
+  }).catch((error) => {
+    console.warn("[stripe-webhook] payment action required email failed", error instanceof Error ? error.message : error);
+  }));
 }
 
 async function getChargeForDispute(c: AppContext, dispute: Record<string, unknown>) {
