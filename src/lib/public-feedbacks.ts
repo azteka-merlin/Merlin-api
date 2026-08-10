@@ -14,6 +14,8 @@ type PublicFeedbackImageRow = {
   size_bytes: number;
   sort_order: number;
   enabled: number;
+  source: string;
+  static_url: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -25,10 +27,12 @@ type PublicFeedbackImageInput = {
 };
 
 function mapFeedback(row: PublicFeedbackImageRow) {
+  const source = row.source === "static" ? "static" : "uploaded";
   return {
     id: row.id,
     title: row.title,
-    imageUrl: `/api/public/feedbacks/${row.id}/image`,
+    source,
+    imageUrl: source === "static" && row.static_url ? row.static_url : `/api/public/feedbacks/${row.id}/image`,
     filename: row.filename,
     contentType: row.content_type,
     sizeBytes: row.size_bytes,
@@ -76,6 +80,7 @@ async function getFeedbackRow(c: AppContext, id: number) {
   const row = await c.env.merlin_db
     .prepare(`
       SELECT id, title, image_key, filename, content_type, size_bytes, sort_order, enabled, created_at, updated_at
+      , source, static_url
       FROM public_feedback_images
       WHERE id = ?
       LIMIT 1
@@ -94,6 +99,7 @@ export async function listPublicFeedbackImages(c: AppContext, options: { include
   const rows = await c.env.merlin_db
     .prepare(`
       SELECT id, title, image_key, filename, content_type, size_bytes, sort_order, enabled, created_at, updated_at
+      , source, static_url
       FROM public_feedback_images
       ${options.includeDisabled ? "" : "WHERE enabled = 1"}
       ORDER BY sort_order ASC, id ASC
@@ -171,7 +177,7 @@ export async function updatePublicFeedbackImage(c: AppContext, id: number, input
 export async function deletePublicFeedbackImage(c: AppContext, id: number) {
   const row = await getFeedbackRow(c, id);
   await c.env.merlin_db.prepare("DELETE FROM public_feedback_images WHERE id = ?").bind(id).run();
-  if (c.env.MERLIN_FILES) {
+  if (row.source !== "static" && c.env.MERLIN_FILES) {
     await c.env.MERLIN_FILES.delete(row.image_key).catch(() => undefined);
   }
   return { success: true, id };
@@ -181,6 +187,9 @@ export async function getPublicFeedbackImageObject(c: AppContext, id: number) {
   const row = await getFeedbackRow(c, id);
   if (!row.enabled) {
     throw new HTTPException(404, { message: "Feedback not found" });
+  }
+  if (row.source === "static") {
+    throw new HTTPException(404, { message: "Feedback image is static" });
   }
 
   const object = await c.env.MERLIN_FILES.get(row.image_key);
