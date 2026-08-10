@@ -5,10 +5,14 @@ type PaymentLogRow = {
   customer_id: number;
   email: string | null;
   stripe_customer_id: string | null;
+  provider: string;
   provider_session_id: string;
   provider_session_url: string | null;
   provider_price_id: string;
   provider_subscription_id: string | null;
+  provider_external_reference: string | null;
+  provider_raw_status: string | null;
+  provider_status_detail: string | null;
   plan_type: string;
   mode: string;
   checkout_status: string;
@@ -39,6 +43,7 @@ type PaymentLogRow = {
 type PaymentEventRow = {
   id: number;
   provider_event_id: string;
+  provider: string;
   event_type: string;
   processing_status: string;
   error_message: string | null;
@@ -63,10 +68,14 @@ function mapPaymentLog(row: PaymentLogRow) {
     customerId: row.customer_id,
     email: row.email,
     stripeCustomerId: row.stripe_customer_id,
+    provider: row.provider,
     providerSessionId: row.provider_session_id,
     providerSessionUrl: row.provider_session_url,
     providerPriceId: row.provider_price_id,
     providerSubscriptionId: row.provider_subscription_id,
+    providerExternalReference: row.provider_external_reference,
+    providerRawStatus: row.provider_raw_status,
+    providerStatusDetail: row.provider_status_detail,
     planType: row.plan_type,
     mode: row.mode,
     checkoutStatus: row.checkout_status,
@@ -99,6 +108,7 @@ function mapPaymentEvent(row: PaymentEventRow) {
   return {
     id: row.id,
     providerEventId: row.provider_event_id,
+    provider: row.provider,
     eventType: row.event_type,
     processingStatus: row.processing_status,
     errorMessage: row.error_message,
@@ -118,10 +128,14 @@ export async function listAdminPaymentLogs(c: AppContext, limit = 100) {
           cs.customer_id,
           cst.email,
           cst.stripe_customer_id,
+          cs.provider,
           cs.provider_session_id,
           cs.provider_session_url,
           cs.provider_price_id,
           cs.provider_subscription_id,
+          cs.provider_external_reference,
+          cs.provider_raw_status,
+          cs.provider_status_detail,
           cs.plan_type,
           cs.mode,
           cs.status AS checkout_status,
@@ -152,7 +166,6 @@ export async function listAdminPaymentLogs(c: AppContext, limit = 100) {
         LEFT JOIN payments p ON p.provider = cs.provider
           AND p.provider_checkout_session_id = cs.provider_session_id
         LEFT JOIN licenses l ON l.id = COALESCE(cs.license_id, p.license_id, cs.reactivation_license_id)
-        WHERE cs.provider = 'stripe'
         ORDER BY cs.id DESC, p.id DESC
         LIMIT ?
       `,
@@ -163,11 +176,10 @@ export async function listAdminPaymentLogs(c: AppContext, limit = 100) {
   const events = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, provider_event_id, event_type, processing_status, error_message, raw_created_at, processed_at, created_at
+        SELECT id, provider_event_id, provider, event_type, processing_status, error_message, raw_created_at, processed_at, created_at
         FROM payment_events
-        WHERE provider = 'stripe'
         ORDER BY id DESC
-        LIMIT 80
+        LIMIT 120
       `,
     )
     .all<PaymentEventRow>();
