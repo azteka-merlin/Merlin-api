@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
 
-export interface AppBindings extends Env {
+export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | "PIX_ENV" | "MERCADO_PAGO_API_BASE" | "MERCADO_PAGO_TEST_PAYER_EMAIL" | "STEAM_ACCOUNT_ID"> {
   SESSION_HASH_SECRET: string;
   RESEND_API_KEY: string;
   STRIPE_SECRET_KEY: string;
@@ -10,6 +10,15 @@ export interface AppBindings extends Env {
   STRIPE_LIFETIME_PRICE_ID?: string;
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_BILLING_PORTAL_CONFIGURATION_ID?: string;
+  PIX_ENABLED?: string;
+  PIX_PROVIDER?: string;
+  PIX_ENV?: string;
+  MERCADO_PAGO_ACCESS_TOKEN?: string;
+  MERCADO_PAGO_WEBHOOK_SECRET?: string;
+  MERCADO_PAGO_TEST_ACCESS_TOKEN?: string;
+  MERCADO_PAGO_TEST_WEBHOOK_SECRET?: string;
+  MERCADO_PAGO_TEST_PAYER_EMAIL?: string;
+  MERCADO_PAGO_API_BASE?: string;
   EMAIL_FROM?: string;
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
@@ -28,7 +37,7 @@ export const VersionResponse = z.object({
 	version: z.string(),
 });
 
-export const LicenseStatus = z.enum(["active", "revoked"]);
+export const LicenseStatus = z.enum(["active", "revoked", "expired"]);
 
 export const LoginRequest = z.object({
 	licenseKey: z

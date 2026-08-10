@@ -43,6 +43,13 @@ import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
 import { createPublicAccessBillingPortal, createPublicAccessUpgradeCheckout, getPublicAccessDetails, getPublicAccessUpgradeStatus } from "./lib/public-access-management";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
 import {
+  createPublicPixOrder,
+  getPublicPixOrderStatus,
+  isMercadoPagoPixAvailable,
+  parseAndVerifyMercadoPagoWebhook,
+  processMercadoPagoWebhookEvent,
+} from "./lib/mercadopago-pix";
+import {
   getPublicCheckoutStatus,
   getPublicCheckoutStatusByEmail,
   parseAndVerifyStripeWebhook,
@@ -102,7 +109,7 @@ app.use("*", async (c, next) => {
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
   const csp = isSwaggerRoute
     ? "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob: https://fastly.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-    : "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+    : "default-src 'self'; script-src 'self' https://www.mercadopago.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
   const headers = new Headers(c.res.headers);
   headers.set("Content-Security-Policy", csp);
@@ -168,6 +175,13 @@ async function handleStripeWebhook(c: AppContext) {
   const result = await processStripeWebhookEvent(c, event);
   return c.json({ received: true, ...result }, 200);
 }
+
+async function handleMercadoPagoWebhook(c: AppContext) {
+  const rawBody = await c.req.text();
+  const event = await parseAndVerifyMercadoPagoWebhook(c, rawBody);
+  const result = await processMercadoPagoWebhookEvent(c, event);
+  return c.json({ received: true, ...result }, 200);
+}
 const publicAccessKeyRecoverySchema = z.object({
   contact: z.string().trim().min(1),
   contactType: z.literal("email"),
@@ -182,6 +196,11 @@ const publicSignupSettingsSchema = z.object({
     billingEnabled: z.boolean(),
     monthlyEnabled: z.boolean(),
     lifetimeEnabled: z.boolean(),
+    pixEnabled: z.boolean().optional().default(false),
+    pixMonthlyEnabled: z.boolean().optional().default(true),
+    pixLifetimeEnabled: z.boolean().optional().default(true),
+    monthlyCardTrialEnabled: z.boolean().optional().default(false),
+    monthlyCardTrialDays: z.number().int().min(1).max(730).optional().default(30),
     monthlyPriceId: z.string().trim().optional().default(""),
     lifetimePriceId: z.string().trim().optional().default(""),
   }).optional(),
@@ -192,6 +211,12 @@ const publicCheckoutSchema = z.object({
   recoveryPin: recoverySecretSchema,
   acceptedRecoveryNotice: z.boolean(),
   planType: z.enum(["monthly", "lifetime"]),
+});
+const publicPixOrderSchema = publicCheckoutSchema.extend({
+  mercadoPagoDeviceId: z.string().trim().max(200).optional(),
+});
+const publicPixOrderStatusParamsSchema = z.object({
+  paymentIntentId: z.string().trim().min(1),
 });
 const publicCheckoutStatusQuerySchema = z.object({
   session_id: z.string().trim().min(1),
@@ -649,7 +674,7 @@ function parseBody<T>(schema: z.ZodSchema<T>, value: unknown) {
   return parsed.data;
 }
 
-function getPublicBillingPayload(billing: Awaited<ReturnType<typeof getBillingSettings>>) {
+function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<typeof getBillingSettings>>) {
   const mapPrice = (price: typeof billing.prices.monthly) => price
     ? {
         productName: price.productName,
@@ -662,10 +687,24 @@ function getPublicBillingPayload(billing: Awaited<ReturnType<typeof getBillingSe
       }
     : null;
 
+  const pixRuntimeAvailable = isMercadoPagoPixAvailable(c);
+  const pixMonthlyAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.monthlyEnabled && billing.pixMonthlyEnabled;
+  const pixLifetimeAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.lifetimeEnabled && billing.pixLifetimeEnabled;
+
   return {
     billingEnabled: billing.billingEnabled,
     monthlyEnabled: billing.monthlyEnabled,
     lifetimeEnabled: billing.lifetimeEnabled,
+    monthlyCardTrial: {
+      enabled: billing.monthlyCardTrialEnabled,
+      days: billing.monthlyCardTrialDays,
+    },
+    paymentMethods: {
+      card: true,
+      pix: pixMonthlyAvailable || pixLifetimeAvailable,
+      pixMonthly: pixMonthlyAvailable,
+      pixLifetime: pixLifetimeAvailable,
+    },
     prices: {
       monthly: mapPrice(billing.prices.monthly),
       lifetime: mapPrice(billing.prices.lifetime),
@@ -1486,7 +1525,7 @@ app.get("/api/public/access-keys/settings", async (c) => {
   return c.json({
     success: true,
     settings: { enabled: settings.enabled },
-    billing: getPublicBillingPayload(billing),
+    billing: getPublicBillingPayload(c, billing),
   }, 200);
 });
 
@@ -1496,7 +1535,7 @@ app.get("/api/billing/settings-public", async (c) => {
   return c.json({
     success: true,
     settings: { enabled: settings.enabled },
-    billing: getPublicBillingPayload(billing),
+    billing: getPublicBillingPayload(c, billing),
   }, 200);
 });
 
@@ -1516,6 +1555,30 @@ app.post("/api/public/checkout", async (c) => {
     }
     throw error;
   }
+});
+
+app.post("/api/public/pix/orders", async (c) => {
+  const body = parseBody(publicPixOrderSchema, await c.req.json());
+  try {
+    const result = await createPublicPixOrder(c, body);
+    return c.json({ success: true, ...result }, 201);
+  } catch (error) {
+    if (error instanceof HTTPException) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error || "Unknown Pix checkout error");
+    console.error("[public-pix:error]", { message });
+    if (c.env.ENVIRONMENT === "staging") {
+      return c.json({ success: false, error: `Pix debug: ${message}` }, 500);
+    }
+    throw error;
+  }
+});
+
+app.get("/api/public/pix/orders/:paymentIntentId/status", async (c) => {
+  const params = parseBody(publicPixOrderStatusParamsSchema, c.req.param());
+  const result = await getPublicPixOrderStatus(c, params.paymentIntentId);
+  return c.json({ success: true, ...result }, 200);
 });
 
 app.get("/api/public/checkout-status", async (c) => {
@@ -1561,6 +1624,7 @@ app.get("/api/public/access/upgrade-status", async (c) => {
 });
 
 app.on("POST", ["/api/stripe/webhook", "/payment/webhooks/stripe"], handleStripeWebhook);
+app.post("/api/webhooks/mercadopago", handleMercadoPagoWebhook);
 
 app.post("/api/public/access-keys/register", async (c) => {
   const body = parseBody(publicAccessKeySchema, await c.req.json());

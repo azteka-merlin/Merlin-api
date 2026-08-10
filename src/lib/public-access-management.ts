@@ -115,6 +115,24 @@ function mapPrice(price: BillingPriceSnapshot | null) {
   };
 }
 
+function trimEnv(value: unknown) {
+  return String(value || "").trim();
+}
+
+function isPixRuntimeAvailable(c: AppContext) {
+  const appEnvironment = trimEnv(c.env.ENVIRONMENT).toLowerCase();
+  const pixEnvironment = trimEnv(c.env.PIX_ENV).toLowerCase();
+  const runtimeMatches = (appEnvironment === "staging" && pixEnvironment === "test")
+    || (appEnvironment !== "staging" && pixEnvironment === "production");
+  const accessToken = appEnvironment === "staging"
+    ? trimEnv(c.env.MERCADO_PAGO_TEST_ACCESS_TOKEN)
+    : trimEnv(c.env.MERCADO_PAGO_ACCESS_TOKEN);
+  return trimEnv(c.env.PIX_ENABLED).toLowerCase() === "true"
+    && trimEnv(c.env.PIX_PROVIDER) === "mercadopago"
+    && runtimeMatches
+    && Boolean(accessToken);
+}
+
 function isCurrentLicense(license: LicenseAccessRow) {
   if (license.status !== "active") return false;
   const expiresAt = new Date(license.expires_at);
@@ -150,7 +168,7 @@ async function getVerifiedCurrentLicense(c: AppContext, input: { email: string; 
   await assertRecentPublicEmailVerification(c, emailNormalized);
 
   const license = await findLicenseByEmailContact(c, emailNormalized);
-  if (!license || !isCurrentLicense(license)) {
+  if (!license || license.status === "revoked") {
     return { emailNormalized, license: null };
   }
 
@@ -166,10 +184,11 @@ async function getVerifiedCurrentLicense(c: AppContext, input: { email: string; 
   return { emailNormalized, license };
 }
 
-async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow) {
+async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow, current: boolean) {
   const billing = await getBillingSettings(c);
   const price = billing.prices.lifetime;
   const available = accessKind(license) === "monthly"
+    && current
     && billing.billingEnabled
     && billing.lifetimeEnabled
     && Boolean(price?.active)
@@ -177,6 +196,7 @@ async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow) 
 
   let reason: string | null = null;
   if (accessKind(license) !== "monthly") reason = "not_monthly";
+  else if (!current) reason = "expired";
   else if (!billing.billingEnabled) reason = "billing_disabled";
   else if (!billing.lifetimeEnabled || !billing.lifetimePriceId || !price?.active) reason = "lifetime_unavailable";
 
@@ -187,8 +207,33 @@ async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow) 
   };
 }
 
-function mapAccessPayload(license: LicenseAccessRow, subscription: SubscriptionAccessRow | null, upgrade: Awaited<ReturnType<typeof getUpgradeAvailability>>) {
+async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, current: boolean) {
+  const billing = await getBillingSettings(c);
+  const price = billing.prices.monthly;
+  const monthlyAvailable = accessKind(license) === "monthly"
+    && !current
+    && billing.publicSignupEnabled
+    && billing.billingEnabled
+    && billing.monthlyEnabled
+    && Boolean(price?.active)
+    && Boolean(billing.monthlyPriceId);
+
+  return {
+    available: monthlyAvailable,
+    card: monthlyAvailable,
+    pix: monthlyAvailable && isPixRuntimeAvailable(c) && billing.pixEnabled && billing.pixMonthlyEnabled,
+    price: monthlyAvailable ? mapPrice(price) : null,
+  };
+}
+
+function mapAccessPayload(
+  license: LicenseAccessRow,
+  subscription: SubscriptionAccessRow | null,
+  upgrade: Awaited<ReturnType<typeof getUpgradeAvailability>>,
+  renewal: Awaited<ReturnType<typeof getRenewalAvailability>>,
+) {
   const kind = accessKind(license);
+  const current = isCurrentLicense(license);
   const cancelAtPeriodEnd = Boolean(license.billing_cancel_at_period_end || subscription?.cancel_at_period_end);
   const currentPeriodEnd = license.billing_current_period_end || subscription?.current_period_end || null;
   return {
@@ -196,6 +241,7 @@ function mapAccessPayload(license: LicenseAccessRow, subscription: SubscriptionA
     access: {
       kind,
       name: license.name,
+      current,
       accessType: license.access_type || "free",
       billingStatus: license.billing_status || "none",
       expiresAt: toDateOnly(license.expires_at),
@@ -203,9 +249,10 @@ function mapAccessPayload(license: LicenseAccessRow, subscription: SubscriptionA
         status: subscription?.status || license.billing_status || "active",
         currentPeriodEnd: toDateOnly(currentPeriodEnd),
         cancelAtPeriodEnd,
-        canManage: Boolean(license.stripe_customer_id && license.stripe_subscription_id),
+        canManage: current && Boolean(license.stripe_customer_id && license.stripe_subscription_id),
       } : null,
       upgrade,
+      renewal,
     },
   };
 }
@@ -216,8 +263,10 @@ export async function getPublicAccessDetails(c: AppContext, input: { email: stri
     return { status: "not_found" as const };
   }
   const subscription = await getSubscription(c, license);
-  const upgrade = await getUpgradeAvailability(c, license);
-  return mapAccessPayload(license, subscription, upgrade);
+  const current = isCurrentLicense(license);
+  const upgrade = await getUpgradeAvailability(c, license, current);
+  const renewal = await getRenewalAvailability(c, license, current);
+  return mapAccessPayload(license, subscription, upgrade, renewal);
 }
 
 async function findReusableUpgradeCheckout(c: AppContext, licenseId: number) {
@@ -354,9 +403,10 @@ export async function createPublicAccessUpgradeCheckout(c: AppContext, input: { 
           operation_type,
           upgrade_license_id,
           upgrade_subscription_id,
-          created_at
+          created_at,
+          updated_at
         )
-        VALUES (?, ?, ?, ?, 'lifetime', 'payment', ?, 'unpaid', ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, 'lifetime', 'payment', ?, 'unpaid', ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
     .bind(
@@ -372,6 +422,7 @@ export async function createPublicAccessUpgradeCheckout(c: AppContext, input: { 
       license.id,
       license.stripe_subscription_id,
       now,
+      now,
     )
     .run();
 
@@ -380,7 +431,7 @@ export async function createPublicAccessUpgradeCheckout(c: AppContext, input: { 
 
 export async function createPublicAccessBillingPortal(c: AppContext, input: { email: string; recoveryPin: string }) {
   const { license } = await getVerifiedCurrentLicense(c, input);
-  if (!license) {
+  if (!license || !isCurrentLicense(license)) {
     throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
   }
   if (accessKind(license) !== "monthly" || !license.stripe_customer_id || !license.stripe_subscription_id) {

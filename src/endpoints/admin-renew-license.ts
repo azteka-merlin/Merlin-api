@@ -3,6 +3,7 @@ import {
 	getLicenseById,
 	mapLicenseResponse,
 	requireAdminToken,
+	resolveLicenseStatus,
 	toIsoDateStart,
 } from "../lib/licenses";
 import { enforceAdminRateLimit } from "../lib/rate-limit";
@@ -62,16 +63,18 @@ export class AdminRenewLicenseRoute extends OpenAPIRoute {
 
 		const data = await this.getValidatedData<typeof this.schema>();
 		await getLicenseById(c, data.params.id);
+		const expiresAt = toIsoDateStart(data.body.expiresAt);
+		const status = resolveLicenseStatus({ status: "active", expires_at: expiresAt });
 
 		await c.env.merlin_db
 			.prepare(
 				`
 					UPDATE licenses
-					SET expires_at = ?, status = 'active', revoked_reason = NULL, updated_at = ?
+					SET expires_at = ?, status = ?, revoked_reason = NULL, updated_at = ?
 					WHERE id = ?
 				`,
 			)
-			.bind(toIsoDateStart(data.body.expiresAt), new Date().toISOString(), data.params.id)
+			.bind(expiresAt, status, new Date().toISOString(), data.params.id)
 			.run();
 
 		const renewed = await getLicenseById(c, data.params.id);

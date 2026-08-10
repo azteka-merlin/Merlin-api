@@ -35,6 +35,7 @@ type CheckoutRow = {
   pending_name: string | null;
   pending_recovery_pin_hash: string | null;
   pending_recovery_notice_accepted_at: string | null;
+  checkout_evidence_json: string | null;
 };
 
 type CustomerRow = {
@@ -303,13 +304,35 @@ function oneMonthFromNowIso() {
   return next.toISOString();
 }
 
+function daysFromNowIso(days: number) {
+  const next = new Date();
+  next.setUTCDate(next.getUTCDate() + days);
+  return next.toISOString();
+}
+
+function getCheckoutCardTrialDays(checkout: CheckoutRow) {
+  if (!checkout.checkout_evidence_json) {
+    return null;
+  }
+  try {
+    const evidence = JSON.parse(checkout.checkout_evidence_json) as { cardTrialDays?: unknown };
+    const value = Number(evidence.cardTrialDays);
+    if (!Number.isFinite(value) || value <= 0) {
+      return null;
+    }
+    return Math.min(730, Math.max(1, Math.floor(value)));
+  } catch {
+    return null;
+  }
+}
+
 async function getCheckoutBySessionId(c: AppContext, sessionId: string) {
   return c.env.merlin_db
     .prepare(
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_session_id = ?
@@ -326,7 +349,7 @@ async function getCheckoutBySubscriptionId(c: AppContext, subscriptionId: string
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_subscription_id = ?
@@ -344,7 +367,7 @@ async function getLatestCheckoutByEmail(c: AppContext, emailNormalized: string) 
       `
         SELECT cs.id, cs.customer_id, cs.provider_session_id, cs.provider_price_id, cs.provider_subscription_id, cs.plan_type, cs.mode, cs.status, cs.payment_status, cs.license_id, cs.reactivation_license_id,
           cs.operation_type, cs.upgrade_license_id, cs.upgrade_subscription_id, cs.upgrade_processed_at,
-          cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at
+          cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at, cs.checkout_evidence_json
         FROM checkout_sessions cs
         JOIN customers cst ON cst.id = cs.customer_id
         WHERE cs.provider = ?
@@ -412,6 +435,7 @@ async function activateLicenseFromCheckout(
     subscriptionId: string | null;
     currentPeriodEnd: string | null;
     cancelAtPeriodEnd?: boolean;
+    checkoutPaymentStatus?: string;
   },
 ) {
   if (checkout.license_id) {
@@ -442,6 +466,7 @@ async function activateLicenseFromCheckout(
           SET name = ?,
               recovery_pin_hash = ?,
               recovery_notice_accepted_at = ?,
+              hwid = NULL,
               expires_at = ?,
               status = 'active',
               revoked_reason = NULL,
@@ -482,11 +507,11 @@ async function activateLicenseFromCheckout(
       .prepare(
         `
           UPDATE checkout_sessions
-          SET license_id = ?, status = 'completed', completed_at = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), payment_status = 'paid'
+          SET license_id = ?, status = 'completed', completed_at = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), payment_status = ?, updated_at = ?
           WHERE id = ?
         `,
       )
-      .bind(existing.id, now, input.subscriptionId, checkout.id)
+      .bind(existing.id, now, input.subscriptionId, input.checkoutPaymentStatus || "paid", now, checkout.id)
       .run();
 
     const updated = await getLicenseById(c, existing.id);
@@ -558,11 +583,11 @@ async function activateLicenseFromCheckout(
     .prepare(
       `
         UPDATE checkout_sessions
-        SET license_id = ?, status = 'completed', completed_at = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), payment_status = 'paid'
+        SET license_id = ?, status = 'completed', completed_at = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), payment_status = ?, updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(createdId, now, input.subscriptionId, checkout.id)
+    .bind(createdId, now, input.subscriptionId, input.checkoutPaymentStatus || "paid", now, checkout.id)
     .run();
 
   const license = await getLicenseById(c, createdId);
@@ -757,11 +782,12 @@ async function handleLifetimeUpgradeCheckoutCompleted(c: AppContext, checkout: C
             status = 'completed',
             payment_status = 'paid',
             completed_at = COALESCE(completed_at, ?),
-            upgrade_processed_at = COALESCE(upgrade_processed_at, ?)
+            upgrade_processed_at = COALESCE(upgrade_processed_at, ?),
+            updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(license.id, now, now, checkout.id)
+    .bind(license.id, now, now, now, checkout.id)
     .run();
 
   await savePayment(c, {
@@ -779,8 +805,8 @@ async function handleLifetimeUpgradeCheckoutCompleted(c: AppContext, checkout: C
   try {
     await cancelCustomerSubscriptionsAtPeriodEnd(c, checkout.customer_id);
     await c.env.merlin_db
-      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = NULL WHERE id = ?`)
-      .bind(checkout.id)
+      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = NULL, updated_at = ? WHERE id = ?`)
+      .bind(new Date().toISOString(), checkout.id)
       .run();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || "Unknown Stripe cancellation error");
@@ -790,8 +816,8 @@ async function handleLifetimeUpgradeCheckoutCompleted(c: AppContext, checkout: C
       message,
     });
     await c.env.merlin_db
-      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = ? WHERE id = ?`)
-      .bind(message.slice(0, 500), checkout.id)
+      .prepare(`UPDATE checkout_sessions SET upgrade_cancel_error = ?, updated_at = ? WHERE id = ?`)
+      .bind(message.slice(0, 500), new Date().toISOString(), checkout.id)
       .run();
   }
 }
@@ -813,11 +839,11 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
     .prepare(
       `
         UPDATE checkout_sessions
-        SET status = ?, payment_status = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), completed_at = COALESCE(completed_at, ?)
+        SET status = ?, payment_status = ?, provider_subscription_id = COALESCE(?, provider_subscription_id), completed_at = COALESCE(completed_at, ?), updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(getString(session.status) || "complete", paymentStatus, subscriptionId, new Date().toISOString(), checkout.id)
+    .bind(getString(session.status) || "complete", paymentStatus, subscriptionId, new Date().toISOString(), new Date().toISOString(), checkout.id)
     .run();
 
   if (checkout.operation_type === UPGRADE_OPERATION) {
@@ -850,8 +876,15 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
     await cancelCustomerSubscriptionsAtPeriodEnd(c, checkout.customer_id);
   }
 
-  if (checkout.plan_type === "monthly" && paymentStatus === "paid") {
-    const periodEnd = oneMonthFromNowIso();
+  if (checkout.plan_type === "monthly") {
+    const cardTrialDays = getCheckoutCardTrialDays(checkout);
+    const isPaid = paymentStatus === "paid";
+    const isTrialCheckout = !isPaid && Boolean(subscriptionId) && Boolean(cardTrialDays);
+    if (!isPaid && !isTrialCheckout) {
+      return;
+    }
+    const periodEnd = isTrialCheckout ? daysFromNowIso(cardTrialDays || 30) : oneMonthFromNowIso();
+    const checkoutPaymentStatus = isTrialCheckout ? "trialing" : "paid";
     const license = await activateLicenseFromCheckout(c, checkout, {
       accessType: "monthly_subscription",
       billingStatus: "active",
@@ -859,6 +892,7 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
       stripeCustomerId,
       subscriptionId,
       currentPeriodEnd: periodEnd,
+      checkoutPaymentStatus,
     });
     await configureStripeSubscriptionForRenewals(c, subscriptionId);
     if (subscriptionId) {
@@ -866,7 +900,7 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
         customerId: checkout.customer_id,
         licenseId: license.id,
         subscriptionId,
-        status: "active",
+        status: isTrialCheckout ? "trialing" : "active",
         currentPeriodEnd: periodEnd,
         cancelAtPeriodEnd: false,
       });
@@ -886,13 +920,14 @@ async function handleCheckoutExpired(c: AppContext, session: Record<string, unkn
         UPDATE checkout_sessions
         SET status = 'expired',
             payment_status = COALESCE(?, payment_status),
-            provider_session_expires_at = COALESCE(?, provider_session_expires_at)
+            provider_session_expires_at = COALESCE(?, provider_session_expires_at),
+            updated_at = ?
         WHERE provider = ?
           AND provider_session_id = ?
           AND license_id IS NULL
       `,
     )
-    .bind(getString(session.payment_status) || "unpaid", unixToIso(session.expires_at), PROVIDER_STRIPE, sessionId)
+    .bind(getString(session.payment_status) || "unpaid", unixToIso(session.expires_at), new Date().toISOString(), PROVIDER_STRIPE, sessionId)
     .run();
 }
 

@@ -3,18 +3,20 @@ import type { AppContext } from "../types";
 
 const LICENSE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+export type LicenseStatusValue = "active" | "revoked" | "expired";
+
 export type LicenseRecord = {
 	id: number;
 	license_key: string;
 	name: string;
 	contact: string;
 	contact_type: "phone" | "email" | "discord";
-	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe";
+	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe" | "mercadopago_pix";
 	recovery_pin_hash: string | null;
 	recovery_notice_accepted_at: string | null;
 	hwid: string | null;
 	expires_at: string;
-	status: "active" | "revoked";
+	status: LicenseStatusValue;
 	revoked_reason: string | null;
 	revoked_origin?: string | null;
 	revoked_event_id?: string | null;
@@ -73,6 +75,21 @@ export function toDateOnly(value: string): string {
 	return value.slice(0, 10);
 }
 
+export function isLicenseDateExpired(expiresAt: string, now = new Date()): boolean {
+	const date = new Date(expiresAt);
+	return Number.isFinite(date.getTime()) && date.getTime() < now.getTime();
+}
+
+export function resolveLicenseStatus(record: Pick<LicenseRecord, "status" | "expires_at">): LicenseStatusValue {
+	if (record.status === "revoked") {
+		return "revoked";
+	}
+	if (isLicenseDateExpired(record.expires_at)) {
+		return "expired";
+	}
+	return "active";
+}
+
 export function mapLicenseResponse(record: LicenseRecord) {
 	return {
 		id: record.id,
@@ -86,7 +103,7 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		phone: record.contact,
 		hwid: record.hwid,
 		expiresAt: toDateOnly(record.expires_at),
-		status: record.status,
+		status: resolveLicenseStatus(record),
 		revokedReason: record.revoked_reason,
 		revokedOrigin: record.revoked_origin || null,
 		revokedEventId: record.revoked_event_id || null,

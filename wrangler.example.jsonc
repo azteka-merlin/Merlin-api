@@ -25,6 +25,16 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"vars": {
+		"ENVIRONMENT": "production",
+		"PIX_ENABLED": "false",
+		"PIX_PROVIDER": "mercadopago",
+		"PIX_ENV": "production",
+		"MERCADO_PAGO_API_BASE": "https://api.mercadopago.com",
+		"MERLIN_WORKER_URL": "http://worker.example.com:8080",
+		"RYU_API_URL": "https://example.com/secure_download",
+		"STEAM_ACCOUNT_ID": "7656119..."
+	},
 	"assets": {
 		"directory": "../merlin-admin/dist",
 		"binding": "ASSETS",
@@ -120,7 +130,15 @@
 		"staging": {
 			"name": "your-merlin-api-worker-stage",
 			"vars": {
-				"ENVIRONMENT": "staging"
+				"ENVIRONMENT": "staging",
+				"PIX_ENABLED": "false",
+				"PIX_PROVIDER": "mercadopago",
+				"PIX_ENV": "test",
+				"MERCADO_PAGO_API_BASE": "https://api.mercadopago.com",
+				"MERCADO_PAGO_TEST_PAYER_EMAIL": "test_user_br@testuser.com",
+				"MERLIN_WORKER_URL": "http://worker.example.com:8080",
+				"RYU_API_URL": "https://example.com/secure_download",
+				"STEAM_ACCOUNT_ID": "7656119..."
 			},
 			"secrets": {
 				"required": [

@@ -73,12 +73,12 @@ export class AdminListLicensesRoute extends OpenAPIRoute {
 				name: string;
 				contact: string;
 				contact_type: "phone" | "email" | "discord";
-				source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe";
+				source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe" | "mercadopago_pix";
 				recovery_pin_hash: string | null;
 				recovery_notice_accepted_at: string | null;
 				hwid: string | null;
 				expires_at: string;
-				status: "active" | "revoked";
+				status: "active" | "revoked" | "expired";
 				revoked_reason: string | null;
 				revoked_origin: string | null;
 				revoked_event_id: string | null;

@@ -130,6 +130,7 @@ function buildCheckoutEvidence(input: {
   currency: string;
   acceptedRecoveryNoticeAt: string;
   billingEnabledAtCheckout: boolean;
+  cardTrialDays?: number | null;
 }) {
   return JSON.stringify({
     emailVerifiedAt: input.emailVerifiedAt,
@@ -139,6 +140,7 @@ function buildCheckoutEvidence(input: {
     currency: input.currency,
     acceptedRecoveryNoticeAt: input.acceptedRecoveryNoticeAt,
     billingEnabledAtCheckout: input.billingEnabledAtCheckout,
+    cardTrialDays: input.cardTrialDays || null,
   });
 }
 
@@ -267,12 +269,14 @@ async function findPendingCheckout(c: AppContext, customerId: number) {
 }
 
 async function expireStaleOpenCheckouts(c: AppContext, customerId: number) {
+  const now = new Date().toISOString();
   await c.env.merlin_db
     .prepare(
       `
         UPDATE checkout_sessions
         SET status = 'expired',
-            payment_status = COALESCE(payment_status, 'expired')
+            payment_status = COALESCE(payment_status, 'expired'),
+            updated_at = ?
         WHERE customer_id = ?
           AND provider = ?
           AND license_id IS NULL
@@ -281,7 +285,7 @@ async function expireStaleOpenCheckouts(c: AppContext, customerId: number) {
           AND provider_session_expires_at <= ?
       `,
     )
-    .bind(customerId, PROVIDER_STRIPE, new Date().toISOString())
+    .bind(now, customerId, PROVIDER_STRIPE, now)
     .run();
 }
 
@@ -317,7 +321,7 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
   if (existingLicense.billing_status === "dispute_open") {
     return false;
   }
-  if (existingLicense.status === "active") {
+  if (existingLicense.status === "active" || existingLicense.status === "expired") {
     const expiresAt = new Date(existingLicense.expires_at);
     return Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() < Date.now();
   }
@@ -364,6 +368,7 @@ async function createStripeCheckoutSession(
     planType: BillingPlanType;
     priceId: string;
     idempotencyKey: string;
+    trialDays?: number | null;
   },
 ) {
   const origin = requestOrigin(c);
@@ -382,6 +387,9 @@ async function createStripeCheckoutSession(
   params.set("metadata[plan_type]", input.planType);
   params.set("metadata[email]", input.email);
   if (input.planType === "monthly") {
+    if (input.trialDays) {
+      params.set("subscription_data[trial_period_days]", String(input.trialDays));
+    }
     params.set("subscription_data[metadata][merlin_customer_id]", String(input.customerId));
     params.set("subscription_data[metadata][plan_type]", input.planType);
     params.set("subscription_data[metadata][email]", input.email);
@@ -496,6 +504,9 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   });
   const licenseKey = reactivationLicenseId ? existingLicense?.license_key || "" : generateLicenseKey();
   const recoveryPinHash = await hashRecoveryPin(c, { licenseKey, recoveryPin });
+  const cardTrialDays = input.planType === "monthly" && !reactivationLicenseId && billing.monthlyCardTrialEnabled
+    ? billing.monthlyCardTrialDays
+    : null;
   const session = await createStripeCheckoutSession(c, {
     customerId: customer.id,
     stripeCustomerId,
@@ -503,6 +514,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     planType: input.planType,
     priceId,
     idempotencyKey,
+    trialDays: cardTrialDays,
   });
   const expiresAt = stripeTimestampToIso(session.expires_at);
   const checkoutIp = getClientIp(c);
@@ -516,6 +528,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     currency: price.currency,
     acceptedRecoveryNoticeAt: now,
     billingEnabledAtCheckout: true,
+    cardTrialDays,
   });
 
   try {
@@ -543,9 +556,10 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
             checkout_country,
             checkout_evidence_json,
             idempotency_key,
-            created_at
+            created_at,
+            updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .bind(
@@ -569,6 +583,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
         checkoutCountry,
         checkoutEvidence,
         idempotencyKey,
+        now,
         now,
       )
       .run();

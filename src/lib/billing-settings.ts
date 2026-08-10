@@ -14,6 +14,11 @@ type BillingSettingsRow = {
   public_signup_enabled: number;
   monthly_enabled: number;
   lifetime_enabled: number;
+  pix_enabled: number;
+  pix_monthly_enabled: number;
+  pix_lifetime_enabled: number;
+  monthly_card_trial_enabled: number;
+  monthly_card_trial_days: number;
   monthly_price_id: string | null;
   lifetime_price_id: string | null;
   currency: string;
@@ -61,6 +66,11 @@ export type BillingSettingsPayload = {
   publicSignupEnabled: boolean;
   monthlyEnabled: boolean;
   lifetimeEnabled: boolean;
+  pixEnabled: boolean;
+  pixMonthlyEnabled: boolean;
+  pixLifetimeEnabled: boolean;
+  monthlyCardTrialEnabled: boolean;
+  monthlyCardTrialDays: number;
   monthlyPriceId: string;
   lifetimePriceId: string;
   currency: string;
@@ -77,12 +87,25 @@ export type BillingSettingsInput = {
   billingEnabled: boolean;
   monthlyEnabled: boolean;
   lifetimeEnabled: boolean;
+  pixEnabled?: boolean;
+  pixMonthlyEnabled?: boolean;
+  pixLifetimeEnabled?: boolean;
+  monthlyCardTrialEnabled?: boolean;
+  monthlyCardTrialDays?: number;
   monthlyPriceId?: string;
   lifetimePriceId?: string;
 };
 
 function normalizePriceId(value: string | undefined | null) {
   return String(value || "").trim();
+}
+
+function normalizeTrialDays(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 30;
+  }
+  return Math.min(730, Math.max(1, Math.floor(parsed)));
 }
 
 function isPriceCacheFresh(syncedAt: string) {
@@ -260,6 +283,11 @@ function mapBillingSettings(c: AppContext, row: BillingSettingsRow, prices: Bill
     publicSignupEnabled: row.public_signup_enabled === 1,
     monthlyEnabled: row.monthly_enabled === 1,
     lifetimeEnabled: row.lifetime_enabled === 1,
+    pixEnabled: row.pix_enabled === 1,
+    pixMonthlyEnabled: row.pix_monthly_enabled === 1,
+    pixLifetimeEnabled: row.pix_lifetime_enabled === 1,
+    monthlyCardTrialEnabled: row.monthly_card_trial_enabled === 1,
+    monthlyCardTrialDays: normalizeTrialDays(row.monthly_card_trial_days),
     monthlyPriceId,
     lifetimePriceId,
     currency: row.currency || "brl",
@@ -275,7 +303,13 @@ export async function getBillingSettings(c: AppContext) {
   let row = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled, monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+        SELECT id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
+          COALESCE(pix_enabled, 0) AS pix_enabled,
+          COALESCE(pix_monthly_enabled, 1) AS pix_monthly_enabled,
+          COALESCE(pix_lifetime_enabled, 1) AS pix_lifetime_enabled,
+          COALESCE(monthly_card_trial_enabled, 0) AS monthly_card_trial_enabled,
+          COALESCE(monthly_card_trial_days, 30) AS monthly_card_trial_days,
+          monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         FROM billing_settings
         WHERE id = 1
       `,
@@ -286,8 +320,11 @@ export async function getBillingSettings(c: AppContext) {
     await c.env.merlin_db
       .prepare(
         `
-          INSERT INTO billing_settings (id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled, currency, free_access_type, updated_at)
-          VALUES (1, 0, 1, 1, 1, 'brl', 'free', ?)
+          INSERT INTO billing_settings (
+            id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
+            pix_enabled, pix_monthly_enabled, pix_lifetime_enabled, monthly_card_trial_enabled, monthly_card_trial_days, currency, free_access_type, updated_at
+          )
+          VALUES (1, 0, 1, 1, 1, 0, 1, 1, 0, 30, 'brl', 'free', ?)
         `,
       )
       .bind(now)
@@ -298,6 +335,11 @@ export async function getBillingSettings(c: AppContext) {
       public_signup_enabled: 1,
       monthly_enabled: 1,
       lifetime_enabled: 1,
+      pix_enabled: 0,
+      pix_monthly_enabled: 1,
+      pix_lifetime_enabled: 1,
+      monthly_card_trial_enabled: 0,
+      monthly_card_trial_days: 30,
       monthly_price_id: null,
       lifetime_price_id: null,
       currency: "brl",
@@ -320,6 +362,7 @@ export async function getBillingSettings(c: AppContext) {
 export async function updateBillingSettings(c: AppContext, input: BillingSettingsInput & { publicSignupEnabled: boolean }) {
   const monthlyPriceId = normalizePriceId(input.monthlyPriceId);
   const lifetimePriceId = normalizePriceId(input.lifetimePriceId);
+  const monthlyCardTrialDays = normalizeTrialDays(input.monthlyCardTrialDays);
 
   if (input.billingEnabled && !input.monthlyEnabled && !input.lifetimeEnabled) {
     throw new HTTPException(400, { message: "Ative pelo menos um plano para exigir pagamento." });
@@ -344,14 +387,22 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
     .prepare(
       `
         INSERT INTO billing_settings (
-          id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled, monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+          id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
+          pix_enabled, pix_monthly_enabled, pix_lifetime_enabled,
+          monthly_card_trial_enabled, monthly_card_trial_days,
+          monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           billing_enabled = excluded.billing_enabled,
           public_signup_enabled = excluded.public_signup_enabled,
           monthly_enabled = excluded.monthly_enabled,
           lifetime_enabled = excluded.lifetime_enabled,
+          pix_enabled = excluded.pix_enabled,
+          pix_monthly_enabled = excluded.pix_monthly_enabled,
+          pix_lifetime_enabled = excluded.pix_lifetime_enabled,
+          monthly_card_trial_enabled = excluded.monthly_card_trial_enabled,
+          monthly_card_trial_days = excluded.monthly_card_trial_days,
           monthly_price_id = excluded.monthly_price_id,
           lifetime_price_id = excluded.lifetime_price_id,
           currency = excluded.currency,
@@ -365,6 +416,11 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
       input.publicSignupEnabled ? 1 : 0,
       input.monthlyEnabled ? 1 : 0,
       input.lifetimeEnabled ? 1 : 0,
+      input.pixEnabled ? 1 : 0,
+      input.pixMonthlyEnabled !== false ? 1 : 0,
+      input.pixLifetimeEnabled !== false ? 1 : 0,
+      input.monthlyCardTrialEnabled ? 1 : 0,
+      monthlyCardTrialDays,
       monthlyPriceId || null,
       lifetimePriceId || null,
       now,

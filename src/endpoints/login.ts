@@ -22,7 +22,7 @@ type LicenseRecord = {
 	contact: string;
 	hwid: string | null;
 	expires_at: string;
-	status: "active" | "revoked";
+	status: "active" | "revoked" | "expired";
 	access_type: string | null;
 	billing_status: string | null;
 	stripe_subscription_id: string | null;
