@@ -15,7 +15,7 @@ type LegacyRecoveryPinHashInput = {
 
 const RECOVERY_SECRET_PATTERN = /^\S{4,8}$/;
 
-export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 caracteres, sem espacos. PINs numericos antigos continuam funcionando.";
+export const RECOVERY_SECRET_DESCRIPTION = "Use 4 a 8 caracteres, sem espacos.";
 
 export function isValidRecoverySecret(value: string) {
 	return RECOVERY_SECRET_PATTERN.test(value);

@@ -30,7 +30,7 @@ function renderAccessKeyEmail(input: AccessKeyEmailInput & { mode: "welcome" | "
 		? `Olá, ${name}. Sua chave de acesso foi criada com sucesso. Guarde-a em um lugar seguro para entrar no Merlin sempre que precisar.`
 		: "Recebemos uma solicitação para recuperar sua chave de acesso. Use a chave abaixo para abrir o Merlin e continuar de onde parou.";
 	const footer = input.mode === "welcome"
-		? "Seu PIN de recuperação foi definido no cadastro. Por segurança, ele não é exibido neste e-mail."
+		? "Sua senha de recuperação foi definida no cadastro. Por segurança, ela não é exibida neste e-mail."
 		: "Se você não solicitou essa recuperação, entre em contato com o suporte Merlin para revisar o acesso da sua chave.";
 
 	return {

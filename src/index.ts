@@ -149,7 +149,7 @@ const adminLoginSchema = z.object({
   rememberMe: z.boolean().optional().default(false),
 });
 const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
-  message: "Use 4 a 8 caracteres, sem espacos. PINs numericos antigos continuam funcionando.",
+  message: "Use 4 a 8 caracteres, sem espacos.",
 });
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
