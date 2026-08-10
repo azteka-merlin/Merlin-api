@@ -102,6 +102,13 @@ import {
   registerPublicAccessKey,
   updatePublicSignupSettings,
 } from "./lib/public-access-keys";
+import {
+  createPublicFeedbackImage,
+  deletePublicFeedbackImage,
+  getPublicFeedbackImageObject,
+  listPublicFeedbackImages,
+  updatePublicFeedbackImage,
+} from "./lib/public-feedbacks";
 
 const app = new Hono<{ Bindings: AppBindings }>();
 
@@ -142,7 +149,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup"] as const;
+const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -335,6 +342,11 @@ const pollVoteSchema = z.object({
   optionId: z.number().int().positive().nullable().optional(),
   contributionOptionId: z.number().int().positive().nullable().optional(),
   contributionSkipped: z.boolean().nullable().optional(),
+});
+const publicFeedbackUpdateSchema = z.object({
+  title: z.string().trim().min(1).max(120).optional(),
+  sortOrder: z.number().int().min(0).max(10000).optional(),
+  enabled: z.boolean().optional(),
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -1607,6 +1619,22 @@ app.post("/api/public/billing-portal", async (c) => {
   return c.json({ success: true, ...result }, 200);
 });
 
+app.get("/api/public/feedbacks", async (c) => {
+  const feedbacks = await listPublicFeedbackImages(c);
+  return c.json({ success: true, feedbacks }, 200);
+});
+
+app.get("/api/public/feedbacks/:id/image", async (c) => {
+  const id = Number(c.req.param("id"));
+  const { row, object } = await getPublicFeedbackImageObject(c, id);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-type", row.content_type);
+  headers.set("cache-control", "public, max-age=3600");
+  headers.set("etag", object.httpEtag);
+  return new Response(object.body, { headers });
+});
+
 app.post("/api/public/access/me", async (c) => {
   const body = parseBody(publicAccessMeSchema, await c.req.json());
   const result = await getPublicAccessDetails(c, body);
@@ -1685,6 +1713,41 @@ app.put("/panel-api/public-signup", async (c) => {
     : await getBillingSettings(c);
   const metrics = await getPublicSignupMetrics(c);
   return c.json({ settings: getPublicSignupSettingsPayload(settings), billing, metrics }, 200);
+});
+
+app.get("/panel-api/public-feedbacks", async (c) => {
+  await requireAdminSession(c);
+  const feedbacks = await listPublicFeedbackImages(c, { includeDisabled: true });
+  return c.json({ success: true, feedbacks }, 200);
+});
+
+app.post("/panel-api/public-feedbacks", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  if (!(file instanceof File)) {
+    throw new HTTPException(400, { message: "Selecione uma imagem de feedback." });
+  }
+
+  const feedback = await createPublicFeedbackImage(c, file, {
+    title: String(formData.get("title") || ""),
+    sortOrder: Number(formData.get("sortOrder") || "0"),
+    enabled: String(formData.get("enabled") || "true") !== "false",
+  });
+  return c.json({ success: true, feedback }, 201);
+});
+
+app.put("/panel-api/public-feedbacks/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(publicFeedbackUpdateSchema, await c.req.json());
+  const feedback = await updatePublicFeedbackImage(c, Number(c.req.param("id")), body);
+  return c.json({ success: true, feedback }, 200);
+});
+
+app.delete("/panel-api/public-feedbacks/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const result = await deletePublicFeedbackImage(c, Number(c.req.param("id")));
+  return c.json(result, 200);
 });
 
 app.get("/panel-api/payments", async (c) => {
