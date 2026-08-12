@@ -690,6 +690,58 @@ async function servePanelApp(c: any) {
   });
 }
 
+function isPagePreviewCrawler(c: any) {
+  const cf = c.req.raw.cf as { verifiedBotCategory?: string } | undefined;
+  const userAgent = String(c.req.header("user-agent") || "").toLowerCase();
+  return cf?.verifiedBotCategory === "Page Preview"
+    || userAgent.includes("facebookexternalhit")
+    || userAgent.includes("facebot");
+}
+
+function serveRootPagePreview(c: any) {
+  const origin = new URL(c.req.url).origin;
+  const downloadUrl = `${origin}/download`;
+  const title = "Merlin - Seu próximo jogo começa aqui";
+  const description = "Acesse uma biblioteca com grandes jogos e lançamentos através do launcher do Merlin.";
+  const imageUrl = `${origin}/download-assets/assets/branding/merlin-hero-official.png`;
+  const html = `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${title}</title>
+    <meta name="description" content="${description}">
+    <link rel="canonical" href="${downloadUrl}">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="${downloadUrl}">
+    <meta property="og:title" content="${title}">
+    <meta property="og:description" content="${description}">
+    <meta property="og:image" content="${imageUrl}">
+    <meta property="og:image:alt" content="Merlin">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="${title}">
+    <meta name="twitter:description" content="${description}">
+    <meta name="twitter:image" content="${imageUrl}">
+  </head>
+  <body>
+    <main>
+      <h1>${title}</h1>
+      <p>${description}</p>
+      <p><a href="${downloadUrl}">Abrir o Merlin</a></p>
+    </main>
+  </body>
+</html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
 function sessionPayload(sessionResult: AuthSessionResult | null) {
   if (!sessionResult) {
     return null;
@@ -981,6 +1033,9 @@ app.get("/login", async (c) => {
 });
 
 app.get("/", (c) => {
+  if (isPagePreviewCrawler(c)) {
+    return serveRootPagePreview(c);
+  }
   return c.redirect("/download", 302);
 });
 
