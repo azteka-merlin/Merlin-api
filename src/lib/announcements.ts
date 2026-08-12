@@ -23,6 +23,10 @@ type AnnouncementRow = {
   image_fit: AnnouncementImageFit;
   image_position_x: number;
   image_position_y: number;
+  image_crop_x: number | null;
+  image_crop_y: number | null;
+  image_crop_width: number | null;
+  image_crop_height: number | null;
   active: number;
   starts_at: string | null;
   ends_at: string | null;
@@ -60,6 +64,10 @@ export type AnnouncementInput = {
   imageFit?: string | null;
   imagePositionX?: number | string | null;
   imagePositionY?: number | string | null;
+  imageCropX?: number | string | null;
+  imageCropY?: number | string | null;
+  imageCropWidth?: number | string | null;
+  imageCropHeight?: number | string | null;
 };
 
 function normalizeId(value: string | number, label = "announcement id") {
@@ -107,6 +115,13 @@ function normalizePercent(value: number | string | null | undefined) {
   return Math.min(100, Math.max(0, Math.round(numberValue)));
 }
 
+function normalizeOptionalCropPercent(value: number | string | null | undefined) {
+  if (value === null || value === undefined || value === "") return null;
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return null;
+  return Math.min(100, Math.max(0, Number(numberValue.toFixed(4))));
+}
+
 function normalizeImageFile(file: File) {
   const contentType = String(file.type || "").toLowerCase();
   if (!ALLOWED_IMAGE_TYPES.has(contentType)) {
@@ -132,9 +147,23 @@ function normalizeInput(input: AnnouncementInput) {
   const bodyText = normalizeText(input.bodyText, "o texto", 3000);
   const startsAt = normalizeOptionalDate(input.startsAt, "inicio");
   const endsAt = normalizeOptionalDate(input.endsAt, "termino");
+  const imageCropX = normalizeOptionalCropPercent(input.imageCropX);
+  const imageCropY = normalizeOptionalCropPercent(input.imageCropY);
+  const imageCropWidth = normalizeOptionalCropPercent(input.imageCropWidth);
+  const imageCropHeight = normalizeOptionalCropPercent(input.imageCropHeight);
+  const hasPartialCrop = [imageCropX, imageCropY, imageCropWidth, imageCropHeight].some((value) => value !== null);
+  const hasCompleteCrop = [imageCropX, imageCropY, imageCropWidth, imageCropHeight].every((value) => value !== null);
 
   if (startsAt && endsAt && startsAt >= endsAt) {
     throw new HTTPException(400, { message: "A data de termino deve ser posterior ao inicio." });
+  }
+  if (hasPartialCrop && !hasCompleteCrop) {
+    throw new HTTPException(400, { message: "Informe o enquadramento completo da imagem." });
+  }
+  if (hasCompleteCrop) {
+    if (!imageCropWidth || !imageCropHeight || imageCropX! + imageCropWidth > 100.0001 || imageCropY! + imageCropHeight > 100.0001) {
+      throw new HTTPException(400, { message: "Enquadramento da imagem invalido." });
+    }
   }
 
   return {
@@ -150,6 +179,10 @@ function normalizeInput(input: AnnouncementInput) {
     imageFit: normalizeImageFit(input.imageFit),
     imagePositionX: normalizePercent(input.imagePositionX),
     imagePositionY: normalizePercent(input.imagePositionY),
+    imageCropX,
+    imageCropY,
+    imageCropWidth,
+    imageCropHeight,
   };
 }
 
@@ -202,6 +235,10 @@ function mapAnnouncement(row: AnnouncementRow, audience: "admin" | "launcher" = 
     imageFit: normalizeImageFit(row.image_fit),
     imagePositionX: normalizePercent(row.image_position_x),
     imagePositionY: normalizePercent(row.image_position_y),
+    imageCropX: row.image_crop_x,
+    imageCropY: row.image_crop_y,
+    imageCropWidth: row.image_crop_width,
+    imageCropHeight: row.image_crop_height,
     active: Boolean(row.active),
     startsAt: row.starts_at,
     endsAt: row.ends_at,
@@ -225,6 +262,7 @@ async function getAnnouncementRow(c: AppContext, value: string | number) {
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
         a.image_fit, a.image_position_x, a.image_position_y,
+        a.image_crop_x, a.image_crop_y, a.image_crop_width, a.image_crop_height,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -290,6 +328,7 @@ export async function listAnnouncements(c: AppContext) {
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
         a.image_fit, a.image_position_x, a.image_position_y,
+        a.image_crop_x, a.image_crop_y, a.image_crop_width, a.image_crop_height,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -331,9 +370,10 @@ export async function createAnnouncement(c: AppContext, input: AnnouncementInput
       INSERT INTO announcements (
         internal_name, title, body_text, image_key, image_filename, image_content_type, image_size_bytes,
         image_fit, image_position_x, image_position_y,
+        image_crop_x, image_crop_y, image_crop_width, image_crop_height,
         active, starts_at, ends_at, frequency, allow_dismiss_forever, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .bind(
       normalized.internalName,
@@ -346,6 +386,10 @@ export async function createAnnouncement(c: AppContext, input: AnnouncementInput
       normalized.imageFit,
       normalized.imagePositionX,
       normalized.imagePositionY,
+      normalized.imageCropX,
+      normalized.imageCropY,
+      normalized.imageCropWidth,
+      normalized.imageCropHeight,
       normalized.active ? 1 : 0,
       normalized.startsAt,
       normalized.endsAt,
@@ -409,6 +453,7 @@ export async function updateAnnouncement(c: AppContext, value: string | number, 
       SET internal_name = ?, title = ?, body_text = ?,
         image_key = ?, image_filename = ?, image_content_type = ?, image_size_bytes = ?,
         image_fit = ?, image_position_x = ?, image_position_y = ?,
+        image_crop_x = ?, image_crop_y = ?, image_crop_width = ?, image_crop_height = ?,
         active = ?, starts_at = ?, ends_at = ?, frequency = ?, allow_dismiss_forever = ?, updated_at = ?
       WHERE id = ?
     `)
@@ -423,6 +468,10 @@ export async function updateAnnouncement(c: AppContext, value: string | number, 
       normalized.imageFit,
       normalized.imagePositionX,
       normalized.imagePositionY,
+      normalized.imageCropX,
+      normalized.imageCropY,
+      normalized.imageCropWidth,
+      normalized.imageCropHeight,
       normalized.active ? 1 : 0,
       normalized.startsAt,
       normalized.endsAt,
@@ -468,6 +517,7 @@ export async function getEligibleAnnouncement(c: AppContext, licenseId: number) 
       SELECT id, internal_name, title, body_text,
         image_key, image_filename, image_content_type, image_size_bytes,
         image_fit, image_position_x, image_position_y,
+        image_crop_x, image_crop_y, image_crop_width, image_crop_height,
         active, starts_at, ends_at, frequency, allow_dismiss_forever,
         created_at, updated_at
       FROM announcements

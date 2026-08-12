@@ -371,6 +371,10 @@ const announcementBodySchema = z.object({
   imageFit: z.enum(["cover", "contain"]).optional().default("cover"),
   imagePositionX: z.coerce.number().int().min(0).max(100).optional().default(50),
   imagePositionY: z.coerce.number().int().min(0).max(100).optional().default(50),
+  imageCropX: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropY: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropWidth: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropHeight: z.coerce.number().min(0).max(100).nullable().optional(),
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -736,6 +740,10 @@ function parseAnnouncementForm(formData: FormData) {
     imageFit: String(formData.get("imageFit") || "cover"),
     imagePositionX: String(formData.get("imagePositionX") || "50"),
     imagePositionY: String(formData.get("imagePositionY") || "50"),
+    imageCropX: formNullableString(formData.get("imageCropX")),
+    imageCropY: formNullableString(formData.get("imageCropY")),
+    imageCropWidth: formNullableString(formData.get("imageCropWidth")),
+    imageCropHeight: formNullableString(formData.get("imageCropHeight")),
   });
 }
 
