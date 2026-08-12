@@ -9,6 +9,7 @@ const MAX_TIME = "9999-12-31T23:59:59.999Z";
 const BACKEND_DAY_TIMEZONE = "America/Sao_Paulo";
 
 type AnnouncementFrequency = "always" | "once_per_day" | "once";
+type AnnouncementImageFit = "cover" | "contain";
 
 type AnnouncementRow = {
   id: number;
@@ -19,6 +20,9 @@ type AnnouncementRow = {
   image_filename: string | null;
   image_content_type: string | null;
   image_size_bytes: number;
+  image_fit: AnnouncementImageFit;
+  image_position_x: number;
+  image_position_y: number;
   active: number;
   starts_at: string | null;
   ends_at: string | null;
@@ -53,6 +57,9 @@ export type AnnouncementInput = {
   frequency?: string | null;
   allowDismissForever?: boolean | null;
   removeImage?: boolean | null;
+  imageFit?: string | null;
+  imagePositionX?: number | string | null;
+  imagePositionY?: number | string | null;
 };
 
 function normalizeId(value: string | number, label = "announcement id") {
@@ -88,6 +95,16 @@ function normalizeOptionalDate(value: string | null | undefined, field: string) 
 function normalizeFrequency(value: string | null | undefined): AnnouncementFrequency {
   if (value === "once_per_day" || value === "once") return value;
   return "always";
+}
+
+function normalizeImageFit(value: string | null | undefined): AnnouncementImageFit {
+  return value === "contain" ? "contain" : "cover";
+}
+
+function normalizePercent(value: number | string | null | undefined) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return 50;
+  return Math.min(100, Math.max(0, Math.round(numberValue)));
 }
 
 function normalizeImageFile(file: File) {
@@ -130,6 +147,9 @@ function normalizeInput(input: AnnouncementInput) {
     frequency: normalizeFrequency(input.frequency),
     allowDismissForever: input.allowDismissForever === true,
     removeImage: input.removeImage === true,
+    imageFit: normalizeImageFit(input.imageFit),
+    imagePositionX: normalizePercent(input.imagePositionX),
+    imagePositionY: normalizePercent(input.imagePositionY),
   };
 }
 
@@ -179,6 +199,9 @@ function mapAnnouncement(row: AnnouncementRow, audience: "admin" | "launcher" = 
     imageFilename: row.image_filename,
     imageContentType: row.image_content_type,
     imageSizeBytes: row.image_size_bytes,
+    imageFit: normalizeImageFit(row.image_fit),
+    imagePositionX: normalizePercent(row.image_position_x),
+    imagePositionY: normalizePercent(row.image_position_y),
     active: Boolean(row.active),
     startsAt: row.starts_at,
     endsAt: row.ends_at,
@@ -201,6 +224,9 @@ async function getAnnouncementRow(c: AppContext, value: string | number) {
       SELECT
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
+        COALESCE(a.image_fit, 'cover') AS image_fit,
+        COALESCE(a.image_position_x, 50) AS image_position_x,
+        COALESCE(a.image_position_y, 50) AS image_position_y,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -265,6 +291,9 @@ export async function listAnnouncements(c: AppContext) {
       SELECT
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
+        COALESCE(a.image_fit, 'cover') AS image_fit,
+        COALESCE(a.image_position_x, 50) AS image_position_x,
+        COALESCE(a.image_position_y, 50) AS image_position_y,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -305,9 +334,10 @@ export async function createAnnouncement(c: AppContext, input: AnnouncementInput
     .prepare(`
       INSERT INTO announcements (
         internal_name, title, body_text, image_key, image_filename, image_content_type, image_size_bytes,
+        image_fit, image_position_x, image_position_y,
         active, starts_at, ends_at, frequency, allow_dismiss_forever, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .bind(
       normalized.internalName,
@@ -317,6 +347,9 @@ export async function createAnnouncement(c: AppContext, input: AnnouncementInput
       image?.safeName || null,
       image?.contentType || null,
       file?.size || 0,
+      normalized.imageFit,
+      normalized.imagePositionX,
+      normalized.imagePositionY,
       normalized.active ? 1 : 0,
       normalized.startsAt,
       normalized.endsAt,
@@ -379,6 +412,7 @@ export async function updateAnnouncement(c: AppContext, value: string | number, 
       UPDATE announcements
       SET internal_name = ?, title = ?, body_text = ?,
         image_key = ?, image_filename = ?, image_content_type = ?, image_size_bytes = ?,
+        image_fit = ?, image_position_x = ?, image_position_y = ?,
         active = ?, starts_at = ?, ends_at = ?, frequency = ?, allow_dismiss_forever = ?, updated_at = ?
       WHERE id = ?
     `)
@@ -390,6 +424,9 @@ export async function updateAnnouncement(c: AppContext, value: string | number, 
       filename,
       contentType,
       sizeBytes,
+      normalized.imageFit,
+      normalized.imagePositionX,
+      normalized.imagePositionY,
       normalized.active ? 1 : 0,
       normalized.startsAt,
       normalized.endsAt,
@@ -434,6 +471,9 @@ export async function getEligibleAnnouncement(c: AppContext, licenseId: number) 
     .prepare(`
       SELECT id, internal_name, title, body_text,
         image_key, image_filename, image_content_type, image_size_bytes,
+        COALESCE(image_fit, 'cover') AS image_fit,
+        COALESCE(image_position_x, 50) AS image_position_x,
+        COALESCE(image_position_y, 50) AS image_position_y,
         active, starts_at, ends_at, frequency, allow_dismiss_forever,
         created_at, updated_at
       FROM announcements

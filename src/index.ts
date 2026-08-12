@@ -368,6 +368,9 @@ const announcementBodySchema = z.object({
   frequency: z.enum(["always", "once_per_day", "once"]).optional().default("always"),
   allowDismissForever: z.boolean().optional().default(false),
   removeImage: z.boolean().optional().default(false),
+  imageFit: z.enum(["cover", "contain"]).optional().default("cover"),
+  imagePositionX: z.coerce.number().int().min(0).max(100).optional().default(50),
+  imagePositionY: z.coerce.number().int().min(0).max(100).optional().default(50),
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -730,6 +733,9 @@ function parseAnnouncementForm(formData: FormData) {
     frequency: String(formData.get("frequency") || "always"),
     allowDismissForever: formBoolean(formData.get("allowDismissForever")),
     removeImage: formBoolean(formData.get("removeImage")),
+    imageFit: String(formData.get("imageFit") || "cover"),
+    imagePositionX: String(formData.get("imagePositionX") || "50"),
+    imagePositionY: String(formData.get("imagePositionY") || "50"),
   });
 }
 
