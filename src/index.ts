@@ -109,6 +109,16 @@ import {
   listPublicFeedbackImages,
   updatePublicFeedbackImage,
 } from "./lib/public-feedbacks";
+import {
+  createAnnouncement,
+  deleteAnnouncement,
+  dismissAnnouncementForever,
+  getAnnouncementImageObject,
+  getEligibleAnnouncement,
+  listAnnouncements,
+  recordAnnouncementView,
+  updateAnnouncement,
+} from "./lib/announcements";
 
 const app = new Hono<{ Bindings: AppBindings }>();
 
@@ -149,7 +159,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks"] as const;
+const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -347,6 +357,17 @@ const publicFeedbackUpdateSchema = z.object({
   title: z.string().trim().min(1).max(120).optional(),
   sortOrder: z.number().int().min(0).max(10000).optional(),
   enabled: z.boolean().optional(),
+});
+const announcementBodySchema = z.object({
+  internalName: z.string().trim().min(1).max(140),
+  title: z.string().trim().min(1).max(180),
+  bodyText: z.string().trim().min(1).max(3000),
+  active: z.boolean().optional().default(false),
+  startsAt: z.string().trim().nullable().optional(),
+  endsAt: z.string().trim().nullable().optional(),
+  frequency: z.enum(["always", "once_per_day", "once"]).optional().default("always"),
+  allowDismissForever: z.boolean().optional().default(false),
+  removeImage: z.boolean().optional().default(false),
 });
 const overrideUploadCompleteSchema = overrideUploadAbortSchema.extend({
   filename: z.string().min(1),
@@ -686,6 +707,30 @@ function parseBody<T>(schema: z.ZodSchema<T>, value: unknown) {
     throw new HTTPException(400, { message: "Invalid request payload" });
   }
   return parsed.data;
+}
+
+function formBoolean(value: unknown, fallback = false) {
+  if (value === null || value === undefined) return fallback;
+  return String(value) === "true" || String(value) === "1";
+}
+
+function formNullableString(value: unknown) {
+  const text = String(value || "").trim();
+  return text || null;
+}
+
+function parseAnnouncementForm(formData: FormData) {
+  return parseBody(announcementBodySchema, {
+    internalName: String(formData.get("internalName") || ""),
+    title: String(formData.get("title") || ""),
+    bodyText: String(formData.get("bodyText") || ""),
+    active: formBoolean(formData.get("active")),
+    startsAt: formNullableString(formData.get("startsAt")),
+    endsAt: formNullableString(formData.get("endsAt")),
+    frequency: String(formData.get("frequency") || "always"),
+    allowDismissForever: formBoolean(formData.get("allowDismissForever")),
+    removeImage: formBoolean(formData.get("removeImage")),
+  });
 }
 
 function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<typeof getBillingSettings>>) {
@@ -1750,6 +1795,52 @@ app.delete("/panel-api/public-feedbacks/:id", async (c) => {
   return c.json(result, 200);
 });
 
+app.get("/panel-api/announcements", async (c) => {
+  await requireAdminSession(c);
+  const announcements = await listAnnouncements(c);
+  return c.json({ success: true, announcements }, 200);
+});
+
+app.post("/panel-api/announcements", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const announcement = await createAnnouncement(
+    c,
+    parseAnnouncementForm(formData),
+    file instanceof File ? file : null
+  );
+  return c.json({ success: true, announcement }, 201);
+});
+
+app.put("/panel-api/announcements/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const announcement = await updateAnnouncement(
+    c,
+    c.req.param("id"),
+    parseAnnouncementForm(formData),
+    file instanceof File ? file : null
+  );
+  return c.json({ success: true, announcement }, 200);
+});
+
+app.delete("/panel-api/announcements/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const result = await deleteAnnouncement(c, c.req.param("id"));
+  return c.json(result, 200);
+});
+
+app.get("/panel-api/announcements/:id/image", async (c) => {
+  await requireAdminSession(c);
+  const { object } = await getAnnouncementImageObject(c, c.req.param("id"));
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "public, max-age=300");
+  return new Response(object.body, { status: 200, headers });
+});
+
 app.get("/panel-api/payments", async (c) => {
   await requireAdminSession(c);
   const limit = Number(c.req.query("limit") || "120");
@@ -2443,6 +2534,32 @@ app.post("/api/polls/:id/vote", async (c) => {
   const body = parseBody(pollVoteSchema, await c.req.json());
   const poll = await votePoll(c, c.req.param("id"), license.id, body);
   return c.json({ success: true, poll }, 200);
+});
+
+app.get("/api/announcements/eligible", async (c) => {
+  const license = await requireLauncherLicense(c);
+  const announcement = await getEligibleAnnouncement(c, license.id);
+  return c.json({ success: true, announcement }, 200);
+});
+
+app.post("/api/announcements/:id/view", async (c) => {
+  const license = await requireLauncherLicense(c);
+  const result = await recordAnnouncementView(c, c.req.param("id"), license.id);
+  return c.json(result, 200);
+});
+
+app.post("/api/announcements/:id/dismiss", async (c) => {
+  const license = await requireLauncherLicense(c);
+  const result = await dismissAnnouncementForever(c, c.req.param("id"), license.id);
+  return c.json(result, 200);
+});
+
+app.get("/api/announcements/:id/image", async (c) => {
+  const { object } = await getAnnouncementImageObject(c, c.req.param("id"));
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "public, max-age=300");
+  return new Response(object.body, { status: 200, headers });
 });
 
 app.post("/api/activations/generate", async (c) => {
