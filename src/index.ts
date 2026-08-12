@@ -703,7 +703,7 @@ function serveRootPagePreview(c: any) {
   const downloadUrl = `${origin}/download`;
   const title = "Merlin - Seu próximo jogo começa aqui";
   const description = "Acesse uma biblioteca com grandes jogos e lançamentos através do launcher do Merlin.";
-  const imageUrl = `${origin}/download-assets/assets/branding/merlin-hero-official.png`;
+  const imageUrl = `${origin}/download-assets/social/merlin-og.png`;
   const html = `<!doctype html>
 <html lang="pt-BR">
   <head>
