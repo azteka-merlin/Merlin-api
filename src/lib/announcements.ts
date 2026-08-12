@@ -224,9 +224,7 @@ async function getAnnouncementRow(c: AppContext, value: string | number) {
       SELECT
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
-        COALESCE(a.image_fit, 'cover') AS image_fit,
-        COALESCE(a.image_position_x, 50) AS image_position_x,
-        COALESCE(a.image_position_y, 50) AS image_position_y,
+        a.image_fit, a.image_position_x, a.image_position_y,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -291,9 +289,7 @@ export async function listAnnouncements(c: AppContext) {
       SELECT
         a.id, a.internal_name, a.title, a.body_text,
         a.image_key, a.image_filename, a.image_content_type, a.image_size_bytes,
-        COALESCE(a.image_fit, 'cover') AS image_fit,
-        COALESCE(a.image_position_x, 50) AS image_position_x,
-        COALESCE(a.image_position_y, 50) AS image_position_y,
+        a.image_fit, a.image_position_x, a.image_position_y,
         a.active, a.starts_at, a.ends_at, a.frequency, a.allow_dismiss_forever,
         a.created_at, a.updated_at,
         COALESCE(SUM(aus.view_count), 0) AS total_views,
@@ -471,9 +467,7 @@ export async function getEligibleAnnouncement(c: AppContext, licenseId: number) 
     .prepare(`
       SELECT id, internal_name, title, body_text,
         image_key, image_filename, image_content_type, image_size_bytes,
-        COALESCE(image_fit, 'cover') AS image_fit,
-        COALESCE(image_position_x, 50) AS image_position_x,
-        COALESCE(image_position_y, 50) AS image_position_y,
+        image_fit, image_position_x, image_position_y,
         active, starts_at, ends_at, frequency, allow_dismiss_forever,
         created_at, updated_at
       FROM announcements
