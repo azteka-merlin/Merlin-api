@@ -222,6 +222,7 @@ const publicSignupSettingsSchema = z.object({
     monthlyCardTrialDays: z.number().int().min(1).max(730).optional().default(30),
     monthlyPriceId: z.string().trim().optional().default(""),
     lifetimePriceId: z.string().trim().optional().default(""),
+    pixLifetimePriceId: z.string().trim().optional().default(""),
   }).optional(),
 });
 const publicCheckoutSchema = z.object({
@@ -833,6 +834,7 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
     prices: {
       monthly: mapPrice(billing.prices.monthly),
       lifetime: mapPrice(billing.prices.lifetime),
+      pixLifetime: mapPrice(billing.prices.pixLifetime),
     },
   };
 }

@@ -990,7 +990,9 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const planEnabled = input.planType === "monthly" ? billing.monthlyEnabled : billing.lifetimeEnabled;
   const pixPlanEnabled = input.planType === "monthly" ? billing.pixMonthlyEnabled : billing.pixLifetimeEnabled;
-  const priceId = input.planType === "monthly" ? billing.monthlyPriceId : billing.lifetimePriceId;
+  const priceId = input.planType === "monthly"
+    ? billing.monthlyPriceId
+    : billing.pixLifetimePriceId || billing.lifetimePriceId;
   if (!planEnabled || !priceId) {
     throw new HTTPException(400, { message: "Plano indisponivel." });
   }

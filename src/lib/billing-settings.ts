@@ -21,6 +21,7 @@ type BillingSettingsRow = {
   monthly_card_trial_days: number;
   monthly_price_id: string | null;
   lifetime_price_id: string | null;
+  pix_lifetime_price_id: string | null;
   currency: string;
   free_access_type: string;
   free_duration_days: number | null;
@@ -73,12 +74,14 @@ export type BillingSettingsPayload = {
   monthlyCardTrialDays: number;
   monthlyPriceId: string;
   lifetimePriceId: string;
+  pixLifetimePriceId: string;
   currency: string;
   freeAccessType: string;
   freeDurationDays: number | null;
   prices: {
     monthly: BillingPriceSnapshot | null;
     lifetime: BillingPriceSnapshot | null;
+    pixLifetime: BillingPriceSnapshot | null;
   };
   updatedAt: string;
 };
@@ -94,6 +97,7 @@ export type BillingSettingsInput = {
   monthlyCardTrialDays?: number;
   monthlyPriceId?: string;
   lifetimePriceId?: string;
+  pixLifetimePriceId?: string;
 };
 
 function normalizePriceId(value: string | undefined | null) {
@@ -278,6 +282,7 @@ function envPriceId(c: AppContext, planType: BillingPlanType) {
 function mapBillingSettings(c: AppContext, row: BillingSettingsRow, prices: BillingSettingsPayload["prices"]): BillingSettingsPayload {
   const monthlyPriceId = normalizePriceId(row.monthly_price_id) || envPriceId(c, "monthly");
   const lifetimePriceId = normalizePriceId(row.lifetime_price_id) || envPriceId(c, "lifetime");
+  const pixLifetimePriceId = normalizePriceId(row.pix_lifetime_price_id);
   return {
     billingEnabled: row.billing_enabled === 1,
     publicSignupEnabled: row.public_signup_enabled === 1,
@@ -290,6 +295,7 @@ function mapBillingSettings(c: AppContext, row: BillingSettingsRow, prices: Bill
     monthlyCardTrialDays: normalizeTrialDays(row.monthly_card_trial_days),
     monthlyPriceId,
     lifetimePriceId,
+    pixLifetimePriceId,
     currency: row.currency || "brl",
     freeAccessType: row.free_access_type || "free",
     freeDurationDays: row.free_duration_days,
@@ -309,7 +315,7 @@ export async function getBillingSettings(c: AppContext) {
           COALESCE(pix_lifetime_enabled, 1) AS pix_lifetime_enabled,
           COALESCE(monthly_card_trial_enabled, 0) AS monthly_card_trial_enabled,
           COALESCE(monthly_card_trial_days, 30) AS monthly_card_trial_days,
-          monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+          monthly_price_id, lifetime_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         FROM billing_settings
         WHERE id = 1
       `,
@@ -342,6 +348,7 @@ export async function getBillingSettings(c: AppContext) {
       monthly_card_trial_days: 30,
       monthly_price_id: null,
       lifetime_price_id: null,
+      pix_lifetime_price_id: null,
       currency: "brl",
       free_access_type: "free",
       free_duration_days: null,
@@ -351,9 +358,11 @@ export async function getBillingSettings(c: AppContext) {
 
   const monthlyPriceId = normalizePriceId(row.monthly_price_id) || envPriceId(c, "monthly");
   const lifetimePriceId = normalizePriceId(row.lifetime_price_id) || envPriceId(c, "lifetime");
+  const pixLifetimePriceId = normalizePriceId(row.pix_lifetime_price_id);
   const prices = {
     monthly: await getReadableStripePriceSnapshot(c, monthlyPriceId),
     lifetime: await getReadableStripePriceSnapshot(c, lifetimePriceId),
+    pixLifetime: await getReadableStripePriceSnapshot(c, pixLifetimePriceId),
   };
 
   return mapBillingSettings(c, row, prices);
@@ -362,6 +371,7 @@ export async function getBillingSettings(c: AppContext) {
 export async function updateBillingSettings(c: AppContext, input: BillingSettingsInput & { publicSignupEnabled: boolean }) {
   const monthlyPriceId = normalizePriceId(input.monthlyPriceId);
   const lifetimePriceId = normalizePriceId(input.lifetimePriceId);
+  const pixLifetimePriceId = normalizePriceId(input.pixLifetimePriceId);
   const monthlyCardTrialDays = normalizeTrialDays(input.monthlyCardTrialDays);
 
   if (input.billingEnabled && !input.monthlyEnabled && !input.lifetimeEnabled) {
@@ -374,12 +384,18 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
   const lifetimePrice = input.lifetimeEnabled || lifetimePriceId
     ? await getStripePriceSnapshot(c, lifetimePriceId, { forceRefresh: true, allowStaleOnError: false })
     : null;
+  const pixLifetimePrice = pixLifetimePriceId
+    ? await getStripePriceSnapshot(c, pixLifetimePriceId, { forceRefresh: true, allowStaleOnError: false })
+    : null;
 
   if (input.monthlyEnabled) {
     assertBillingPlanPrice("monthly", monthlyPrice);
   }
   if (input.lifetimeEnabled) {
     assertBillingPlanPrice("lifetime", lifetimePrice);
+  }
+  if (pixLifetimePriceId) {
+    assertBillingPlanPrice("lifetime", pixLifetimePrice);
   }
 
   const now = new Date().toISOString();
@@ -390,9 +406,9 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
           id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
           pix_enabled, pix_monthly_enabled, pix_lifetime_enabled,
           monthly_card_trial_enabled, monthly_card_trial_days,
-          monthly_price_id, lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+          monthly_price_id, lifetime_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           billing_enabled = excluded.billing_enabled,
           public_signup_enabled = excluded.public_signup_enabled,
@@ -405,6 +421,7 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
           monthly_card_trial_days = excluded.monthly_card_trial_days,
           monthly_price_id = excluded.monthly_price_id,
           lifetime_price_id = excluded.lifetime_price_id,
+          pix_lifetime_price_id = excluded.pix_lifetime_price_id,
           currency = excluded.currency,
           free_access_type = excluded.free_access_type,
           free_duration_days = excluded.free_duration_days,
@@ -423,6 +440,7 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
       monthlyCardTrialDays,
       monthlyPriceId || null,
       lifetimePriceId || null,
+      pixLifetimePriceId || null,
       now,
     )
     .run();
