@@ -137,16 +137,29 @@ const RecoverySecretRequest = z.string().trim().refine(isValidRecoverySecret, {
 export const CreateLicenseRequest = z.object({
 	name: z.string().min(1).describe("Customer name"),
 	contact: z.string().min(1).optional().describe("Customer contact"),
-	contactType: z.enum(["phone", "email", "discord"]).optional().default("phone"),
+	contactType: z.enum(["phone", "email", "discord", "none"]).optional().default("phone"),
 	phone: z.string().min(1).optional().describe("Deprecated alias for contact"),
 	recoveryPin: RecoverySecretRequest.optional().describe("Optional recovery secret. Use 4 to 8 non-space characters."),
 	expiresAt: z
 		.string()
 		.regex(/^\d{4}-\d{2}-\d{2}$/)
+		.optional()
 		.describe("License expiration date in YYYY-MM-DD format"),
-}).refine((value) => Boolean(value.contact || value.phone), {
+	licenseType: z.enum(["normal", "test"]).optional().default("normal"),
+	normalActivationLimit: z.number().int().min(0).max(9999).optional(),
+	premiumActivationLimit: z.number().int().min(0).max(9999).optional(),
+}).refine((value) => value.licenseType === "test" || Boolean(value.contact || value.phone), {
 	message: "Contact is required",
 	path: ["contact"],
+}).refine((value) => value.licenseType === "test" || Boolean(value.expiresAt), {
+	message: "Expiration date is required",
+	path: ["expiresAt"],
+}).refine((value) => value.licenseType !== "test" || value.normalActivationLimit !== undefined, {
+	message: "Normal activation limit is required",
+	path: ["normalActivationLimit"],
+}).refine((value) => value.licenseType !== "test" || value.premiumActivationLimit !== undefined, {
+	message: "Premium activation limit is required",
+	path: ["premiumActivationLimit"],
 });
 
 export const LicenseResponse = z.object({
@@ -154,8 +167,14 @@ export const LicenseResponse = z.object({
 	licenseKey: z.string().regex(/^MERLIN-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/),
 	name: z.string(),
 	contact: z.string(),
-	contactType: z.enum(["phone", "email", "discord"]),
+	contactType: z.enum(["phone", "email", "discord", "none"]),
 	source: z.string(),
+	licenseType: z.enum(["normal", "test"]).optional(),
+	normalActivationLimit: z.number().int().nonnegative().nullable().optional(),
+	premiumActivationLimit: z.number().int().nonnegative().nullable().optional(),
+	normalActivationUsed: z.number().int().nonnegative().optional(),
+	premiumActivationUsed: z.number().int().nonnegative().optional(),
+	activationUsageResetAt: z.string().nullable().optional(),
 	hasRecoveryPin: z.boolean().optional(),
 	recoveryNoticeAcceptedAt: z.string().nullable().optional(),
 	phone: z.string(),

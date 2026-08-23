@@ -1,4 +1,5 @@
 import { HTTPException } from "hono/http-exception";
+import { assertPremiumActivationLimit } from "./license-activation-limits";
 import { requireLauncherLicense } from "./launcher-auth";
 import type { AppContext } from "../types";
 
@@ -662,6 +663,8 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
       throw new HTTPException(409, { message: `Premium activation is already being processed until ${reservedUntil}` });
     }
   }
+
+  await assertPremiumActivationLimit(c, licenseId);
 
   const appRows = await listCurrentPremiumActivations(c, [game.appId]);
   let occupiedSlots = 0;

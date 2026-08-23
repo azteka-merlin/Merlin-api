@@ -1,5 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
+import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
@@ -237,6 +238,34 @@ export class ManifestsRoute extends OpenAPIRoute {
 		}
 
 		const clientIp = getClientIp(c);
+		try {
+			await assertNormalActivationLimit(c, license.id, appId);
+		} catch (error) {
+			await writeUserActivityLog(c, {
+				licenseId: license.id,
+				licenseKey: license.licenseKey,
+				userName: license.name,
+				action: "game_activation_denied",
+				status: "denied",
+				appId,
+				gameName: null,
+				ipAddress: clientIp,
+				hwid: license.hwid,
+				reason: "test_license_normal_activation_limit",
+			});
+			if ((error as { code?: unknown }).code === TEST_LICENSE_NORMAL_LIMIT_CODE) {
+				const message = error instanceof Error
+					? error.message
+					: "Limite de ativacoes normais da licenca de teste atingido.";
+				return c.json({
+					success: false,
+					error: message,
+					code: TEST_LICENSE_NORMAL_LIMIT_CODE,
+				}, 403);
+			}
+			throw error;
+		}
+
 		const env = c.env as Env & ManifestEnv;
 		const override = await getRequiredManifestOverride(env, appId);
 		if (override) {

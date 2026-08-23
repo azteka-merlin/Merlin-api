@@ -32,8 +32,10 @@ import {
   mapLicense,
   renewLicense,
   resetLicenseHwid,
+  resetTestLicenseUsage,
   revokeLicense,
   reactivateLicense,
+  updateTestLicense,
   updateLicense,
 } from "./lib/admin-license-service";
 import { getBillingSettings, updateBillingSettings } from "./lib/billing-settings";
@@ -179,6 +181,11 @@ const updateLicenseSchema = z.object({
 }).refine((value) => Boolean(value.contact || value.phone), {
   message: "Contact is required",
   path: ["contact"],
+});
+const updateTestLicenseSchema = z.object({
+  name: z.string().trim().min(1),
+  normalActivationLimit: z.number().int().min(0).max(9999),
+  premiumActivationLimit: z.number().int().min(0).max(9999),
 });
 const publicAccessKeySchema = z.object({
   name: z.string().trim().min(1),
@@ -2094,6 +2101,27 @@ app.put("/panel-api/licenses/:id", async (c) => {
   return c.json(mapLicense(updated), 200);
 });
 
+app.put("/panel-api/licenses/:id/test", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = parseBody(updateTestLicenseSchema, await c.req.json());
+  const updated = await updateTestLicense(c, parseLicenseId(c.req.param("id")), body, {
+    adminUserId: session.session.admin_user_id,
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json(mapLicense(updated), 200);
+});
+
+app.post("/panel-api/licenses/:id/test/reset-usage", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const updated = await resetTestLicenseUsage(c, parseLicenseId(c.req.param("id")), {
+    adminUserId: session.session.admin_user_id,
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json(mapLicense(updated), 200);
+});
+
 app.post("/panel-api/licenses/:id/send-welcome-email", async (c) => {
   const session = await requireAdminSession(c, { mutate: true });
   const license = await getLicense(c, parseLicenseId(c.req.param("id")));
@@ -2769,7 +2797,15 @@ app.onError((error, c) => {
     } else {
       console.warn("[merlin-api:client-error]", logPayload);
     }
-    return c.json({ success: false, error: message }, errorStatus as 400 | 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503);
+    const codedError = error as unknown as { code?: unknown };
+    const code = typeof codedError.code === "string"
+      ? codedError.code
+      : undefined;
+    return c.json({
+      success: false,
+      error: message,
+      ...(code ? { code } : {}),
+    }, errorStatus as 400 | 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503);
   }
 
   console.error("[merlin-api:error]", error);

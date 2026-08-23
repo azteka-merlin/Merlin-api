@@ -10,8 +10,14 @@ export type LicenseRecord = {
 	license_key: string;
 	name: string;
 	contact: string;
-	contact_type: "phone" | "email" | "discord";
+	contact_type: "phone" | "email" | "discord" | "none";
 	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe" | "mercadopago_pix";
+	license_type?: "normal" | "test" | null;
+	normal_activation_limit?: number | null;
+	premium_activation_limit?: number | null;
+	normal_activation_used?: number | null;
+	premium_activation_used?: number | null;
+	activation_usage_reset_at?: string | null;
 	recovery_pin_hash: string | null;
 	recovery_notice_accepted_at: string | null;
 	hwid: string | null;
@@ -98,6 +104,12 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		contact: record.contact,
 		contactType: record.contact_type,
 		source: record.source,
+		licenseType: record.license_type || "normal",
+		normalActivationLimit: record.normal_activation_limit ?? null,
+		premiumActivationLimit: record.premium_activation_limit ?? null,
+		normalActivationUsed: record.normal_activation_used ?? 0,
+		premiumActivationUsed: record.premium_activation_used ?? 0,
+		activationUsageResetAt: record.activation_usage_reset_at || null,
 		hasRecoveryPin: Boolean(record.recovery_pin_hash),
 		recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
 		phone: record.contact,
@@ -131,6 +143,25 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 					contact,
 					contact_type,
 					source,
+					COALESCE(license_type, 'normal') AS license_type,
+					normal_activation_limit,
+					premium_activation_limit,
+					activation_usage_reset_at,
+					(
+						SELECT COUNT(DISTINCT ual.app_id)
+						FROM user_activity_logs ual
+						WHERE ual.license_id = licenses.id
+							AND ual.action = 'game_activation_success'
+							AND ual.app_id IS NOT NULL
+							AND (licenses.activation_usage_reset_at IS NULL OR ual.created_at > licenses.activation_usage_reset_at)
+					) AS normal_activation_used,
+					(
+						SELECT COUNT(*)
+						FROM premium_activations pa
+						WHERE pa.license_id = licenses.id
+							AND pa.status IN ('reserved', 'active', 'expired')
+							AND (licenses.activation_usage_reset_at IS NULL OR pa.created_at > licenses.activation_usage_reset_at)
+					) AS premium_activation_used,
 					recovery_pin_hash,
 					recovery_notice_accepted_at,
 					hwid,

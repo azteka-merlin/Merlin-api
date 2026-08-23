@@ -4,15 +4,9 @@ import {
 	CreateLicenseRequest,
 	LicenseResponse,
 } from "../types";
-import {
-	generateLicenseKey,
-	getLicenseById,
-	mapLicenseResponse,
-	requireAdminToken,
-	toIsoDateStart,
-} from "../lib/licenses";
+import { mapLicenseResponse, requireAdminToken } from "../lib/licenses";
 import { enforceAdminRateLimit } from "../lib/rate-limit";
-import { hashRecoveryPin, normalizeRecoveryPin } from "../lib/recovery-pin";
+import { createLicense } from "../lib/admin-license-service";
 
 export class AdminCreateLicenseRoute extends OpenAPIRoute {
 	schema = {
@@ -77,64 +71,7 @@ export class AdminCreateLicenseRoute extends OpenAPIRoute {
 		await enforceAdminRateLimit(c, adminKey);
 
 		const data = await this.getValidatedData<typeof this.schema>();
-		const now = new Date().toISOString();
-		const expiresAt = toIsoDateStart(data.body.expiresAt);
-		const recoveryPin = normalizeRecoveryPin(data.body.recoveryPin);
-
-		let licenseKey = generateLicenseKey();
-		let insertResult: D1Result<Record<string, unknown>> | null = null;
-
-		for (let attempt = 0; attempt < 5; attempt += 1) {
-			const recoveryPinHash = recoveryPin ? await hashRecoveryPin(c, { licenseKey, recoveryPin }) : null;
-			const statement = c.env.merlin_db.prepare(
-				`
-					INSERT INTO licenses (
-						license_key,
-						name,
-						contact,
-						contact_type,
-						source,
-						recovery_pin_hash,
-						recovery_notice_accepted_at,
-						hwid,
-						expires_at,
-						status,
-						revoked_reason,
-						created_at,
-						updated_at
-					)
-					VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, 'active', ?, ?, ?)
-				`,
-			);
-
-			try {
-				insertResult = await statement
-					.bind(
-						licenseKey,
-						data.body.name,
-						data.body.contact || data.body.phone,
-						data.body.contactType || "phone",
-						recoveryPinHash,
-						recoveryPin ? now : null,
-						null,
-						expiresAt,
-						null,
-						now,
-						now,
-					)
-					.run();
-				break;
-			} catch (error) {
-				if (attempt === 4) {
-					throw error;
-				}
-
-				licenseKey = generateLicenseKey();
-			}
-		}
-
-		const createdId = Number(insertResult?.meta.last_row_id);
-		const created = await getLicenseById(c, createdId);
+		const created = await createLicense(c, data.body);
 
 		return c.json(mapLicenseResponse(created), 201);
 	}

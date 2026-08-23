@@ -4,7 +4,8 @@ import { generateLicenseKey, resolveLicenseStatus, toDateOnly, toIsoDateStart, t
 import { writeAdminAuditLog } from "./admin-security";
 import { hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
-export type ContactType = "phone" | "email" | "discord";
+export type ContactType = "phone" | "email" | "discord" | "none";
+export type LicenseType = "normal" | "test";
 
 export type LicenseActionActor = {
   adminUserId: number;
@@ -13,6 +14,29 @@ export type LicenseActionActor = {
 };
 
 const DUPLICATE_EMAIL_LICENSE_MESSAGE = "Este e-mail já possui uma licença cadastrada.";
+const TEST_LICENSE_DEFAULT_EXPIRY = "9999-12-31";
+
+const licenseActivationSelect = `
+  COALESCE(license_type, 'normal') AS license_type,
+  normal_activation_limit,
+  premium_activation_limit,
+  activation_usage_reset_at,
+  (
+    SELECT COUNT(DISTINCT ual.app_id)
+    FROM user_activity_logs ual
+    WHERE ual.license_id = licenses.id
+      AND ual.action = 'game_activation_success'
+      AND ual.app_id IS NOT NULL
+      AND (licenses.activation_usage_reset_at IS NULL OR ual.created_at > licenses.activation_usage_reset_at)
+  ) AS normal_activation_used,
+  (
+    SELECT COUNT(*)
+    FROM premium_activations pa
+    WHERE pa.license_id = licenses.id
+      AND pa.status IN ('reserved', 'active', 'expired')
+      AND (licenses.activation_usage_reset_at IS NULL OR pa.created_at > licenses.activation_usage_reset_at)
+  ) AS premium_activation_used
+`;
 
 function statusForExpiresAt(expiresAt: string, currentStatus?: LicenseStatusValue): LicenseStatusValue {
   if (currentStatus === "revoked") {
@@ -29,6 +53,12 @@ export function mapLicense(record: LicenseRecord) {
     contact: record.contact,
     contactType: record.contact_type,
     source: record.source,
+    licenseType: record.license_type || "normal",
+    normalActivationLimit: record.normal_activation_limit ?? null,
+    premiumActivationLimit: record.premium_activation_limit ?? null,
+    normalActivationUsed: record.normal_activation_used ?? 0,
+    premiumActivationUsed: record.premium_activation_used ?? 0,
+    activationUsageResetAt: record.activation_usage_reset_at || null,
     hasRecoveryPin: Boolean(record.recovery_pin_hash),
     recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
     phone: record.contact,
@@ -65,7 +95,9 @@ export async function listLicenses(c: AppContext) {
   const result = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+        SELECT id, license_key, name, contact, contact_type, source,
+          ${licenseActivationSelect},
+          recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           ${billingColumns},
           created_at, updated_at
         FROM licenses
@@ -81,7 +113,9 @@ export async function getLicense(c: AppContext, id: number) {
   const license = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+        SELECT id, license_key, name, contact, contact_type, source,
+          ${licenseActivationSelect},
+          recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           customer_id,
           COALESCE(access_type, 'free') AS access_type,
           COALESCE(billing_status, 'none') AS billing_status,
@@ -130,6 +164,9 @@ export function assertValidContact(contact: string, contactType: ContactType) {
   if (contactType === "discord" && contact.length < 2) {
     throw new HTTPException(400, { message: "A valid Discord contact is required" });
   }
+  if (contactType === "none" && contact.length > 0) {
+    throw new HTTPException(400, { message: "Contact must be empty for this license type" });
+  }
 }
 
 export async function findLicenseByEmailContact(c: AppContext, email: string, excludeId?: number) {
@@ -137,7 +174,9 @@ export async function findLicenseByEmailContact(c: AppContext, email: string, ex
   return c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+        SELECT id, license_key, name, contact, contact_type, source,
+          ${licenseActivationSelect},
+          recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           customer_id,
           COALESCE(access_type, 'free') AS access_type,
           COALESCE(billing_status, 'none') AS billing_status,
@@ -175,19 +214,40 @@ function isDuplicateEmailLicenseError(error: unknown) {
   return message.includes("idx_licenses_unique_email_contact");
 }
 
+function normalizeActivationLimit(value: number | null | undefined, label: string) {
+  const numeric = Number(value);
+  if (!Number.isInteger(numeric) || numeric < 0 || numeric > 9999) {
+    throw new HTTPException(400, { message: `Informe um limite de ativacoes ${label} valido.` });
+  }
+  return numeric;
+}
+
 export async function createLicense(
   c: AppContext,
-  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string },
+  input: {
+    name: string;
+    contact?: string;
+    contactType?: ContactType;
+    phone?: string;
+    recoveryPin?: string;
+    expiresAt?: string;
+    licenseType?: LicenseType;
+    normalActivationLimit?: number | null;
+    premiumActivationLimit?: number | null;
+  },
   actor?: LicenseActionActor,
 ) {
   const now = new Date().toISOString();
-  const expiresAt = toIsoDateStart(input.expiresAt);
+  const licenseType = input.licenseType || "normal";
+  const expiresAt = toIsoDateStart(licenseType === "test" ? TEST_LICENSE_DEFAULT_EXPIRY : String(input.expiresAt || ""));
   const status = statusForExpiresAt(expiresAt);
-  const contactType = input.contactType || "phone";
-  const normalizedContact = normalizeContact(input.contact || input.phone || "", contactType);
+  const contactType = licenseType === "test" ? "none" : input.contactType || "phone";
+  const normalizedContact = licenseType === "test" ? "" : normalizeContact(input.contact || input.phone || "", contactType);
+  const normalActivationLimit = licenseType === "test" ? normalizeActivationLimit(input.normalActivationLimit, "normal") : null;
+  const premiumActivationLimit = licenseType === "test" ? normalizeActivationLimit(input.premiumActivationLimit, "premium") : null;
   assertValidContact(normalizedContact, contactType);
   await assertEmailContactAvailable(c, contactType, normalizedContact);
-  const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
+  const recoveryPin = licenseType === "test" ? "" : normalizeRecoveryPin(input.recoveryPin);
   let licenseKey = generateLicenseKey();
   let insertResult: D1Result<Record<string, unknown>> | null = null;
 
@@ -198,12 +258,12 @@ export async function createLicense(
         .prepare(
           `
             INSERT INTO licenses (
-              license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+              license_key, name, contact, contact_type, source, license_type, normal_activation_limit, premium_activation_limit, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
         )
-        .bind(licenseKey, input.name, normalizedContact, contactType, recoveryPinHash, recoveryPin ? now : null, null, expiresAt, status, null, now, now)
+        .bind(licenseKey, input.name, normalizedContact, contactType, licenseType, normalActivationLimit, premiumActivationLimit, recoveryPinHash, recoveryPin ? now : null, null, expiresAt, status, null, now, now)
         .run();
       break;
     } catch (error) {
@@ -226,7 +286,7 @@ export async function createLicense(
       entityId: String(created.id),
       ipHash: actor.ipHash,
       userAgentHash: actor.userAgentHash,
-      metadata: { licenseKey: created.license_key },
+      metadata: { licenseKey: created.license_key, licenseType },
     });
   }
   return created;
@@ -278,6 +338,83 @@ export async function updateLicense(
       entityId: String(updated.id),
       ipHash: actor.ipHash,
       userAgentHash: actor.userAgentHash,
+    });
+  }
+  return updated;
+}
+
+export async function updateTestLicense(
+  c: AppContext,
+  id: number,
+  input: { name: string; normalActivationLimit: number; premiumActivationLimit: number },
+  actor?: LicenseActionActor,
+) {
+  const current = await getLicense(c, id);
+  if ((current.license_type || "normal") !== "test") {
+    throw new HTTPException(400, { message: "Esta licença não é uma licença de teste." });
+  }
+
+  const name = String(input.name || "").trim();
+  if (!name) {
+    throw new HTTPException(400, { message: "Informe o nome do teste." });
+  }
+
+  const normalActivationLimit = normalizeActivationLimit(input.normalActivationLimit, "normal");
+  const premiumActivationLimit = normalizeActivationLimit(input.premiumActivationLimit, "premium");
+  const now = new Date().toISOString();
+
+  await c.env.merlin_db
+    .prepare(
+      `
+        UPDATE licenses
+        SET name = ?, normal_activation_limit = ?, premium_activation_limit = ?, updated_at = ?
+        WHERE id = ?
+      `,
+    )
+    .bind(name, normalActivationLimit, premiumActivationLimit, now, current.id)
+    .run();
+
+  const updated = await getLicense(c, id);
+  if (actor) {
+    await writeAdminAuditLog(c, {
+      adminUserId: actor.adminUserId,
+      action: "license_updated",
+      entityType: "license",
+      entityId: String(updated.id),
+      ipHash: actor.ipHash,
+      userAgentHash: actor.userAgentHash,
+      metadata: {
+        licenseType: "test",
+        normalActivationLimit,
+        premiumActivationLimit,
+      },
+    });
+  }
+  return updated;
+}
+
+export async function resetTestLicenseUsage(c: AppContext, id: number, actor?: LicenseActionActor) {
+  const current = await getLicense(c, id);
+  if ((current.license_type || "normal") !== "test") {
+    throw new HTTPException(400, { message: "Esta licença não é uma licença de teste." });
+  }
+
+  const now = new Date().toISOString();
+  await c.env.merlin_db
+    .prepare(`UPDATE licenses SET activation_usage_reset_at = ?, updated_at = ? WHERE id = ?`)
+    .bind(now, now, current.id)
+    .run();
+
+  const updated = await getLicense(c, id);
+  if (actor) {
+    await writeAdminAuditLog(c, {
+      adminUserId: actor.adminUserId,
+      action: "license_updated",
+      entityType: "license",
+      entityId: String(updated.id),
+      ipHash: actor.ipHash,
+      userAgentHash: actor.userAgentHash,
+      metadata: { licenseType: "test", resetUsageAt: now },
     });
   }
   return updated;
