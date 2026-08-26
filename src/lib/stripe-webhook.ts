@@ -4,7 +4,17 @@ import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePaymentFailedNotification } from "./billing-notifications";
 import { assertRecentPublicEmailVerification } from "./email-verification";
-import { LIFETIME_EXPIRES_AT, UPGRADE_OPERATION } from "./public-access-management";
+import { normalizeStoredPlanTier } from "./plan-tiers";
+import {
+  LIFETIME_EXPIRES_AT,
+  UPGRADE_OPERATION,
+} from "./public-access-management";
+import {
+  markPlanChangePaymentProblem,
+  markSubscriptionScheduleEvent,
+  syncInvoicePlanChangeFromStripe,
+  syncSubscriptionPlanFromStripe,
+} from "./subscription-plan-change";
 
 const PROVIDER_STRIPE = "stripe";
 const SIGNATURE_TOLERANCE_SECONDS = 300;
@@ -22,7 +32,8 @@ type CheckoutRow = {
   provider_session_id: string;
   provider_price_id: string;
   provider_subscription_id: string | null;
-  plan_type: "monthly" | "lifetime";
+  plan_tier: string | null;
+  plan_type: "monthly" | "annual" | "lifetime";
   mode: "subscription" | "payment";
   status: string;
   payment_status: string | null;
@@ -75,6 +86,7 @@ type StripeSubscription = {
   id: string;
   object: "subscription";
   status?: string;
+  current_period_start?: number | null;
   current_period_end?: number | null;
   cancel_at?: number | null;
   cancel_at_period_end?: boolean;
@@ -295,6 +307,10 @@ function getSubscriptionEffectivePeriodEnd(subscription: Pick<StripeSubscription
   return unixToIso(subscription.current_period_end) || unixToIso(subscription.cancel_at);
 }
 
+function getSubscriptionEffectivePeriodStart(subscription: Pick<StripeSubscription, "current_period_start">) {
+  return unixToIso(subscription.current_period_start);
+}
+
 function requestOrigin(c: AppContext) {
   const url = new URL(c.req.raw.url);
   return `${url.protocol}//${url.host}`;
@@ -308,6 +324,21 @@ function oneMonthFromNowIso() {
   const next = new Date();
   next.setUTCMonth(next.getUTCMonth() + 1);
   return next.toISOString();
+}
+
+function oneYearFromNowIso() {
+  const next = new Date();
+  next.setUTCFullYear(next.getUTCFullYear() + 1);
+  return next.toISOString();
+}
+
+function subscriptionFallbackPeriodEnd(planType: CheckoutRow["plan_type"], trialDays: number | null) {
+  if (trialDays) return daysFromNowIso(trialDays);
+  return planType === "annual" ? oneYearFromNowIso() : oneMonthFromNowIso();
+}
+
+function subscriptionAccessType(planType: CheckoutRow["plan_type"]) {
+  return planType === "annual" ? "annual_subscription" : "monthly_subscription";
 }
 
 function daysFromNowIso(days: number) {
@@ -336,7 +367,7 @@ async function getCheckoutBySessionId(c: AppContext, sessionId: string) {
   return c.env.merlin_db
     .prepare(
       `
-        SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
+        SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
           pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
         FROM checkout_sessions
@@ -353,7 +384,7 @@ async function getCheckoutBySubscriptionId(c: AppContext, subscriptionId: string
   return c.env.merlin_db
     .prepare(
       `
-        SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
+        SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
           pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
         FROM checkout_sessions
@@ -371,7 +402,7 @@ async function getLatestCheckoutByEmail(c: AppContext, emailNormalized: string) 
   return c.env.merlin_db
     .prepare(
       `
-        SELECT cs.id, cs.customer_id, cs.provider_session_id, cs.provider_price_id, cs.provider_subscription_id, cs.plan_type, cs.mode, cs.status, cs.payment_status, cs.license_id, cs.reactivation_license_id,
+        SELECT cs.id, cs.customer_id, cs.provider_session_id, cs.provider_price_id, cs.provider_subscription_id, cs.plan_tier, cs.plan_type, cs.mode, cs.status, cs.payment_status, cs.license_id, cs.reactivation_license_id,
           cs.operation_type, cs.upgrade_license_id, cs.upgrade_subscription_id, cs.upgrade_processed_at,
           cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at, cs.checkout_evidence_json
         FROM checkout_sessions cs
@@ -434,11 +465,12 @@ async function activateLicenseFromCheckout(
   c: AppContext,
   checkout: CheckoutRow,
   input: {
-    accessType: "paid_lifetime" | "monthly_subscription";
+    accessType: "paid_lifetime" | "monthly_subscription" | "annual_subscription";
     billingStatus: "active" | "past_due" | "canceled" | "expired";
     expiresAt: string;
     stripeCustomerId: string | null;
     subscriptionId: string | null;
+    currentPeriodStart?: string | null;
     currentPeriodEnd: string | null;
     cancelAtPeriodEnd?: boolean;
     checkoutPaymentStatus?: string;
@@ -465,6 +497,7 @@ async function activateLicenseFromCheckout(
       throw new Error(`Checkout ${checkout.provider_session_id} is missing pending reactivation data`);
     }
     const now = new Date().toISOString();
+    const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
     await c.env.merlin_db
       .prepare(
         `
@@ -479,12 +512,15 @@ async function activateLicenseFromCheckout(
               revoked_origin = NULL,
               revoked_event_id = NULL,
               source = 'stripe',
+              plan_tier = ?,
+              premium_catalog_restricted = 0,
               customer_id = ?,
               access_type = ?,
               billing_status = ?,
               stripe_customer_id = ?,
               stripe_subscription_id = ?,
               stripe_checkout_session_id = ?,
+              billing_current_period_start = ?,
               billing_current_period_end = ?,
               billing_cancel_at_period_end = ?,
               updated_at = ?
@@ -496,12 +532,14 @@ async function activateLicenseFromCheckout(
         checkout.pending_recovery_pin_hash,
         checkout.pending_recovery_notice_accepted_at || now,
         input.expiresAt,
+        planTier,
         customer.id,
         input.accessType,
         input.billingStatus,
         input.stripeCustomerId || customer.stripe_customer_id,
         input.subscriptionId,
         checkout.provider_session_id,
+        input.currentPeriodStart || now,
         input.currentPeriodEnd,
         input.cancelAtPeriodEnd ? 1 : 0,
         now,
@@ -539,24 +577,26 @@ async function activateLicenseFromCheckout(
   }
 
   const now = new Date().toISOString();
+  const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
   let createdId: number | null = null;
   try {
     const result = await c.env.merlin_db
       .prepare(
         `
           INSERT INTO licenses (
-            license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status,
+            license_key, name, contact, contact_type, source, plan_tier, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status,
             revoked_reason, created_at, updated_at, customer_id, access_type, billing_status, stripe_customer_id, stripe_subscription_id,
-            stripe_checkout_session_id, billing_current_period_end, billing_cancel_at_period_end
+            stripe_checkout_session_id, billing_current_period_start, billing_current_period_end, billing_cancel_at_period_end
           )
-          VALUES (?, ?, ?, 'email', 'stripe', ?, ?, NULL, ?, 'active',
-            NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, 'email', 'stripe', ?, ?, ?, NULL, ?, 'active',
+            NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .bind(
         checkout.pending_license_key,
         checkout.pending_name,
         customer.email_normalized || customer.email,
+        planTier,
         checkout.pending_recovery_pin_hash,
         checkout.pending_recovery_notice_accepted_at || now,
         input.expiresAt,
@@ -568,6 +608,7 @@ async function activateLicenseFromCheckout(
         input.stripeCustomerId || customer.stripe_customer_id,
         input.subscriptionId,
         checkout.provider_session_id,
+        input.currentPeriodStart || now,
         input.currentPeriodEnd,
         input.cancelAtPeriodEnd ? 1 : 0,
       )
@@ -766,6 +807,7 @@ async function handleLifetimeUpgradeCheckoutCompleted(c: AppContext, checkout: C
         `
           UPDATE licenses
           SET access_type = 'paid_lifetime',
+              premium_catalog_restricted = 0,
               billing_status = 'active',
               expires_at = ?,
               stripe_subscription_id = NULL,
@@ -882,21 +924,23 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
     await cancelCustomerSubscriptionsAtPeriodEnd(c, checkout.customer_id);
   }
 
-  if (checkout.plan_type === "monthly") {
+  if (checkout.plan_type === "monthly" || checkout.plan_type === "annual") {
     const cardTrialDays = getCheckoutCardTrialDays(checkout);
     const isPaid = paymentStatus === "paid";
     const isTrialCheckout = !isPaid && Boolean(subscriptionId) && Boolean(cardTrialDays);
     if (!isPaid && !isTrialCheckout) {
       return;
     }
-    const periodEnd = isTrialCheckout ? daysFromNowIso(cardTrialDays || 30) : oneMonthFromNowIso();
+    const periodEnd = subscriptionFallbackPeriodEnd(checkout.plan_type, isTrialCheckout ? cardTrialDays || 30 : null);
+    const periodStart = new Date().toISOString();
     const checkoutPaymentStatus = isTrialCheckout ? "trialing" : "paid";
     const license = await activateLicenseFromCheckout(c, checkout, {
-      accessType: "monthly_subscription",
+      accessType: subscriptionAccessType(checkout.plan_type),
       billingStatus: "active",
       expiresAt: dateOrLifetime(periodEnd),
       stripeCustomerId,
       subscriptionId,
+      currentPeriodStart: periodStart,
       currentPeriodEnd: periodEnd,
       checkoutPaymentStatus,
     });
@@ -951,6 +995,14 @@ function getInvoicePeriodEnd(invoice: Record<string, unknown>) {
   return unixToIso(period?.end);
 }
 
+function getInvoicePeriodStart(invoice: Record<string, unknown>) {
+  const lines = getObject(invoice.lines);
+  const lineItems = Array.isArray(lines?.data) ? lines.data : [];
+  const firstLine = getObject(lineItems[0]);
+  const period = getObject(firstLine?.period);
+  return unixToIso(period?.start);
+}
+
 async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>) {
   const subscriptionId = getInvoiceSubscriptionId(invoice);
   if (!subscriptionId) {
@@ -958,18 +1010,21 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
   }
   const checkout = await getCheckoutBySubscriptionId(c, subscriptionId);
   if (!checkout) {
+    await syncInvoicePlanChangeFromStripe(c, invoice);
     return;
   }
 
   const periodEnd = getInvoicePeriodEnd(invoice);
+  const periodStart = getInvoicePeriodStart(invoice);
   const expiresAt = dateOrLifetime(periodEnd);
   const stripeCustomerId = getStripeId(invoice.customer);
   const license = await activateLicenseFromCheckout(c, checkout, {
-    accessType: "monthly_subscription",
+    accessType: subscriptionAccessType(checkout.plan_type),
     billingStatus: "active",
     expiresAt,
     stripeCustomerId,
     subscriptionId,
+    currentPeriodStart: periodStart,
     currentPeriodEnd: periodEnd,
   });
   await configureStripeSubscriptionForRenewals(c, subscriptionId);
@@ -978,11 +1033,11 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     .prepare(
       `
         UPDATE licenses
-        SET expires_at = ?, billing_status = 'active', billing_current_period_end = ?, stripe_subscription_id = ?, updated_at = ?
+        SET expires_at = ?, billing_status = 'active', billing_current_period_start = COALESCE(?, billing_current_period_start), billing_current_period_end = ?, stripe_subscription_id = ?, updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(expiresAt, periodEnd, subscriptionId, new Date().toISOString(), license.id)
+    .bind(expiresAt, periodStart, periodEnd, subscriptionId, new Date().toISOString(), license.id)
     .run();
 
   await saveSubscription(c, {
@@ -1004,6 +1059,7 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     status: "paid",
     paymentType: "subscription",
   });
+  await syncInvoicePlanChangeFromStripe(c, invoice);
 }
 
 async function updateSubscriptionStatus(c: AppContext, subscription: Record<string, unknown>) {
@@ -1012,6 +1068,7 @@ async function updateSubscriptionStatus(c: AppContext, subscription: Record<stri
     return;
   }
   const currentPeriodEnd = getSubscriptionEffectivePeriodEnd(subscription);
+  const currentPeriodStart = getSubscriptionEffectivePeriodStart(subscription);
   const cancelAtPeriodEnd = isSubscriptionCancelScheduled(subscription);
   const status = getString(subscription.status) || "unknown";
 
@@ -1035,13 +1092,15 @@ async function updateSubscriptionStatus(c: AppContext, subscription: Record<stri
     .prepare(
       `
         UPDATE licenses
-        SET billing_status = ?, billing_current_period_end = COALESCE(?, billing_current_period_end),
+        SET billing_status = ?, billing_current_period_start = COALESCE(?, billing_current_period_start),
+            billing_current_period_end = COALESCE(?, billing_current_period_end),
             billing_cancel_at_period_end = ?, updated_at = ?
         WHERE stripe_subscription_id = ?
       `,
     )
-    .bind(billingStatus, currentPeriodEnd, cancelAtPeriodEnd ? 1 : 0, new Date().toISOString(), subscriptionId)
+    .bind(billingStatus, currentPeriodStart, currentPeriodEnd, cancelAtPeriodEnd ? 1 : 0, new Date().toISOString(), subscriptionId)
     .run();
+  await syncSubscriptionPlanFromStripe(c, subscription, { paymentConfirmed: false });
 }
 
 async function handleInvoiceFailed(c: AppContext, invoice: Record<string, unknown>) {
@@ -1057,6 +1116,7 @@ async function handleInvoiceFailed(c: AppContext, invoice: Record<string, unknow
     .prepare(`UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
     .bind(new Date().toISOString(), PROVIDER_STRIPE, subscriptionId)
     .run();
+  await markPlanChangePaymentProblem(c, invoice, "payment_failed");
 
   c.executionCtx.waitUntil(sendStripeInvoicePaymentFailedNotification(c, {
     subscriptionId,
@@ -1081,6 +1141,7 @@ async function handleInvoicePaymentActionRequired(c: AppContext, invoice: Record
     .prepare(`UPDATE subscriptions SET status = 'action_required', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
     .bind(now, PROVIDER_STRIPE, subscriptionId)
     .run();
+  await markPlanChangePaymentProblem(c, invoice, "payment_action_required");
 
   c.executionCtx.waitUntil(sendStripeInvoicePaymentActionRequiredNotification(c, {
     subscriptionId,
@@ -1483,6 +1544,12 @@ export async function processStripeWebhookEvent(c: AppContext, event: StripeEven
       await handleChargeRefunded(c, object);
     } else if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
       await updateSubscriptionStatus(c, object);
+    } else if (event.type === "subscription_schedule.released") {
+      await markSubscriptionScheduleEvent(c, object, "released");
+    } else if (event.type === "subscription_schedule.canceled") {
+      await markSubscriptionScheduleEvent(c, object, "canceled");
+    } else if (event.type === "subscription_schedule.completed") {
+      await markSubscriptionScheduleEvent(c, object, "completed");
     }
 
     await markPaymentEvent(c, event.id, "processed");

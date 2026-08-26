@@ -165,10 +165,10 @@ dist
 .env*
 !.env.example
 .wrangler/
+.wrangler-dryrun/
 wrangler.jsonc
 worker-configuration.d.ts
 
 seed-admin.sql
 update-admin-password.sql
 tmp/
-docs/

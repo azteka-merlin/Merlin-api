@@ -7,6 +7,7 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   RESEND_API_KEY: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_MONTHLY_PRICE_ID?: string;
+  STRIPE_ANNUAL_PRICE_ID?: string;
   STRIPE_LIFETIME_PRICE_ID?: string;
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_BILLING_PORTAL_CONFIGURATION_ID?: string;
@@ -38,6 +39,7 @@ export const VersionResponse = z.object({
 });
 
 export const LicenseStatus = z.enum(["active", "revoked", "expired"]);
+export const PlanTier = z.enum(["bronze", "prata", "ouro"]);
 
 export const LoginRequest = z.object({
 	licenseKey: z
@@ -56,6 +58,7 @@ export const LoginResponse = z.object({
 		name: z.string(),
 		expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 		status: LicenseStatus,
+		planTier: PlanTier.optional(),
 		billing: z.object({
 			accessType: z.string(),
 			billingStatus: z.string(),
@@ -118,11 +121,12 @@ export const PublicEmailVerificationStartResponse = z.object({
 	success: z.literal(true),
 	cooldownSeconds: z.number().int().positive(),
 	expiresIn: z.number().int().positive(),
+	deliveryMode: z.enum(["email", "staging_test"]),
 });
 
 export const PublicEmailVerificationVerifyRequest = z.object({
 	email: z.string().trim().email().max(254),
-	code: z.string().trim().regex(/^\d{6}$/),
+	code: z.string().trim().regex(/^(?:\d{6}|12345)$/),
 });
 
 export const PublicEmailVerificationVerifyResponse = z.object({
@@ -146,6 +150,7 @@ export const CreateLicenseRequest = z.object({
 		.optional()
 		.describe("License expiration date in YYYY-MM-DD format"),
 	licenseType: z.enum(["normal", "test"]).optional().default("normal"),
+	planTier: PlanTier.nullable().optional(),
 	normalActivationLimit: z.number().int().min(0).max(9999).optional(),
 	premiumActivationLimit: z.number().int().min(0).max(9999).optional(),
 }).refine((value) => value.licenseType === "test" || Boolean(value.contact || value.phone), {
@@ -170,6 +175,8 @@ export const LicenseResponse = z.object({
 	contactType: z.enum(["phone", "email", "discord", "none"]),
 	source: z.string(),
 	licenseType: z.enum(["normal", "test"]).optional(),
+	planTier: PlanTier.nullable().optional(),
+	premiumCatalogRestricted: z.boolean().optional(),
 	normalActivationLimit: z.number().int().nonnegative().nullable().optional(),
 	premiumActivationLimit: z.number().int().nonnegative().nullable().optional(),
 	normalActivationUsed: z.number().int().nonnegative().optional(),
@@ -191,6 +198,7 @@ export const LicenseResponse = z.object({
 	stripeSubscriptionId: z.string().nullable().optional(),
 	stripeCheckoutSessionId: z.string().nullable().optional(),
 	billingCurrentPeriodEnd: z.string().nullable().optional(),
+	billingCurrentPeriodStart: z.string().nullable().optional(),
 	billingCancelAtPeriodEnd: z.boolean().optional(),
 	createdAt: z.string().datetime(),
 	updatedAt: z.string().datetime(),

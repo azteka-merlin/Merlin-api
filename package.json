@@ -8,6 +8,7 @@
                     "dev":  "wrangler dev",
                     "start":  "wrangler dev",
                     "typecheck":  "tsc --noEmit",
+                    "test":  "vitest run",
                     "types":  "wrangler types",
                     "types:stage":  "wrangler types --env staging",
                     "cf-typegen":  "wrangler types",
@@ -26,6 +27,7 @@
     "devDependencies":  {
                             "@types/node":  "^25.9.4",
                             "typescript":  "^6.0.3",
+                            "vitest":  "^4.1.11",
                             "wrangler":  "^4.103.0"
                         }
 }

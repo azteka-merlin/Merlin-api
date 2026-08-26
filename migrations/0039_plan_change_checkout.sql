@@ -1,0 +1,5 @@
+ALTER TABLE subscription_plan_changes ADD COLUMN stripe_checkout_session_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_subscription_plan_changes_checkout
+ON subscription_plan_changes(stripe_checkout_session_id)
+WHERE stripe_checkout_session_id IS NOT NULL;

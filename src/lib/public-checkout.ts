@@ -5,6 +5,8 @@ import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, typ
 import { findLicenseByEmailContact, normalizeContact } from "./admin-license-service";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { generateLicenseKey } from "./licenses";
+import { getCardPlanPrice } from "./subscription-plan-change";
+import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
@@ -37,6 +39,7 @@ type OpenCheckoutRow = {
   provider_session_id: string;
   provider_session_url: string | null;
   provider_session_expires_at: string | null;
+  plan_tier: PlanTier | null;
   plan_type: BillingPlanType;
   status: string;
   payment_status: string | null;
@@ -54,6 +57,7 @@ export type PublicCheckoutInput = {
   recoveryPin: string;
   acceptedRecoveryNotice: boolean;
   planType: BillingPlanType;
+  planTier?: PlanTier | null;
 };
 
 function encodeBasicAuth(secretKey: string) {
@@ -99,7 +103,7 @@ async function stripePost<T>(c: AppContext, path: string, params: URLSearchParam
 }
 
 function checkoutMode(planType: BillingPlanType) {
-  return planType === "monthly" ? "subscription" : "payment";
+  return planType === "lifetime" ? "payment" : "subscription";
 }
 
 function normalizeEmail(email: string) {
@@ -125,6 +129,7 @@ function getCheckoutUserAgent(c: AppContext) {
 function buildCheckoutEvidence(input: {
   emailVerifiedAt: string | null;
   planType: BillingPlanType;
+  planTier: PlanTier | null;
   priceId: string;
   amountCents: number;
   currency: string;
@@ -135,6 +140,7 @@ function buildCheckoutEvidence(input: {
   return JSON.stringify({
     emailVerifiedAt: input.emailVerifiedAt,
     planType: input.planType,
+    planTier: input.planTier,
     priceId: input.priceId,
     amountCents: input.amountCents,
     currency: input.currency,
@@ -245,7 +251,7 @@ async function findPendingCheckout(c: AppContext, customerId: number) {
   return c.env.merlin_db
     .prepare(
       `
-        SELECT provider_session_id, provider_session_url, provider_session_expires_at, plan_type, status, payment_status, reactivation_license_id
+        SELECT provider_session_id, provider_session_url, provider_session_expires_at, plan_tier, plan_type, status, payment_status, reactivation_license_id
         FROM checkout_sessions
         WHERE customer_id = ?
           AND provider = ?
@@ -304,14 +310,16 @@ async function findCheckoutByIdempotencyKey(c: AppContext, idempotencyKey: strin
     .first<CheckoutSessionByIdempotencyRow>();
 }
 
-function isSameCheckoutContext(checkout: OpenCheckoutRow, planType: BillingPlanType, reactivationLicenseId: number | null) {
-  return checkout.plan_type === planType && (checkout.reactivation_license_id ?? null) === reactivationLicenseId;
+function isSameCheckoutContext(checkout: OpenCheckoutRow, planType: BillingPlanType, planTier: PlanTier | null, reactivationLicenseId: number | null) {
+  return checkout.plan_type === planType
+    && (checkout.plan_tier ?? null) === planTier
+    && (checkout.reactivation_license_id ?? null) === reactivationLicenseId;
 }
 
-function isReusableCheckout(checkout: OpenCheckoutRow, planType: BillingPlanType, reactivationLicenseId: number | null) {
+function isReusableCheckout(checkout: OpenCheckoutRow, planType: BillingPlanType, planTier: PlanTier | null, reactivationLicenseId: number | null) {
   return checkout.status === "open"
     && Boolean(checkout.provider_session_url)
-    && isSameCheckoutContext(checkout, planType, reactivationLicenseId);
+    && isSameCheckoutContext(checkout, planType, planTier, reactivationLicenseId);
 }
 
 function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEmailContact>>) {
@@ -320,6 +328,10 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
   }
   if (existingLicense.billing_status === "dispute_open") {
     return false;
+  }
+  // A free legacy access can become a paid plan without minting a second key.
+  if (existingLicense.status === "active" && existingLicense.access_type === "free") {
+    return true;
   }
   if (existingLicense.status === "active" || existingLicense.status === "expired") {
     const expiresAt = new Date(existingLicense.expires_at);
@@ -332,11 +344,11 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
     || existingLicense.revoked_origin === "stripe_subscription";
 }
 
-function isActiveMonthlyCancelingAtPeriodEnd(existingLicense: Awaited<ReturnType<typeof findLicenseByEmailContact>>) {
+function isActiveSubscriptionCancelingAtPeriodEnd(existingLicense: Awaited<ReturnType<typeof findLicenseByEmailContact>>) {
   if (!existingLicense) {
     return false;
   }
-  if (existingLicense.status !== "active" || existingLicense.access_type !== "monthly_subscription") {
+  if (existingLicense.status !== "active" || !["monthly_subscription", "annual_subscription"].includes(existingLicense.access_type || "")) {
     return false;
   }
   if (!existingLicense.billing_cancel_at_period_end) {
@@ -365,8 +377,9 @@ async function createStripeCheckoutSession(
     customerId: number;
     stripeCustomerId: string;
     email: string;
-    planType: BillingPlanType;
-    priceId: string;
+  planType: BillingPlanType;
+  planTier: PlanTier | null;
+  priceId: string;
     idempotencyKey: string;
     trialDays?: number | null;
   },
@@ -385,13 +398,15 @@ async function createStripeCheckoutSession(
   params.set("expires_at", String(Math.floor(Date.now() / 1000) + CHECKOUT_SESSION_TTL_SECONDS));
   params.set("metadata[merlin_customer_id]", String(input.customerId));
   params.set("metadata[plan_type]", input.planType);
+  if (input.planTier) params.set("metadata[plan_tier]", input.planTier);
   params.set("metadata[email]", input.email);
-  if (input.planType === "monthly") {
+  if (input.planType !== "lifetime") {
     if (input.trialDays) {
       params.set("subscription_data[trial_period_days]", String(input.trialDays));
     }
     params.set("subscription_data[metadata][merlin_customer_id]", String(input.customerId));
     params.set("subscription_data[metadata][plan_type]", input.planType);
+    if (input.planTier) params.set("subscription_data[metadata][plan_tier]", input.planTier);
     params.set("subscription_data[metadata][email]", input.email);
   } else {
     params.set("payment_intent_data[metadata][merlin_customer_id]", String(input.customerId));
@@ -411,6 +426,7 @@ async function createStripeCheckoutSession(
 function buildCheckoutIdempotencyKey(input: {
   customerId: number;
   planType: BillingPlanType;
+  planTier: PlanTier | null;
   reactivationLicenseId: number | null;
 }) {
   const bucket = Math.floor(Date.now() / (CHECKOUT_SESSION_TTL_SECONDS * 1000));
@@ -418,6 +434,7 @@ function buildCheckoutIdempotencyKey(input: {
     "merlin_checkout",
     input.customerId,
     input.planType,
+    input.planTier || "legacy",
     input.reactivationLicenseId || "new",
     bucket,
   ].join(":");
@@ -430,6 +447,9 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   }
   if (!billing.billingEnabled) {
     throw new HTTPException(409, { message: "Pagamento publico esta desativado." });
+  }
+  if (billing.plansEnabled && input.planType === "lifetime") {
+    throw new HTTPException(409, { message: "Novos acessos vitalicios nao estao disponiveis com a estrutura de planos ativa." });
   }
 
   const name = input.name.trim();
@@ -444,8 +464,8 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const existingLicense = await findLicenseByEmailContact(c, email);
   const reactivationLicenseId = existingLicense && canPayAgain(existingLicense) ? existingLicense.id : null;
   if (existingLicense && !reactivationLicenseId) {
-    if (isActiveMonthlyCancelingAtPeriodEnd(existingLicense)) {
-      throw new HTTPException(409, { message: "Sua mensalidade ainda esta ativa ate o fim do periodo pago. Use a opcao Gerenciar mensalidade para reativar ou alterar a assinatura." });
+    if (isActiveSubscriptionCancelingAtPeriodEnd(existingLicense)) {
+      throw new HTTPException(409, { message: "Sua assinatura ainda esta ativa ate o fim do periodo pago. Use a opcao Gerenciar assinatura para reativar ou alterar." });
     }
     if (existingLicense.status === "revoked") {
       throw new HTTPException(409, { message: "Esta licenca nao pode ser reativada automaticamente. Fale com o suporte." });
@@ -458,8 +478,23 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
 
-  const planEnabled = input.planType === "monthly" ? billing.monthlyEnabled : billing.lifetimeEnabled;
-  const priceId = input.planType === "monthly" ? billing.monthlyPriceId : billing.lifetimePriceId;
+  const planEnabled = input.planType === "monthly"
+    ? billing.monthlyEnabled
+    : input.planType === "annual"
+      ? billing.annualEnabled
+      : billing.lifetimeEnabled;
+  const selectedTier = input.planTier ? normalizeStoredPlanTier(input.planTier, "ouro") : null;
+  if (billing.plansEnabled && input.planType !== "lifetime" && !selectedTier) {
+    throw new HTTPException(400, { message: "Escolha um plano Bronze, Prata ou Ouro." });
+  }
+  const tierPrice = billing.plansEnabled && selectedTier && input.planType !== "lifetime"
+    ? await getCardPlanPrice(c, selectedTier, input.planType)
+    : null;
+  const priceId = tierPrice?.provider_price_id || (input.planType === "monthly"
+    ? billing.monthlyPriceId
+    : input.planType === "annual"
+      ? billing.annualPriceId
+      : billing.lifetimePriceId);
   if (!planEnabled || !priceId) {
     throw new HTTPException(400, { message: "Plano indisponivel." });
   }
@@ -476,7 +511,8 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const emailVerifiedAt = customer.email_verified_at || now;
   await expireStaleOpenCheckouts(c, customer.id);
   const pendingCheckout = await findPendingCheckout(c, customer.id);
-  if (pendingCheckout && isReusableCheckout(pendingCheckout, input.planType, reactivationLicenseId) && pendingCheckout.provider_session_url) {
+  const checkoutPlanTier = billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null;
+  if (pendingCheckout && isReusableCheckout(pendingCheckout, input.planType, checkoutPlanTier, reactivationLicenseId) && pendingCheckout.provider_session_url) {
     await consumePublicEmailVerification(c, verificationId);
     return {
       checkoutUrl: pendingCheckout.provider_session_url,
@@ -500,6 +536,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const idempotencyKey = buildCheckoutIdempotencyKey({
     customerId: customer.id,
     planType: input.planType,
+    planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
     reactivationLicenseId,
   });
   const licenseKey = reactivationLicenseId ? existingLicense?.license_key || "" : generateLicenseKey();
@@ -512,6 +549,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     stripeCustomerId,
     email,
     planType: input.planType,
+    planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
     priceId,
     idempotencyKey,
     trialDays: cardTrialDays,
@@ -523,6 +561,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const checkoutEvidence = buildCheckoutEvidence({
     emailVerifiedAt,
     planType: input.planType,
+    planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
     priceId,
     amountCents: price.amountCents,
     currency: price.currency,
@@ -540,6 +579,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
             provider,
             provider_session_id,
             provider_price_id,
+            plan_tier,
             plan_type,
             mode,
             status,
@@ -559,7 +599,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
             created_at,
             updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       )
       .bind(
@@ -567,6 +607,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
         PROVIDER_STRIPE,
         session.id,
         priceId,
+        billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
         input.planType,
         checkoutMode(input.planType),
         session.status || "open",

@@ -115,3 +115,17 @@ export async function enforcePublicEmailVerificationRateLimit(c: AppContext, ema
 		await enforceLimit(env.LOGIN_RATE_LIMITER, key, PUBLIC_EMAIL_LIMIT_MESSAGE, "public-email");
 	}
 }
+
+export async function enforcePublicAccessCredentialsRateLimit(c: AppContext, email: string) {
+  const env = c.env as typeof c.env & RateLimitBindings;
+  const clientIp = getClientIp(c);
+  const normalizedEmail = email.trim().toLowerCase();
+  const keys = [
+    clientIp ? `public-access-credentials:ip:${clientIp}` : null,
+    normalizedEmail ? `public-access-credentials:email:${normalizedEmail}` : null,
+  ].filter((key): key is string => Boolean(key));
+
+  for (const key of keys) {
+    await enforceLimit(env.LOGIN_RATE_LIMITER, key, PUBLIC_ACCESS_LIMIT_MESSAGE, "public-access-credentials");
+  }
+}

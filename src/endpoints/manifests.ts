@@ -126,19 +126,6 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 	};
 	const sources: ManifestSource[] = [];
 
-	if (env.RYU_API_URL && env.RYUU_AUTH_CODE) {
-		const ryuUrl = new URL(env.RYU_API_URL);
-		ryuUrl.searchParams.set("appid", appId);
-		ryuUrl.searchParams.set("auth_code", env.RYUU_AUTH_CODE);
-		sources.push({
-			name: "ryu",
-			url: ryuUrl.toString(),
-			init: { headers: commonHeaders },
-			maxAttempts: 1,
-			timeoutMs: SOURCE_TIMEOUT_MS,
-		});
-	}
-
 	if (env.DEPOTBOX_API_KEY) {
 		sources.push({
 			name: "depotbox",
@@ -152,6 +139,19 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 				},
 				body: JSON.stringify({ appid: appId }),
 			},
+			maxAttempts: 1,
+			timeoutMs: SOURCE_TIMEOUT_MS,
+		});
+	}
+
+	if (env.RYU_API_URL && env.RYUU_AUTH_CODE) {
+		const ryuUrl = new URL(env.RYU_API_URL);
+		ryuUrl.searchParams.set("appid", appId);
+		ryuUrl.searchParams.set("auth_code", env.RYUU_AUTH_CODE);
+		sources.push({
+			name: "ryu",
+			url: ryuUrl.toString(),
+			init: { headers: commonHeaders },
 			maxAttempts: 1,
 			timeoutMs: SOURCE_TIMEOUT_MS,
 		});

@@ -1,6 +1,17 @@
 import { HTTPException } from "hono/http-exception";
 import { assertPremiumActivationLimit } from "./license-activation-limits";
 import { requireLauncherLicense } from "./launcher-auth";
+import {
+  PLAN_RULES,
+  PLAN_TIERS,
+  premiumReleaseAt,
+  resolveCurrentMonthlyCycle,
+  resolveEffectivePlan,
+  getPlanSettings,
+  type EffectivePlan,
+  type PlanTier,
+} from "./plan-tiers";
+import { getPremiumCatalogCutoffAt } from "./billing-settings";
 import type { AppContext } from "../types";
 
 type PremiumGameMetadata = {
@@ -25,7 +36,7 @@ type FallbackCatalogEntry = {
   header_image?: string;
 };
 
-type PremiumActivationStatus = "reserved" | "active" | "expired" | "failed";
+type PremiumActivationStatus = "reserved" | "processing" | "active" | "expired" | "failed";
 type PremiumActivationType = "steam_ticket" | "third_party";
 
 type PremiumActivationRecord = {
@@ -52,6 +63,9 @@ export type PremiumGameRecord = {
   activation_type: PremiumActivationType | null;
   launch_executable_path: string | null;
   activation_limit: number;
+  access_bronze_enabled?: number | null;
+  access_prata_enabled?: number | null;
+  access_ouro_enabled?: number | null;
   enabled: number;
   created_at: string;
   updated_at: string;
@@ -67,6 +81,9 @@ export type PremiumGame = {
   activationType: PremiumActivationType;
   launchExecutablePath: string | null;
   activationLimit: number;
+  accessBronzeEnabled: boolean;
+  accessPrataEnabled: boolean;
+  accessOuroEnabled: boolean;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -103,12 +120,35 @@ export type PremiumCatalogItem = {
     }>;
   };
   viewer: {
-    status: "available" | "cooldown" | "reserved" | "unavailable";
+    status: "available" | "cooldown" | "reserved" | "unavailable" | "locked";
     canActivate: boolean;
     cooldownUntil: string | null;
     reservedUntil: string | null;
     lastActivatedAt: string | null;
+    lockedReason: "tier_release_pending" | "tier_disabled" | "bronze_limit" | "free_catalog_cutoff" | null;
+    releaseAvailableAt: string | null;
+    nearestAvailableTier: PlanTier | null;
+    planTier: PlanTier;
+    plansEnabled: boolean;
+    premiumActivationsUsed: number | null;
+    premiumActivationLimit: number | null;
+    premiumActivationsResetAt: string | null;
+    tierAvailability: Array<{
+      tier: PlanTier;
+      availableNow: boolean;
+      availableAt: string | null;
+    }>;
   };
+};
+
+type PremiumLicensePlanRow = {
+  id: number;
+  license_type: string | null;
+  plan_tier: string | null;
+  created_at: string | null;
+  billing_current_period_start: string | null;
+  billing_current_period_end: string | null;
+  premium_catalog_restricted: number;
 };
 
 export type PremiumReservationResult = {
@@ -131,6 +171,9 @@ export type PremiumGameCreateInput = {
   activationType?: PremiumActivationType | null;
   launchExecutablePath?: string | null;
   activationLimit?: number | null;
+  accessBronzeEnabled?: boolean | null;
+  accessPrataEnabled?: boolean | null;
+  accessOuroEnabled?: boolean | null;
   enabled?: boolean | null;
 };
 
@@ -142,6 +185,9 @@ export type PremiumGameUpdateInput = {
   activationType?: PremiumActivationType | null;
   launchExecutablePath?: string | null;
   activationLimit?: number | null;
+  accessBronzeEnabled?: boolean | null;
+  accessPrataEnabled?: boolean | null;
+  accessOuroEnabled?: boolean | null;
   enabled?: boolean | null;
 };
 
@@ -246,6 +292,9 @@ function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
     activationType: normalizeActivationType(row.activation_type),
     launchExecutablePath: row.launch_executable_path,
     activationLimit: row.activation_limit,
+    accessBronzeEnabled: row.access_bronze_enabled === 1,
+    accessPrataEnabled: row.access_prata_enabled === 1,
+    accessOuroEnabled: row.access_ouro_enabled !== 0,
     enabled: Boolean(row.enabled),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -269,7 +318,111 @@ function isActiveActivation(record: PremiumActivationRecord, nowIso: string): bo
 
 function isReservedActivation(record: PremiumActivationRecord, nowIso: string): boolean {
   const reservedUntil = getReservedUntil(record);
-  return record.status === "reserved" && Boolean(reservedUntil) && String(reservedUntil) > nowIso;
+  return (record.status === "reserved" || record.status === "processing") && Boolean(reservedUntil) && String(reservedUntil) > nowIso;
+}
+
+async function getPremiumLicensePlan(c: AppContext, licenseId: number): Promise<{ license: PremiumLicensePlanRow; plan: EffectivePlan }> {
+  const [settings, license] = await Promise.all([
+    getPlanSettings(c),
+    c.env.merlin_db
+      .prepare(`
+        SELECT id, COALESCE(license_type, 'normal') AS license_type, plan_tier, created_at,
+          billing_current_period_start,
+          billing_current_period_end,
+          COALESCE(premium_catalog_restricted, 0) AS premium_catalog_restricted
+        FROM licenses
+        WHERE id = ?
+        LIMIT 1
+      `)
+      .bind(licenseId)
+      .first<PremiumLicensePlanRow>(),
+  ]);
+
+  if (!license) {
+    throw new HTTPException(404, { message: "License not found" });
+  }
+
+  return {
+    license,
+    plan: resolveEffectivePlan(settings, license),
+  };
+}
+
+function tierManualAccess(game: PremiumGame, tier: PlanTier) {
+  if (tier === "bronze") return game.accessBronzeEnabled;
+  if (tier === "prata") return game.accessPrataEnabled;
+  return game.accessOuroEnabled;
+}
+
+function isPremiumCatalogCutoffLocked(game: PremiumGame, license: PremiumLicensePlanRow, catalogCutoffAt: string | null) {
+  if (license.premium_catalog_restricted !== 1 || !catalogCutoffAt) return false;
+  const cutoff = new Date(catalogCutoffAt);
+  const createdAt = new Date(game.createdAt);
+  return !Number.isNaN(cutoff.getTime())
+    && !Number.isNaN(createdAt.getTime())
+    && createdAt.getTime() > cutoff.getTime();
+}
+
+function isTierAvailableNow(game: PremiumGame, tier: PlanTier, now: Date) {
+  const releaseAt = premiumReleaseAt(game.createdAt, tier);
+  return tierManualAccess(game, tier) || Boolean(releaseAt && releaseAt <= now.toISOString());
+}
+
+function getTierAvailability(game: PremiumGame, now: Date): PremiumCatalogItem["viewer"]["tierAvailability"] {
+  return [...PLAN_TIERS].reverse().map((tier) => {
+    const availableNow = isTierAvailableNow(game, tier, now);
+    return {
+      tier,
+      availableNow,
+      availableAt: availableNow ? null : premiumReleaseAt(game.createdAt, tier),
+    };
+  });
+}
+
+function resolvePremiumTierAccess(game: PremiumGame, plan: EffectivePlan, license: PremiumLicensePlanRow, catalogCutoffAt: string | null, now = new Date()) {
+  if (!plan.plansEnabled) {
+    return {
+      allowed: true,
+      releaseAvailableAt: null,
+      nearestAvailableTier: null as PlanTier | null,
+      lockedReason: null as PremiumCatalogItem["viewer"]["lockedReason"],
+    };
+  }
+
+  if (isPremiumCatalogCutoffLocked(game, license, catalogCutoffAt)) {
+    return {
+      allowed: false,
+      releaseAvailableAt: null,
+      nearestAvailableTier: PLAN_TIERS.find((candidate) => isTierAvailableNow(game, candidate, now)) || null,
+      lockedReason: "free_catalog_cutoff" as const,
+    };
+  }
+
+  const tier = plan.effectiveTier;
+  const currentReleaseAt = premiumReleaseAt(game.createdAt, tier);
+  const allowed = isTierAvailableNow(game, tier, now);
+
+  if (allowed) {
+    return {
+      allowed: true,
+      releaseAvailableAt: null,
+      nearestAvailableTier: null as PlanTier | null,
+      lockedReason: null as PremiumCatalogItem["viewer"]["lockedReason"],
+    };
+  }
+
+  const currentRank = PLAN_RULES[tier].rank;
+  const nearestAvailableTier = PLAN_TIERS.find((candidate) => (
+    PLAN_RULES[candidate].rank > currentRank
+      && isTierAvailableNow(game, candidate, now)
+  )) || null;
+
+  return {
+    allowed: false,
+    releaseAvailableAt: currentReleaseAt,
+    nearestAvailableTier,
+    lockedReason: currentReleaseAt ? "tier_release_pending" as const : "tier_disabled" as const,
+  };
 }
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = METADATA_TIMEOUT_MS): Promise<Response> {
@@ -397,8 +550,16 @@ async function headArchiveAvailability(c: AppContext, archiveKey: string): Promi
     return false;
   }
 
-  const object = await c.env.MERLIN_ACTIVATIONS.head(archiveKey);
-  return Boolean(object);
+  try {
+    const object = await c.env.MERLIN_ACTIVATIONS.head(archiveKey);
+    return Boolean(object);
+  } catch (error) {
+    console.warn("Unable to check Premium archive availability", {
+      archiveKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
 }
 
 async function listCurrentPremiumActivations(c: AppContext, appIds: string[]): Promise<PremiumActivationRecord[]> {
@@ -423,7 +584,7 @@ async function listCurrentPremiumActivations(c: AppContext, appIds: string[]): P
         updated_at
       FROM premium_activations
       WHERE app_id IN (${placeholders})
-        AND status IN ('reserved', 'active')
+        AND status IN ('reserved', 'processing', 'active')
     `)
     .bind(...appIds)
     .all<PremiumActivationRecord>();
@@ -431,7 +592,9 @@ async function listCurrentPremiumActivations(c: AppContext, appIds: string[]): P
   return result.results || [];
 }
 
-async function listLicensePremiumActivations(c: AppContext, licenseId: number, appId: string): Promise<PremiumActivationRecord[]> {
+async function listLicensePremiumActivations(c: AppContext, licenseId: number, appId?: string): Promise<PremiumActivationRecord[]> {
+  const appFilter = appId ? "AND app_id = ?" : "";
+  const bindings = appId ? [licenseId, appId] : [licenseId];
   const result = await c.env.merlin_db
     .prepare(`
       SELECT
@@ -448,14 +611,86 @@ async function listLicensePremiumActivations(c: AppContext, licenseId: number, a
         updated_at
       FROM premium_activations
       WHERE license_id = ?
-        AND app_id = ?
-        AND status IN ('reserved', 'active')
+        ${appFilter}
+        AND status IN ('reserved', 'processing', 'active')
       ORDER BY id DESC
     `)
-    .bind(licenseId, appId)
+    .bind(...bindings)
     .all<PremiumActivationRecord>();
 
   return result.results || [];
+}
+
+async function countBronzePremiumActivationsInCycle(c: AppContext, licenseId: number, cycleStart: string, cycleEnd: string): Promise<number> {
+  const row = await c.env.merlin_db
+    .prepare(`
+      SELECT COUNT(*) AS count
+      FROM premium_activations
+      WHERE license_id = ?
+        AND status IN ('active', 'expired')
+        AND activated_at IS NOT NULL
+        AND activated_at >= ?
+        AND activated_at < ?
+    `)
+    .bind(licenseId, cycleStart, cycleEnd)
+    .first<{ count: number }>();
+
+  return Number(row?.count || 0);
+}
+
+async function consumeBronzePremiumActivationSlot(
+  c: AppContext,
+  licenseId: number,
+  cycleStart: string,
+  cycleEnd: string,
+  limit: number,
+) {
+  const now = new Date().toISOString();
+  await c.env.merlin_db
+    .prepare(`
+      INSERT INTO premium_activation_cycle_usage (license_id, cycle_start, activation_count, updated_at)
+      SELECT ?, ?, COUNT(*), ?
+      FROM premium_activations
+      WHERE license_id = ?
+        AND status IN ('active', 'expired')
+        AND activated_at IS NOT NULL
+        AND activated_at >= ?
+        AND activated_at < ?
+      ON CONFLICT(license_id, cycle_start) DO NOTHING
+    `)
+    .bind(licenseId, cycleStart, now, licenseId, cycleStart, cycleEnd)
+    .run();
+
+  const result = await c.env.merlin_db
+    .prepare(`
+      UPDATE premium_activation_cycle_usage
+      SET activation_count = activation_count + 1, updated_at = ?
+      WHERE license_id = ?
+        AND cycle_start = ?
+        AND activation_count < ?
+    `)
+    .bind(now, licenseId, cycleStart, limit)
+    .run();
+
+  return Number(result.meta.changes || 0) === 1;
+}
+
+async function releaseBronzePremiumActivationSlot(
+  c: AppContext,
+  licenseId: number,
+  cycleStart: string,
+) {
+  const now = new Date().toISOString();
+  await c.env.merlin_db
+    .prepare(`
+      UPDATE premium_activation_cycle_usage
+      SET activation_count = activation_count - 1, updated_at = ?
+      WHERE license_id = ?
+        AND cycle_start = ?
+        AND activation_count > 0
+    `)
+    .bind(now, licenseId, cycleStart)
+    .run();
 }
 
 export async function cleanupPremiumActivations(c: AppContext, now = new Date()): Promise<void> {
@@ -480,7 +715,7 @@ export async function cleanupPremiumActivations(c: AppContext, now = new Date())
           failure_stage = COALESCE(failure_stage, 'reservation_timeout'),
           failure_reason = COALESCE(failure_reason, 'Reservation expired before activation completed.'),
           updated_at = ?
-        WHERE status = 'reserved'
+        WHERE status IN ('reserved', 'processing')
           AND reserved_at IS NOT NULL
           AND reserved_at <= ?
       `)
@@ -498,7 +733,10 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
       SELECT id, app_id, name, cover_url, archive_key, activation_limit, enabled, created_at, updated_at,
         install_subpath,
         activation_type,
-        launch_executable_path
+        launch_executable_path,
+        COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
+        COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
+        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled
       FROM premium_games
       ORDER BY enabled DESC, updated_at DESC, id DESC
     `)
@@ -510,22 +748,48 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
 export async function listPremiumCatalog(c: AppContext, licenseId: number): Promise<PremiumCatalogItem[]> {
   await cleanupPremiumActivations(c);
 
+  const [{ license, plan }, catalogCutoffAt] = await Promise.all([
+    getPremiumLicensePlan(c, licenseId),
+    getPremiumCatalogCutoffAt(c),
+  ]);
   const games = (await listPremiumGames(c)).filter((entry) => entry.enabled);
   if (!games.length) {
     return [];
   }
 
+  const bronzeCycle = resolveCurrentMonthlyCycle(license);
   const [archiveStates, activationRows] = await Promise.all([
     Promise.all(games.map((game) => headArchiveAvailability(c, game.archiveKey))),
     listCurrentPremiumActivations(c, games.map((game) => game.appId)),
   ]);
+  const [licenseCurrentRows, bronzeUsed] = await Promise.all([
+    listLicensePremiumActivations(c, licenseId),
+    plan.effectiveTier === "bronze"
+      ? countBronzePremiumActivationsInCycle(c, licenseId, bronzeCycle.cycleStart, bronzeCycle.cycleEnd)
+      : Promise.resolve(0),
+  ]);
 
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
   const rowsByAppId = new Map<string, PremiumActivationRecord[]>();
   for (const row of activationRows) {
     const existing = rowsByAppId.get(row.app_id) || [];
     existing.push(row);
     rowsByAppId.set(row.app_id, existing);
+  }
+
+  let globalCooldownUntil: string | null = null;
+  let globalReservedUntil: string | null = null;
+  for (const row of licenseCurrentRows) {
+    if (isActiveActivation(row, nowIso) && row.cooldown_until && (!globalCooldownUntil || row.cooldown_until > globalCooldownUntil)) {
+      globalCooldownUntil = row.cooldown_until;
+    }
+    if (isReservedActivation(row, nowIso)) {
+      const rowReservedUntil = getReservedUntil(row);
+      if (rowReservedUntil && (!globalReservedUntil || rowReservedUntil > globalReservedUntil)) {
+        globalReservedUntil = rowReservedUntil;
+      }
+    }
   }
 
   return games.map((game, index) => {
@@ -538,6 +802,9 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     let cooldownUntil: string | null = null;
     let reservedUntil: string | null = null;
     let lastActivatedAt: string | null = null;
+    let lockedReason: PremiumCatalogItem["viewer"]["lockedReason"] = null;
+    let releaseAvailableAt: string | null = null;
+    let nearestAvailableTier: PlanTier | null = null;
 
     for (const row of rows) {
       if (isActiveActivation(row, nowIso)) {
@@ -583,6 +850,29 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     const archiveAvailable = archiveStates[index] || false;
     const occupiedSlots = activeCount + reservedCount;
     const availableSlots = Math.max(0, game.activationLimit - occupiedSlots);
+    const tierAccess = resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
+
+    if (viewerStatus === "available" && PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "global" && globalCooldownUntil) {
+      viewerStatus = "cooldown";
+      cooldownUntil = globalCooldownUntil;
+    }
+
+    if (viewerStatus === "available" && PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "global" && globalReservedUntil) {
+      viewerStatus = "reserved";
+      reservedUntil = globalReservedUntil;
+    }
+
+    if (viewerStatus === "available" && plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null && bronzeUsed >= PLAN_RULES.bronze.premiumLimitPerCycle) {
+      viewerStatus = "locked";
+      lockedReason = "bronze_limit";
+    }
+
+    if (viewerStatus === "available" && !tierAccess.allowed) {
+      viewerStatus = "locked";
+      lockedReason = tierAccess.lockedReason;
+      releaseAvailableAt = tierAccess.releaseAvailableAt;
+      nearestAvailableTier = tierAccess.nearestAvailableTier;
+    }
 
     if (viewerStatus === "available" && (!archiveAvailable || availableSlots <= 0)) {
       viewerStatus = "unavailable";
@@ -615,6 +905,15 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
         cooldownUntil,
         reservedUntil,
         lastActivatedAt,
+        lockedReason,
+        releaseAvailableAt,
+        nearestAvailableTier,
+        planTier: plan.effectiveTier,
+        plansEnabled: plan.plansEnabled,
+        premiumActivationsUsed: plan.effectiveTier === "bronze" ? bronzeUsed : null,
+        premiumActivationLimit: PLAN_RULES[plan.effectiveTier].premiumLimitPerCycle,
+        premiumActivationsResetAt: plan.effectiveTier === "bronze" ? bronzeCycle.cycleEnd : null,
+        tierAvailability: plan.plansEnabled ? getTierAvailability(game, now) : [],
       },
     };
   });
@@ -627,7 +926,10 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
       SELECT id, app_id, name, cover_url, archive_key, activation_limit, enabled, created_at, updated_at,
         install_subpath,
         activation_type,
-        launch_executable_path
+        launch_executable_path,
+        COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
+        COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
+        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled
       FROM premium_games
       WHERE app_id = ?
       LIMIT 1
@@ -641,9 +943,22 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
 export async function reservePremiumActivation(c: AppContext, licenseId: number, appId: string): Promise<PremiumReservationResult> {
   await cleanupPremiumActivations(c);
 
+  const [{ license, plan }, catalogCutoffAt] = await Promise.all([
+    getPremiumLicensePlan(c, licenseId),
+    getPremiumCatalogCutoffAt(c),
+  ]);
   const game = await getPremiumGame(c, appId);
   if (!game || !game.enabled) {
     throw new HTTPException(404, { message: "Premium game not found" });
+  }
+
+  const tierAccess = resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
+  if (!tierAccess.allowed) {
+    throw new HTTPException(403, {
+      message: tierAccess.nearestAvailableTier
+        ? `Premium game is not available for this plan yet. Available now on ${PLAN_RULES[tierAccess.nearestAvailableTier].label}.`
+        : "Premium game is not available for this plan yet.",
+    });
   }
 
   const archiveAvailable = await headArchiveAvailability(c, game.archiveKey);
@@ -652,7 +967,11 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
   }
 
   const nowIso = new Date().toISOString();
-  const licenseRows = await listLicensePremiumActivations(c, licenseId, game.appId);
+  const licenseRows = await listLicensePremiumActivations(
+    c,
+    licenseId,
+    PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "game" ? game.appId : undefined,
+  );
   for (const row of licenseRows) {
     if (isActiveActivation(row, nowIso)) {
       throw new HTTPException(409, { message: `Premium activation is in cooldown until ${row.cooldown_until}` });
@@ -661,6 +980,14 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
     if (isReservedActivation(row, nowIso)) {
       const reservedUntil = getReservedUntil(row);
       throw new HTTPException(409, { message: `Premium activation is already being processed until ${reservedUntil}` });
+    }
+  }
+
+  if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
+    const cycle = resolveCurrentMonthlyCycle(license);
+    const used = await countBronzePremiumActivationsInCycle(c, licenseId, cycle.cycleStart, cycle.cycleEnd);
+    if (used >= PLAN_RULES.bronze.premiumLimitPerCycle) {
+      throw new HTTPException(409, { message: "Bronze premium activation limit reached for the current cycle." });
     }
   }
 
@@ -743,7 +1070,7 @@ export async function failPremiumActivationReservation(
         failure_reason = ?,
         updated_at = ?
       WHERE id = ?
-        AND status = 'reserved'
+        AND status IN ('reserved', 'processing')
     `)
     .bind(stage, reason, nowIso, reservationId)
     .run();
@@ -828,28 +1155,95 @@ export async function completePremiumActivation(
   c: AppContext,
   reservationId: number,
 ): Promise<PremiumActivationCompletion> {
-  const activatedAt = new Date();
-  const activatedAtIso = activatedAt.toISOString();
-  const cooldownUntilIso = new Date(activatedAt.getTime() + PREMIUM_COOLDOWN_MS).toISOString();
+  const reservation = await c.env.merlin_db
+    .prepare(`
+      SELECT id, license_id, app_id, status, reserved_at, activated_at, cooldown_until,
+        failure_stage, failure_reason, created_at, updated_at
+      FROM premium_activations
+      WHERE id = ?
+      LIMIT 1
+    `)
+    .bind(reservationId)
+    .first<PremiumActivationRecord>();
 
-  await c.env.merlin_db
+  if (!reservation || reservation.status !== "reserved") {
+    throw new HTTPException(409, { message: "Premium activation reservation is not available" });
+  }
+
+  const claimedAt = new Date().toISOString();
+  const claim = await c.env.merlin_db
     .prepare(`
       UPDATE premium_activations
-      SET
-        status = 'active',
-        activated_at = ?,
-        cooldown_until = ?,
-        updated_at = ?
+      SET status = 'processing', updated_at = ?
       WHERE id = ?
         AND status = 'reserved'
     `)
-    .bind(activatedAtIso, cooldownUntilIso, activatedAtIso, reservationId)
+    .bind(claimedAt, reservationId)
     .run();
+  if (Number(claim.meta.changes || 0) !== 1) {
+    throw new HTTPException(409, { message: "Premium activation reservation is not available" });
+  }
 
-  return {
-    activatedAt: activatedAtIso,
-    cooldownUntil: cooldownUntilIso,
-  };
+  const { license, plan } = await getPremiumLicensePlan(c, reservation.license_id);
+  let bronzeCycleStart: string | null = null;
+  let bronzeSlotConsumed = false;
+  try {
+    if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
+      const cycle = resolveCurrentMonthlyCycle(license);
+      const consumed = await consumeBronzePremiumActivationSlot(
+        c,
+        reservation.license_id,
+        cycle.cycleStart,
+        cycle.cycleEnd,
+        PLAN_RULES.bronze.premiumLimitPerCycle,
+      );
+      if (!consumed) {
+        await failPremiumActivationReservation(c, reservationId, "bronze_limit", "Bronze premium activation limit reached for the current cycle.");
+        throw new HTTPException(409, { message: "Bronze premium activation limit reached for the current cycle." });
+      }
+      bronzeCycleStart = cycle.cycleStart;
+      bronzeSlotConsumed = true;
+    }
+
+    const activatedAt = new Date();
+    const activatedAtIso = activatedAt.toISOString();
+    const cooldownUntilIso = new Date(activatedAt.getTime() + PLAN_RULES[plan.effectiveTier].premiumCooldownMs).toISOString();
+
+    const completion = await c.env.merlin_db
+      .prepare(`
+        UPDATE premium_activations
+        SET
+          status = 'active',
+          activated_at = ?,
+          cooldown_until = ?,
+          updated_at = ?
+        WHERE id = ?
+          AND status = 'processing'
+      `)
+      .bind(activatedAtIso, cooldownUntilIso, activatedAtIso, reservationId)
+      .run();
+    if (Number(completion.meta.changes || 0) !== 1) {
+      throw new HTTPException(409, { message: "Premium activation reservation is not available" });
+    }
+
+    return {
+      activatedAt: activatedAtIso,
+      cooldownUntil: cooldownUntilIso,
+    };
+  } catch (error) {
+    // A falha ocorre antes de a ativação virar ativa. Devolve apenas a vaga
+    // atomica que esta mesma chamada consumiu; nao altera o contrato do launcher.
+    if (bronzeSlotConsumed && bronzeCycleStart) {
+      await releaseBronzePremiumActivationSlot(c, reservation.license_id, bronzeCycleStart).catch(() => undefined);
+    }
+    await failPremiumActivationReservation(
+      c,
+      reservationId,
+      "completion",
+      error instanceof Error ? error.message : "Premium activation could not be completed.",
+    );
+    throw error;
+  }
 }
 
 export async function completePremiumActivationForLicense(
@@ -890,6 +1284,9 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
     throw new HTTPException(400, { message: "launchExecutablePath is required for third-party activations" });
   }
   const activationLimit = normalizeActivationLimit(input.activationLimit);
+  const accessBronzeEnabled = Boolean(input.accessBronzeEnabled);
+  const accessPrataEnabled = Boolean(input.accessPrataEnabled);
+  const accessOuroEnabled = input.accessOuroEnabled !== false;
   const enabled = Boolean(input.enabled);
   const now = new Date().toISOString();
   const metadata = await resolvePremiumGameMetadata(appId);
@@ -908,11 +1305,14 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
           activation_type,
           launch_executable_path,
           activation_limit,
+          access_bronze_enabled,
+          access_prata_enabled,
+          access_ouro_enabled,
           enabled,
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         appId,
@@ -923,6 +1323,9 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
         activationType,
         launchExecutablePath,
         activationLimit,
+        accessBronzeEnabled ? 1 : 0,
+        accessPrataEnabled ? 1 : 0,
+        accessOuroEnabled ? 1 : 0,
         enabled ? 1 : 0,
         now,
         now,
@@ -974,6 +1377,15 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
   const nextActivationLimit = input.activationLimit !== undefined
     ? normalizeActivationLimit(input.activationLimit)
     : existing.activationLimit;
+  const nextAccessBronzeEnabled = input.accessBronzeEnabled !== undefined
+    ? Boolean(input.accessBronzeEnabled)
+    : existing.accessBronzeEnabled;
+  const nextAccessPrataEnabled = input.accessPrataEnabled !== undefined
+    ? Boolean(input.accessPrataEnabled)
+    : existing.accessPrataEnabled;
+  const nextAccessOuroEnabled = input.accessOuroEnabled !== undefined
+    ? Boolean(input.accessOuroEnabled)
+    : existing.accessOuroEnabled;
   const nextEnabled = input.enabled !== undefined
     ? Boolean(input.enabled)
     : existing.enabled;
@@ -990,6 +1402,9 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
         activation_type = ?,
         launch_executable_path = ?,
         activation_limit = ?,
+        access_bronze_enabled = ?,
+        access_prata_enabled = ?,
+        access_ouro_enabled = ?,
         enabled = ?,
         updated_at = ?
       WHERE app_id = ?
@@ -1002,6 +1417,9 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
       nextActivationType,
       nextLaunchExecutablePath,
       nextActivationLimit,
+      nextAccessBronzeEnabled ? 1 : 0,
+      nextAccessPrataEnabled ? 1 : 0,
+      nextAccessOuroEnabled ? 1 : 0,
       nextEnabled ? 1 : 0,
       now,
       existing.appId,

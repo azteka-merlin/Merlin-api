@@ -3,6 +3,7 @@ import type { AppContext } from "../types";
 import { generateLicenseKey, resolveLicenseStatus, toDateOnly, toIsoDateStart, type LicenseRecord, type LicenseStatusValue } from "./licenses";
 import { writeAdminAuditLog } from "./admin-security";
 import { hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 
 export type ContactType = "phone" | "email" | "discord" | "none";
 export type LicenseType = "normal" | "test";
@@ -54,6 +55,8 @@ export function mapLicense(record: LicenseRecord) {
     contactType: record.contact_type,
     source: record.source,
     licenseType: record.license_type || "normal",
+    planTier: record.license_type === "test" ? null : record.plan_tier || "ouro",
+    premiumCatalogRestricted: record.premium_catalog_restricted === 1,
     normalActivationLimit: record.normal_activation_limit ?? null,
     premiumActivationLimit: record.premium_activation_limit ?? null,
     normalActivationUsed: record.normal_activation_used ?? 0,
@@ -75,6 +78,7 @@ export function mapLicense(record: LicenseRecord) {
     stripeSubscriptionId: record.stripe_subscription_id || null,
     stripeCheckoutSessionId: record.stripe_checkout_session_id || null,
     billingCurrentPeriodEnd: record.billing_current_period_end || null,
+    billingCurrentPeriodStart: record.billing_current_period_start || null,
     billingCancelAtPeriodEnd: Boolean(record.billing_cancel_at_period_end),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
@@ -90,6 +94,7 @@ export async function listLicenses(c: AppContext) {
     stripe_subscription_id,
     stripe_checkout_session_id,
     billing_current_period_end,
+    billing_current_period_start,
     billing_cancel_at_period_end
   `;
   const result = await c.env.merlin_db
@@ -98,6 +103,7 @@ export async function listLicenses(c: AppContext) {
         SELECT id, license_key, name, contact, contact_type, source,
           ${licenseActivationSelect},
           recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          plan_tier,
           ${billingColumns},
           created_at, updated_at
         FROM licenses
@@ -116,6 +122,8 @@ export async function getLicense(c: AppContext, id: number) {
         SELECT id, license_key, name, contact, contact_type, source,
           ${licenseActivationSelect},
           recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          plan_tier,
+          COALESCE(premium_catalog_restricted, 0) AS premium_catalog_restricted,
           customer_id,
           COALESCE(access_type, 'free') AS access_type,
           COALESCE(billing_status, 'none') AS billing_status,
@@ -123,6 +131,7 @@ export async function getLicense(c: AppContext, id: number) {
           stripe_subscription_id,
           stripe_checkout_session_id,
           billing_current_period_end,
+          billing_current_period_start,
           billing_cancel_at_period_end,
           created_at, updated_at
         FROM licenses
@@ -177,6 +186,7 @@ export async function findLicenseByEmailContact(c: AppContext, email: string, ex
         SELECT id, license_key, name, contact, contact_type, source,
           ${licenseActivationSelect},
           recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          plan_tier,
           customer_id,
           COALESCE(access_type, 'free') AS access_type,
           COALESCE(billing_status, 'none') AS billing_status,
@@ -184,6 +194,7 @@ export async function findLicenseByEmailContact(c: AppContext, email: string, ex
           stripe_subscription_id,
           stripe_checkout_session_id,
           billing_current_period_end,
+          billing_current_period_start,
           billing_cancel_at_period_end,
           created_at, updated_at
         FROM licenses
@@ -234,6 +245,7 @@ export async function createLicense(
     licenseType?: LicenseType;
     normalActivationLimit?: number | null;
     premiumActivationLimit?: number | null;
+    planTier?: PlanTier | null;
   },
   actor?: LicenseActionActor,
 ) {
@@ -245,6 +257,7 @@ export async function createLicense(
   const normalizedContact = licenseType === "test" ? "" : normalizeContact(input.contact || input.phone || "", contactType);
   const normalActivationLimit = licenseType === "test" ? normalizeActivationLimit(input.normalActivationLimit, "normal") : null;
   const premiumActivationLimit = licenseType === "test" ? normalizeActivationLimit(input.premiumActivationLimit, "premium") : null;
+  const planTier = licenseType === "test" ? null : normalizeStoredPlanTier(input.planTier, "ouro");
   assertValidContact(normalizedContact, contactType);
   await assertEmailContactAvailable(c, contactType, normalizedContact);
   const recoveryPin = licenseType === "test" ? "" : normalizeRecoveryPin(input.recoveryPin);
@@ -258,12 +271,12 @@ export async function createLicense(
         .prepare(
           `
             INSERT INTO licenses (
-              license_key, name, contact, contact_type, source, license_type, normal_activation_limit, premium_activation_limit, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+              license_key, name, contact, contact_type, source, license_type, plan_tier, normal_activation_limit, premium_activation_limit, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
         )
-        .bind(licenseKey, input.name, normalizedContact, contactType, licenseType, normalActivationLimit, premiumActivationLimit, recoveryPinHash, recoveryPin ? now : null, null, expiresAt, status, null, now, now)
+        .bind(licenseKey, input.name, normalizedContact, contactType, licenseType, planTier, normalActivationLimit, premiumActivationLimit, recoveryPinHash, recoveryPin ? now : null, null, expiresAt, status, null, now, now)
         .run();
       break;
     } catch (error) {
@@ -295,7 +308,7 @@ export async function createLicense(
 export async function updateLicense(
   c: AppContext,
   id: number,
-  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string; hwid: string | null },
+  input: { name: string; contact?: string; contactType?: ContactType; phone?: string; recoveryPin?: string; expiresAt: string; hwid: string | null; planTier?: PlanTier | null },
   actor?: LicenseActionActor,
 ) {
   const current = await getLicense(c, id);
@@ -311,16 +324,17 @@ export async function updateLicense(
   const now = new Date().toISOString();
   const expiresAt = toIsoDateStart(input.expiresAt);
   const nextStatus = statusForExpiresAt(expiresAt, current.status);
+  const planTier = normalizeStoredPlanTier(input.planTier || current.plan_tier, "ouro");
   try {
     await c.env.merlin_db
       .prepare(
         `
           UPDATE licenses
-          SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, status = ?${recoveryPinSql}, updated_at = ?
+          SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, status = ?, plan_tier = ?${recoveryPinSql}, updated_at = ?
           WHERE id = ?
         `,
       )
-      .bind(input.name, normalizedContact, contactType, nextHwid, expiresAt, nextStatus, ...recoveryPinBindings, now, current.id)
+      .bind(input.name, normalizedContact, contactType, nextHwid, expiresAt, nextStatus, planTier, ...recoveryPinBindings, now, current.id)
       .run();
   } catch (error) {
     if (isDuplicateEmailLicenseError(error)) {

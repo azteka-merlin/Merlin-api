@@ -1,11 +1,19 @@
 import { HTTPException } from "hono/http-exception";
 import { Buffer } from "node:buffer";
 import type { AppContext } from "../types";
-import { findLicenseByEmailContact, normalizeContact } from "./admin-license-service";
-import { createStripeBillingPortalSession } from "./billing-portal";
+import { findLicenseByEmailContact, getLicense, normalizeContact } from "./admin-license-service";
+import { createStripeBillingPortalSession, createStripeSubscriptionUpdateConfirmPortalSession } from "./billing-portal";
 import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, type BillingPriceSnapshot } from "./billing-settings";
 import { assertRecentPublicEmailVerification } from "./email-verification";
+import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { compareRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import {
+  cancelScheduledSubscriptionPlanChange,
+  createSubscriptionPlanChange,
+  previewImmediatePlanChangeCharge,
+  previewSubscriptionPlanChange,
+  type BillingPeriod,
+} from "./subscription-plan-change";
 
 const PROVIDER_STRIPE = "stripe";
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
@@ -20,6 +28,12 @@ type SubscriptionAccessRow = {
   status: string;
   current_period_end: string | null;
   cancel_at_period_end: number;
+};
+
+type StripeSubscriptionForHostedChange = {
+  id: string;
+  current_period_end?: number | null;
+  items?: { data?: Array<{ id?: string; price?: { id?: string | null } | null }> };
 };
 
 type StripeCheckoutSession = {
@@ -46,6 +60,15 @@ type UpgradeStatusRow = {
   upgrade_cancel_error: string | null;
   license_id: number | null;
   upgrade_license_id: number | null;
+};
+
+type PublicPlanChangeRow = {
+  status: string;
+  target_plan_tier: string;
+  target_billing_period: BillingPeriod;
+  timing: "immediate" | "period_end";
+  effective_at: string | null;
+  failure_reason: string | null;
 };
 
 function encodeBasicAuth(secretKey: string) {
@@ -87,6 +110,17 @@ async function stripePost<T>(c: AppContext, path: string, params: URLSearchParam
   return payload;
 }
 
+async function stripeGet<T>(c: AppContext, path: string) {
+  const response = await fetch(`${STRIPE_API_BASE_URL}${path}`, {
+    headers: { Authorization: encodeBasicAuth(stripeSecretKey(c)) },
+  });
+  const payload = await response.json().catch(() => null) as T & { error?: { message?: string } } | null;
+  if (!response.ok || !payload) {
+    throw new HTTPException(502, { message: stripeApiError(payload, "Nao foi possivel consultar a Stripe.") });
+  }
+  return payload;
+}
+
 function normalizeEmail(email: string) {
   return normalizeContact(email, "email");
 }
@@ -98,6 +132,10 @@ function toDateOnly(value: string | null | undefined) {
 function requestOrigin(c: AppContext) {
   const url = new URL(c.req.raw.url);
   return `${url.protocol}//${url.host}`;
+}
+
+function appendAccessState(returnPath: string, state: string) {
+  return `${returnPath}${returnPath.includes("?") ? "&" : "?"}access=${encodeURIComponent(state)}`;
 }
 
 function stripeTimestampToIso(value: number | null) {
@@ -117,6 +155,10 @@ function mapPrice(price: BillingPriceSnapshot | null) {
 
 function trimEnv(value: unknown) {
   return String(value || "").trim();
+}
+
+function getString(value: unknown) {
+  return typeof value === "string" && value ? value : null;
 }
 
 function isPixRuntimeAvailable(c: AppContext) {
@@ -141,6 +183,7 @@ function isCurrentLicense(license: LicenseAccessRow) {
 
 function accessKind(license: LicenseAccessRow) {
   if (license.access_type === "monthly_subscription") return "monthly" as const;
+  if (license.access_type === "annual_subscription" || license.access_type === "annual_manual") return "annual" as const;
   if (license.access_type === "paid_lifetime" || license.access_type === "legacy_lifetime") return "lifetime" as const;
   return "active" as const;
 }
@@ -163,29 +206,36 @@ async function getSubscription(c: AppContext, license: LicenseAccessRow) {
     .first<SubscriptionAccessRow>();
 }
 
-async function getVerifiedCurrentLicense(c: AppContext, input: { email: string; recoveryPin: string }) {
+export async function validatePublicAccessCredentials(c: AppContext, input: { email: string; recoveryPin: string }) {
   const emailNormalized = normalizeEmail(input.email);
-  await assertRecentPublicEmailVerification(c, emailNormalized);
-
   const license = await findLicenseByEmailContact(c, emailNormalized);
   if (!license || license.status === "revoked") {
-    return { emailNormalized, license: null };
+    throw new HTTPException(401, { message: "E-mail ou PIN inválido." });
   }
 
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
   if (!recoveryPin || !license.recovery_pin_hash) {
-    throw new HTTPException(401, { message: "Nao foi possivel validar este acesso com as informacoes fornecidas." });
+    throw new HTTPException(401, { message: "E-mail ou PIN inválido." });
   }
   const matchesRecoveryPin = await compareRecoveryPin(c, license, recoveryPin);
   if (!matchesRecoveryPin) {
-    throw new HTTPException(401, { message: "Nao foi possivel validar este acesso com as informacoes fornecidas." });
+    throw new HTTPException(401, { message: "E-mail ou PIN inválido." });
   }
 
   return { emailNormalized, license };
 }
 
+async function getVerifiedCurrentLicense(c: AppContext, input: { email: string; recoveryPin: string }) {
+  const emailNormalized = normalizeEmail(input.email);
+  await assertRecentPublicEmailVerification(c, emailNormalized);
+  return validatePublicAccessCredentials(c, input);
+}
+
 async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow, current: boolean) {
   const billing = await getBillingSettings(c);
+  if (billing.plansEnabled) {
+    return { available: false, price: null };
+  }
   const price = billing.prices.lifetime;
   const available = accessKind(license) === "monthly"
     && current
@@ -209,20 +259,50 @@ async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow, 
 
 async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, current: boolean) {
   const billing = await getBillingSettings(c);
-  const price = billing.prices.monthly;
-  const monthlyAvailable = accessKind(license) === "monthly"
+  const kind = accessKind(license);
+  const price = kind === "annual" ? billing.prices.annual : billing.prices.monthly;
+  const pixEnabled = kind === "annual" ? billing.pixAnnualEnabled : billing.pixMonthlyEnabled;
+  const priceId = kind === "annual" ? billing.annualPriceId : billing.monthlyPriceId;
+  const planEnabled = kind === "annual" ? billing.annualEnabled : billing.monthlyEnabled;
+  const available = (kind === "monthly" || kind === "annual")
     && !current
     && billing.publicSignupEnabled
     && billing.billingEnabled
-    && billing.monthlyEnabled
+    && planEnabled
     && Boolean(price?.active)
-    && Boolean(billing.monthlyPriceId);
+    && Boolean(priceId);
 
   return {
-    available: monthlyAvailable,
-    card: monthlyAvailable,
-    pix: monthlyAvailable && isPixRuntimeAvailable(c) && billing.pixEnabled && billing.pixMonthlyEnabled,
-    price: monthlyAvailable ? mapPrice(price) : null,
+    available,
+    card: available,
+    pix: available && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled,
+    price: available ? mapPrice(price) : null,
+  };
+}
+
+async function getPublicPlanChange(c: AppContext, licenseId: number) {
+  const row = await c.env.merlin_db
+    .prepare(`
+      SELECT status, target_plan_tier, target_billing_period, timing, effective_at, failure_reason
+      FROM subscription_plan_changes
+      WHERE license_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `)
+    .bind(licenseId)
+    .first<PublicPlanChangeRow>();
+
+  if (!row) return null;
+  if (!['pending_payment', 'payment_action_required', 'scheduled', 'failed'].includes(row.status)) {
+    return null;
+  }
+  return {
+    status: row.status === "failed" || row.status === "payment_action_required" ? "not_completed" : row.status,
+    targetTier: row.target_plan_tier,
+    targetPeriod: row.target_billing_period,
+    timing: row.timing,
+    effectiveAt: toDateOnly(row.effective_at),
+    canCancel: row.status === "scheduled",
   };
 }
 
@@ -231,6 +311,7 @@ function mapAccessPayload(
   subscription: SubscriptionAccessRow | null,
   upgrade: Awaited<ReturnType<typeof getUpgradeAvailability>>,
   renewal: Awaited<ReturnType<typeof getRenewalAvailability>>,
+  planChange: Awaited<ReturnType<typeof getPublicPlanChange>>,
 ) {
   const kind = accessKind(license);
   const current = isCurrentLicense(license);
@@ -243,9 +324,10 @@ function mapAccessPayload(
       name: license.name,
       current,
       accessType: license.access_type || "free",
+      planTier: normalizeStoredPlanTier(license.plan_tier, "ouro"),
       billingStatus: license.billing_status || "none",
       expiresAt: toDateOnly(license.expires_at),
-      subscription: kind === "monthly" ? {
+      subscription: kind === "monthly" || kind === "annual" ? {
         status: subscription?.status || license.billing_status || "active",
         currentPeriodEnd: toDateOnly(currentPeriodEnd),
         cancelAtPeriodEnd,
@@ -253,6 +335,7 @@ function mapAccessPayload(
       } : null,
       upgrade,
       renewal,
+      planChange,
     },
   };
 }
@@ -266,7 +349,143 @@ export async function getPublicAccessDetails(c: AppContext, input: { email: stri
   const current = isCurrentLicense(license);
   const upgrade = await getUpgradeAvailability(c, license, current);
   const renewal = await getRenewalAvailability(c, license, current);
-  return mapAccessPayload(license, subscription, upgrade, renewal);
+  const planChange = await getPublicPlanChange(c, license.id);
+  return mapAccessPayload(license, subscription, upgrade, renewal, planChange);
+}
+
+export async function getPublicAccessDetailsForLicense(c: AppContext, licenseId: number) {
+  const license = await getLicense(c, licenseId);
+  if (license.status === "revoked") {
+    return { status: "not_found" as const };
+  }
+  const subscription = await getSubscription(c, license);
+  const current = isCurrentLicense(license);
+  const upgrade = await getUpgradeAvailability(c, license, current);
+  const renewal = await getRenewalAvailability(c, license, current);
+  const planChange = await getPublicPlanChange(c, license.id);
+  return mapAccessPayload(license, subscription, upgrade, renewal, planChange);
+}
+
+export async function previewPublicAccessPlanChange(
+  c: AppContext,
+  input: { email: string; recoveryPin: string; targetTier: PlanTier; targetPeriod: BillingPeriod },
+) {
+  const { license } = await getVerifiedCurrentLicense(c, input);
+  if (!license || !isCurrentLicense(license)) {
+    throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
+  }
+  return previewPublicAccessPlanChangeForLicense(c, license.id, input);
+}
+
+export async function previewPublicAccessPlanChangeForLicense(
+  c: AppContext,
+  licenseId: number,
+  input: { targetTier: PlanTier; targetPeriod: BillingPeriod },
+) {
+  const billing = await getBillingSettings(c);
+  if (!billing.plansEnabled) throw new HTTPException(409, { message: "A troca de planos nao esta disponivel neste momento." });
+  const preview = await previewSubscriptionPlanChange(c, { licenseId, targetTier: input.targetTier, targetPeriod: input.targetPeriod });
+  if (!preview.requiresPaymentConfirmation) {
+    return { ...preview, amountDueNowCents: null, prorationDate: null };
+  }
+  const charge = await previewImmediatePlanChangeCharge(c, {
+    licenseId,
+    targetPriceId: preview.targetPriceId,
+    targetAmountCents: preview.targetAmountCents,
+  });
+  return { ...preview, ...charge };
+}
+
+export async function createPublicAccessPlanChange(
+  c: AppContext,
+  input: { email: string; recoveryPin: string; targetTier: PlanTier; targetPeriod: BillingPeriod },
+) {
+  const { license } = await getVerifiedCurrentLicense(c, input);
+  if (!license || !isCurrentLicense(license)) {
+    throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
+  }
+  return createPublicAccessPlanChangeForLicense(c, license, input);
+}
+
+export async function createPublicAccessPlanChangeForLicense(
+  c: AppContext,
+  license: LicenseAccessRow,
+  input: { targetTier: PlanTier; targetPeriod: BillingPeriod },
+  options: { returnPath?: string } = {},
+) {
+  if (!isCurrentLicense(license)) {
+    throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
+  }
+  const billing = await getBillingSettings(c);
+  if (!billing.plansEnabled) throw new HTTPException(409, { message: "A troca de planos nao esta disponivel neste momento." });
+  const preview = await previewPublicAccessPlanChangeForLicense(c, license.id, {
+    targetTier: input.targetTier,
+    targetPeriod: input.targetPeriod,
+  });
+  if (preview.timing === "period_end") {
+    return createSubscriptionPlanChange(c, {
+      licenseId: license.id,
+      targetTier: input.targetTier,
+      targetPeriod: input.targetPeriod,
+    });
+  }
+
+  await ensureNoPublicAccessPlanChange(c, license.id);
+
+  if (!license.customer_id || !license.stripe_customer_id || !license.stripe_subscription_id) {
+    throw new HTTPException(409, { message: "Esta assinatura nao esta elegivel para troca de plano." });
+  }
+
+  const subscription = await stripeGet<StripeSubscriptionForHostedChange>(
+    c,
+    `/subscriptions/${encodeURIComponent(license.stripe_subscription_id)}?expand%5B%5D=items.data.price`,
+  );
+  const item = subscription.items?.data?.[0];
+  if (!item?.id) throw new HTTPException(409, { message: "Assinatura Stripe nao possui item elegivel." });
+
+  const returnPath = options.returnPath || "/download";
+  const portal = await createStripeSubscriptionUpdateConfirmPortalSession(c, {
+    stripeCustomerId: license.stripe_customer_id,
+    subscriptionId: license.stripe_subscription_id,
+    subscriptionItemId: item.id,
+    targetPriceId: preview.targetPriceId,
+    returnPath: appendAccessState(returnPath, "plan-change-cancel"),
+    completedPath: appendAccessState(returnPath, "plan-change-return"),
+  });
+  return { ...preview, status: "pending_payment" as const, checkoutUrl: portal.portalUrl };
+}
+
+async function ensureNoPublicAccessPlanChange(c: AppContext, licenseId: number) {
+  const pending = await c.env.merlin_db
+    .prepare(`
+      SELECT id
+      FROM subscription_plan_changes
+      WHERE license_id = ?
+        AND status IN ('pending_payment', 'payment_action_required', 'scheduled')
+      ORDER BY id DESC
+      LIMIT 1
+    `)
+    .bind(licenseId)
+    .first<{ id: number }>();
+  if (pending) {
+    throw new HTTPException(409, { message: "Ja existe uma alteração de plano em andamento para esta licença." });
+  }
+}
+
+export async function cancelPublicAccessPlanChange(c: AppContext, input: { email: string; recoveryPin: string }) {
+  const { license } = await getVerifiedCurrentLicense(c, input);
+  if (!license || !isCurrentLicense(license)) {
+    throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
+  }
+  return cancelScheduledSubscriptionPlanChange(c, license.id);
+}
+
+export async function cancelPublicAccessPlanChangeForLicense(c: AppContext, licenseId: number) {
+  const license = await getLicense(c, licenseId);
+  if (!isCurrentLicense(license)) {
+    throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
+  }
+  return cancelScheduledSubscriptionPlanChange(c, license.id);
 }
 
 async function findReusableUpgradeCheckout(c: AppContext, licenseId: number) {
@@ -359,6 +578,9 @@ export async function createPublicAccessUpgradeCheckout(c: AppContext, input: { 
   }
 
   const billing = await getBillingSettings(c);
+  if (billing.plansEnabled) {
+    throw new HTTPException(409, { message: "A troca para vitalicio nao esta disponivel com a estrutura de planos ativa." });
+  }
   if (!billing.billingEnabled || !billing.lifetimeEnabled || !billing.lifetimePriceId) {
     throw new HTTPException(409, { message: "Upgrade para vitalicio esta temporariamente indisponivel." });
   }
@@ -434,12 +656,16 @@ export async function createPublicAccessBillingPortal(c: AppContext, input: { em
   if (!license || !isCurrentLicense(license)) {
     throw new HTTPException(404, { message: "Nao encontramos um acesso ativo para este e-mail." });
   }
-  if (accessKind(license) !== "monthly" || !license.stripe_customer_id || !license.stripe_subscription_id) {
-    throw new HTTPException(409, { message: "Este acesso nao possui assinatura mensal Stripe para gerenciar." });
+  return createPublicAccessBillingPortalForLicense(c, license, "/download?access=portal-return");
+}
+
+export async function createPublicAccessBillingPortalForLicense(c: AppContext, license: LicenseAccessRow, returnPath: string) {
+  if (!["monthly", "annual"].includes(accessKind(license)) || !license.stripe_customer_id || !license.stripe_subscription_id) {
+    throw new HTTPException(409, { message: "Este acesso nao possui assinatura Stripe para gerenciar." });
   }
   return createStripeBillingPortalSession(c, {
     stripeCustomerId: license.stripe_customer_id,
-    returnPath: "/download?access=portal-return",
+    returnPath,
   });
 }
 

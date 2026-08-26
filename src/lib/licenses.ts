@@ -13,6 +13,8 @@ export type LicenseRecord = {
 	contact_type: "phone" | "email" | "discord" | "none";
 	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe" | "mercadopago_pix";
 	license_type?: "normal" | "test" | null;
+	plan_tier?: "bronze" | "prata" | "ouro" | null;
+	premium_catalog_restricted?: number | null;
 	normal_activation_limit?: number | null;
 	premium_activation_limit?: number | null;
 	normal_activation_used?: number | null;
@@ -33,6 +35,7 @@ export type LicenseRecord = {
 	stripe_subscription_id?: string | null;
 	stripe_checkout_session_id?: string | null;
 	billing_current_period_end?: string | null;
+	billing_current_period_start?: string | null;
 	billing_cancel_at_period_end?: number | null;
 	created_at: string;
 	updated_at: string;
@@ -105,6 +108,8 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		contactType: record.contact_type,
 		source: record.source,
 		licenseType: record.license_type || "normal",
+		planTier: record.license_type === "test" ? null : record.plan_tier || "ouro",
+		premiumCatalogRestricted: record.premium_catalog_restricted === 1,
 		normalActivationLimit: record.normal_activation_limit ?? null,
 		premiumActivationLimit: record.premium_activation_limit ?? null,
 		normalActivationUsed: record.normal_activation_used ?? 0,
@@ -126,6 +131,7 @@ export function mapLicenseResponse(record: LicenseRecord) {
 		stripeSubscriptionId: record.stripe_subscription_id || null,
 		stripeCheckoutSessionId: record.stripe_checkout_session_id || null,
 		billingCurrentPeriodEnd: record.billing_current_period_end || null,
+		billingCurrentPeriodStart: record.billing_current_period_start || null,
 		billingCancelAtPeriodEnd: Boolean(record.billing_cancel_at_period_end),
 		createdAt: record.created_at,
 		updatedAt: record.updated_at,
@@ -144,6 +150,8 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 					contact_type,
 					source,
 					COALESCE(license_type, 'normal') AS license_type,
+					plan_tier,
+					COALESCE(premium_catalog_restricted, 0) AS premium_catalog_restricted,
 					normal_activation_limit,
 					premium_activation_limit,
 					activation_usage_reset_at,
@@ -177,6 +185,7 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 					stripe_subscription_id,
 					stripe_checkout_session_id,
 					billing_current_period_end,
+					billing_current_period_start,
 					billing_cancel_at_period_end,
 					created_at,
 					updated_at

@@ -5,8 +5,10 @@ import { findLicenseByEmailContact, normalizeContact } from "./admin-license-ser
 import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, type BillingPlanType } from "./billing-settings";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { generateLicenseKey } from "./licenses";
+import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { LIFETIME_EXPIRES_AT } from "./public-access-management";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { getBillingPlanPrice } from "./subscription-plan-change";
 
 const PROVIDER_MP = "mercadopago";
 const PIX_MODE = "pix";
@@ -29,6 +31,7 @@ type PixCheckoutRow = {
   provider_price_id: string;
   provider_payment_id: string | null;
   provider_external_reference: string | null;
+  plan_tier: string | null;
   provider_qr_code: string | null;
   provider_qr_code_base64: string | null;
   provider_ticket_url: string | null;
@@ -45,6 +48,7 @@ type PixCheckoutRow = {
   pending_name: string | null;
   pending_recovery_pin_hash: string | null;
   pending_recovery_notice_accepted_at: string | null;
+  checkout_evidence_json: string | null;
   processed_at: string | null;
 };
 
@@ -77,6 +81,7 @@ export type PublicPixOrderInput = {
   recoveryPin: string;
   acceptedRecoveryNotice: boolean;
   planType: BillingPlanType;
+  planTier?: PlanTier | null;
   mercadoPagoDeviceId?: string;
 };
 
@@ -154,7 +159,9 @@ function normalizeEmail(email: string) {
 }
 
 function checkoutMode(planType: BillingPlanType) {
-  return planType === "monthly" ? "pix_monthly" : "pix_lifetime";
+  if (planType === "monthly") return "pix_monthly";
+  if (planType === "annual") return "pix_annual";
+  return "pix_lifetime";
 }
 
 function oneMonthFromNowIso() {
@@ -163,12 +170,28 @@ function oneMonthFromNowIso() {
   return next.toISOString();
 }
 
+function oneYearFromNowIso() {
+  const next = new Date();
+  next.setUTCFullYear(next.getUTCFullYear() + 1);
+  return next.toISOString();
+}
+
 function addSeconds(date: Date, seconds: number) {
   return new Date(date.getTime() + seconds * 1000).toISOString();
 }
 
-function pixProductTitle(planType: BillingPlanType) {
-  return planType === "monthly" ? "Merlin mensal" : "Merlin vitalicio";
+function pixProductTitle(planType: BillingPlanType, planTier: PlanTier | null) {
+  const tier = planTier ? ` ${planTier.charAt(0).toUpperCase()}${planTier.slice(1)}` : "";
+  if (planType === "monthly") return `Merlin${tier} mensal`;
+  if (planType === "annual") return `Merlin${tier} anual`;
+  return "Merlin vitalicio";
+}
+
+function pixExternalCode(planType: BillingPlanType, planTier: PlanTier | null) {
+  const tier = planTier ? `_${planTier}` : "";
+  if (planType === "monthly") return `merlin${tier}_monthly`;
+  if (planType === "annual") return `merlin${tier}_annual`;
+  return "merlin_lifetime";
 }
 
 function splitPayerName(name: string) {
@@ -190,6 +213,10 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
   if (existingLicense.billing_status === "dispute_open") {
     return false;
   }
+  // A free legacy access can become a paid plan without minting a second key.
+  if (existingLicense.status === "active" && existingLicense.access_type === "free") {
+    return true;
+  }
   if (existingLicense.status === "active" || existingLicense.status === "expired") {
     const expiresAt = new Date(existingLicense.expires_at);
     return Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() < Date.now();
@@ -201,8 +228,10 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
     || existingLicense.revoked_origin === "stripe_subscription";
 }
 
-function isSamePixCheckoutContext(checkout: PixCheckoutRow, planType: BillingPlanType, reactivationLicenseId: number | null) {
-  return checkout.plan_type === planType && (checkout.reactivation_license_id ?? null) === reactivationLicenseId;
+function isSamePixCheckoutContext(checkout: PixCheckoutRow, planType: BillingPlanType, planTier: PlanTier | null, reactivationLicenseId: number | null) {
+  return checkout.plan_type === planType
+    && normalizeStoredPlanTier(checkout.plan_tier, "ouro") === (planTier || normalizeStoredPlanTier(checkout.plan_tier, "ouro"))
+    && (checkout.reactivation_license_id ?? null) === reactivationLicenseId;
 }
 
 function getClientIp(c: AppContext) {
@@ -224,6 +253,7 @@ function getCheckoutUserAgent(c: AppContext) {
 function buildCheckoutEvidence(input: {
   emailVerifiedAt: string | null;
   planType: BillingPlanType;
+  planTier: PlanTier | null;
   priceId: string;
   amountCents: number;
   currency: string;
@@ -233,6 +263,7 @@ function buildCheckoutEvidence(input: {
   return JSON.stringify({
     emailVerifiedAt: input.emailVerifiedAt,
     planType: input.planType,
+    planTier: input.planTier,
     priceId: input.priceId,
     amountCents: input.amountCents,
     currency: input.currency,
@@ -241,6 +272,34 @@ function buildCheckoutEvidence(input: {
     paymentMethod: PIX_MODE,
     environment: input.environment,
   });
+}
+
+function syntheticPixPriceId(planTier: PlanTier, planType: BillingPlanType) {
+  return `pix:${planTier}:${planType}`;
+}
+
+function isSyntheticPixPriceId(priceId: string | null | undefined) {
+  return String(priceId || "").startsWith("pix:");
+}
+
+function parseCheckoutEvidence(checkout: Pick<PixCheckoutRow, "checkout_evidence_json">) {
+  if (!checkout.checkout_evidence_json) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(checkout.checkout_evidence_json) as {
+      amountCents?: unknown;
+      currency?: unknown;
+    };
+    const amountCents = Number(parsed.amountCents);
+    const currency = typeof parsed.currency === "string" ? parsed.currency.toLowerCase() : "";
+    if (!Number.isFinite(amountCents) || amountCents < 0 || !currency) {
+      return null;
+    }
+    return { amountCents: Math.round(amountCents), currency };
+  } catch {
+    return null;
+  }
 }
 
 function moneyAmount(amountCents: number) {
@@ -388,6 +447,7 @@ async function createMercadoPagoOrder(
     email: string;
     customerName: string;
     planType: BillingPlanType;
+    planTier: PlanTier | null;
     amountCents: number;
     deviceId?: string;
   },
@@ -395,7 +455,7 @@ async function createMercadoPagoOrder(
   const runtimeEnvironment = getMercadoPagoRuntimeEnvironment(c);
   const { firstName, lastName } = splitPayerName(input.customerName);
   const amount = moneyAmount(input.amountCents);
-  const title = pixProductTitle(input.planType);
+  const title = pixProductTitle(input.planType, input.planTier);
   const now = new Date().toISOString();
   return mercadoPagoFetch<MercadoPagoOrder>(c, "/v1/orders", {
     method: "POST",
@@ -416,7 +476,7 @@ async function createMercadoPagoOrder(
       },
       items: [
         {
-          external_code: input.planType === "monthly" ? "merlin_monthly" : "merlin_lifetime",
+          external_code: pixExternalCode(input.planType, input.planTier),
           title,
           description: title,
           category_id: "digital_services",
@@ -526,8 +586,8 @@ async function findPendingPixCheckout(c: AppContext, customerId: number) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
-          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, processed_at
+          provider_session_expires_at, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE customer_id = ?
           AND provider = ?
@@ -576,8 +636,8 @@ async function getPixCheckoutByReference(c: AppContext, reference: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
-          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, processed_at
+          provider_session_expires_at, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_external_reference = ?
@@ -631,9 +691,18 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
   }
 
   const now = new Date().toISOString();
-  const accessType = checkout.plan_type === "lifetime" ? "paid_lifetime" : "monthly_subscription";
-  const expiresAt = checkout.plan_type === "lifetime" ? LIFETIME_EXPIRES_AT : oneMonthFromNowIso();
+  const accessType = checkout.plan_type === "lifetime"
+    ? "paid_lifetime"
+    : checkout.plan_type === "annual"
+      ? "annual_manual"
+      : "monthly_subscription";
+  const expiresAt = checkout.plan_type === "lifetime"
+    ? LIFETIME_EXPIRES_AT
+    : checkout.plan_type === "annual"
+      ? oneYearFromNowIso()
+      : oneMonthFromNowIso();
   const periodEnd = checkout.plan_type === "lifetime" ? null : expiresAt;
+  const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
   let licenseId: number | null = null;
 
   if (checkout.reactivation_license_id) {
@@ -658,12 +727,15 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
               revoked_origin = NULL,
               revoked_event_id = NULL,
               source = 'mercadopago_pix',
+              plan_tier = ?,
+              premium_catalog_restricted = 0,
               customer_id = ?,
               access_type = ?,
               billing_status = 'active',
               stripe_customer_id = NULL,
               stripe_subscription_id = NULL,
               stripe_checkout_session_id = NULL,
+              billing_current_period_start = ?,
               billing_current_period_end = ?,
               billing_cancel_at_period_end = ?,
               updated_at = ?
@@ -676,10 +748,12 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
         checkout.pending_recovery_pin_hash,
         checkout.pending_recovery_notice_accepted_at || now,
         expiresAt,
+        planTier,
         customer.id,
         accessType,
+        now,
         periodEnd,
-        checkout.plan_type === "monthly" ? 0 : 0,
+        0,
         now,
         existing.id,
       )
@@ -724,18 +798,19 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
       .prepare(
         `
           INSERT INTO licenses (
-            license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status,
+            license_key, name, contact, contact_type, source, plan_tier, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status,
             revoked_reason, created_at, updated_at, customer_id, access_type, billing_status, stripe_customer_id, stripe_subscription_id,
-            stripe_checkout_session_id, billing_current_period_end, billing_cancel_at_period_end
+            stripe_checkout_session_id, billing_current_period_start, billing_current_period_end, billing_cancel_at_period_end
           )
-          VALUES (?, ?, ?, 'email', 'mercadopago_pix', ?, ?, NULL, ?, 'active',
-            NULL, ?, ?, ?, ?, 'active', NULL, NULL, NULL, ?, ?)
+          VALUES (?, ?, ?, 'email', 'mercadopago_pix', ?, ?, ?, NULL, ?, 'active',
+            NULL, ?, ?, ?, ?, 'active', NULL, NULL, NULL, ?, ?, ?)
         `,
       )
       .bind(
         checkout.pending_license_key,
         checkout.pending_name,
         customer.email_normalized || customer.email,
+        planTier,
         checkout.pending_recovery_pin_hash,
         checkout.pending_recovery_notice_accepted_at || now,
         expiresAt,
@@ -743,6 +818,7 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
         now,
         customer.id,
         accessType,
+        now,
         periodEnd,
         checkout.plan_type === "monthly" ? 1 : 0,
       )
@@ -795,9 +871,12 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
 async function savePixPayment(c: AppContext, checkout: PixCheckoutRow, order: MercadoPagoOrder, licenseId: number) {
   const now = new Date().toISOString();
   const payment = extractPixPayment(order);
-  const price = await getStripePriceSnapshot(c, checkout.provider_price_id, { forceRefresh: false, allowStaleOnError: true });
-  const amountCents = price?.amountCents ?? Math.round((getNumber(order.total_amount) || 0) * 100);
-  const currency = price?.currency || getString(order.currency) || "brl";
+  const evidence = parseCheckoutEvidence(checkout);
+  const price = isSyntheticPixPriceId(checkout.provider_price_id)
+    ? null
+    : await getStripePriceSnapshot(c, checkout.provider_price_id, { forceRefresh: false, allowStaleOnError: true });
+  const amountCents = evidence?.amountCents ?? price?.amountCents ?? Math.round((getNumber(order.total_amount) || 0) * 100);
+  const currency = evidence?.currency || price?.currency || getString(order.currency) || "brl";
   await c.env.merlin_db
     .prepare(
       `
@@ -826,6 +905,7 @@ function publicPixPayload(checkout: PixCheckoutRow) {
     paymentIntentId: checkout.provider_external_reference || checkout.provider_session_id,
     status: checkout.payment_status === "paid" ? "paid" : checkout.status === "expired" ? "expired" : checkout.status === "failed" ? "failed" : "awaiting_payment",
     planType: checkout.plan_type,
+    planTier: checkout.plan_tier ? normalizeStoredPlanTier(checkout.plan_tier, "ouro") : null,
     qrCode: checkout.provider_qr_code,
     qrCodeBase64: checkout.provider_qr_code_base64,
     ticketUrl: checkout.provider_ticket_url,
@@ -919,14 +999,16 @@ async function assertMercadoPagoOrderMatchesCheckout(
     throw new Error(`Pix checkout ${input.checkout.id} is not linked to Mercado Pago order ${input.event.dataId}`);
   }
 
-  const price = await getStripePriceSnapshot(c, input.checkout.provider_price_id, { forceRefresh: false, allowStaleOnError: true });
-  if (price) {
+  const expected = isSyntheticPixPriceId(input.checkout.provider_price_id)
+    ? parseCheckoutEvidence(input.checkout)
+    : await getStripePriceSnapshot(c, input.checkout.provider_price_id, { forceRefresh: false, allowStaleOnError: true });
+  if (expected) {
     const amountCents = getOrderAmountCents(input.order);
     const currency = getOrderCurrency(input.order);
-    if (amountCents !== null && amountCents !== price.amountCents) {
+    if (amountCents !== null && amountCents !== expected.amountCents) {
       throw new Error(`Mercado Pago amount mismatch for checkout ${input.checkout.id}`);
     }
-    if (currency && currency !== price.currency.toLowerCase()) {
+    if (currency && currency !== expected.currency.toLowerCase()) {
       throw new Error(`Mercado Pago currency mismatch for checkout ${input.checkout.id}`);
     }
   }
@@ -963,6 +1045,9 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   if (!billing.pixEnabled) {
     throw new HTTPException(409, { message: "Pix esta desativado." });
   }
+  if (billing.plansEnabled && input.planType === "lifetime") {
+    throw new HTTPException(409, { message: "Novos acessos vitalicios nao estao disponiveis com a estrutura de planos ativa." });
+  }
 
   const name = input.name.trim();
   if (!name) {
@@ -988,11 +1073,31 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   }
   const mercadoPagoDeviceId = normalizeDeviceId(input.mercadoPagoDeviceId);
 
-  const planEnabled = input.planType === "monthly" ? billing.monthlyEnabled : billing.lifetimeEnabled;
-  const pixPlanEnabled = input.planType === "monthly" ? billing.pixMonthlyEnabled : billing.pixLifetimeEnabled;
-  const priceId = input.planType === "monthly"
+  const planEnabled = input.planType === "monthly"
+    ? billing.monthlyEnabled
+    : input.planType === "annual"
+      ? billing.annualEnabled
+      : billing.lifetimeEnabled;
+  const pixPlanEnabled = input.planType === "monthly"
+    ? billing.pixMonthlyEnabled
+    : input.planType === "annual"
+      ? billing.pixAnnualEnabled
+      : billing.pixLifetimeEnabled;
+  const selectedTier = input.planTier ? normalizeStoredPlanTier(input.planTier, "ouro") : null;
+  if (billing.plansEnabled && input.planType !== "lifetime" && !selectedTier) {
+    throw new HTTPException(400, { message: "Escolha um plano Bronze, Prata ou Ouro." });
+  }
+  const selectedTierForCheckout = billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null;
+  const tierPrice = billing.plansEnabled && selectedTier && input.planType !== "lifetime"
+    ? await getBillingPlanPrice(c, "pix", selectedTier, input.planType)
+    : null;
+  const priceId = tierPrice
+    ? (tierPrice.provider_price_id || syntheticPixPriceId(selectedTier as PlanTier, input.planType))
+    : input.planType === "monthly"
     ? billing.monthlyPriceId
-    : billing.pixLifetimePriceId || billing.lifetimePriceId;
+    : input.planType === "annual"
+      ? billing.pixAnnualPriceId || billing.annualPriceId
+      : billing.pixLifetimePriceId || billing.lifetimePriceId;
   if (!planEnabled || !priceId) {
     throw new HTTPException(400, { message: "Plano indisponivel." });
   }
@@ -1001,10 +1106,22 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   }
 
   const verificationId = await assertRecentPublicEmailVerification(c, email);
-  const price = await getStripePriceSnapshot(c, priceId, { forceRefresh: true, allowStaleOnError: false });
-  assertBillingPlanPrice(input.planType, price);
-  if (!price) {
-    throw new HTTPException(400, { message: "Informe o Price ID do plano." });
+  const price: { amountCents: number; currency: string } | null = tierPrice
+    ? {
+      amountCents: tierPrice.amount_cents ?? 0,
+      currency: tierPrice.currency || "brl",
+    }
+    : await getStripePriceSnapshot(c, priceId, { forceRefresh: true, allowStaleOnError: false });
+  if (!tierPrice) {
+    const priceValidationPlan = input.planType === "monthly"
+      ? "monthly"
+      : input.planType === "annual" && !billing.pixAnnualPriceId
+        ? "annual"
+        : "lifetime";
+    assertBillingPlanPrice(priceValidationPlan, price as Awaited<ReturnType<typeof getStripePriceSnapshot>>);
+  }
+  if (!price || !price.amountCents) {
+    throw new HTTPException(400, { message: "Informe o valor do plano." });
   }
 
   const nowDate = new Date();
@@ -1019,7 +1136,12 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     if (
       pendingCheckout.status === "open"
       && pendingCheckout.provider_qr_code
-      && isSamePixCheckoutContext(pendingCheckout, input.planType, reactivationLicenseId)
+      && isSamePixCheckoutContext(
+        pendingCheckout,
+        input.planType,
+        selectedTierForCheckout,
+        reactivationLicenseId,
+      )
     ) {
       await consumePublicEmailVerification(c, verificationId);
       return {
@@ -1037,6 +1159,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   const checkoutEvidence = buildCheckoutEvidence({
     emailVerifiedAt,
     planType: input.planType,
+    planTier: selectedTierForCheckout,
     priceId,
     amountCents: price.amountCents,
     currency: price.currency,
@@ -1048,12 +1171,12 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     .prepare(
       `
         INSERT INTO checkout_sessions (
-          customer_id, provider, provider_session_id, provider_price_id, plan_type, mode, status,
+          customer_id, provider, provider_session_id, provider_price_id, plan_tier, plan_type, mode, status,
           pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, reactivation_license_id,
           provider_session_expires_at, payment_status, checkout_ip, checkout_user_agent, checkout_country,
           checkout_evidence_json, idempotency_key, provider_external_reference, provider_environment, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
     .bind(
@@ -1061,6 +1184,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       PROVIDER_MP,
       externalReference,
       priceId,
+      selectedTierForCheckout,
       input.planType,
       checkoutMode(input.planType),
       reactivationLicenseId ? null : licenseKey,
@@ -1094,6 +1218,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       email: getMercadoPagoPayerEmail(c, email),
       customerName: name,
       planType: input.planType,
+      planTier: selectedTierForCheckout,
       amountCents: price.amountCents,
       deviceId: mercadoPagoDeviceId,
     });
@@ -1135,6 +1260,7 @@ export async function getPublicPixOrderStatus(c: AppContext, paymentIntentId: st
         status: "paid" as const,
         paymentStatus: "paid",
         planType: refreshed.plan_type,
+        planTier: refreshed.plan_tier ? normalizeStoredPlanTier(refreshed.plan_tier, "ouro") : null,
         license: {
           licenseKey: license.license_key,
           name: license.name,

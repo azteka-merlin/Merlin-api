@@ -35,6 +35,7 @@ export class PublicEmailVerificationStartRoute extends OpenAPIRoute {
 							success: true,
 							cooldownSeconds: 60,
 							expiresIn: 600,
+							deliveryMode: "email",
 						},
 					},
 				},

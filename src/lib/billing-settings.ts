@@ -6,21 +6,28 @@ const PRICE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
 
-export type BillingPlanType = "monthly" | "lifetime";
+export type BillingPlanType = "monthly" | "annual" | "lifetime";
 
 type BillingSettingsRow = {
   id: number;
   billing_enabled: number;
   public_signup_enabled: number;
+  plans_enabled: number;
   monthly_enabled: number;
+  annual_enabled: number;
   lifetime_enabled: number;
   pix_enabled: number;
   pix_monthly_enabled: number;
+  pix_annual_enabled: number;
   pix_lifetime_enabled: number;
   monthly_card_trial_enabled: number;
   monthly_card_trial_days: number;
+  staging_email_delivery_enabled: number;
+  premium_catalog_cutoff_at: string | null;
   monthly_price_id: string | null;
+  annual_price_id: string | null;
   lifetime_price_id: string | null;
+  pix_annual_price_id: string | null;
   pix_lifetime_price_id: string | null;
   currency: string;
   free_access_type: string;
@@ -65,22 +72,31 @@ export type BillingPriceSnapshot = {
 export type BillingSettingsPayload = {
   billingEnabled: boolean;
   publicSignupEnabled: boolean;
+  plansEnabled: boolean;
   monthlyEnabled: boolean;
+  annualEnabled: boolean;
   lifetimeEnabled: boolean;
   pixEnabled: boolean;
   pixMonthlyEnabled: boolean;
+  pixAnnualEnabled: boolean;
   pixLifetimeEnabled: boolean;
   monthlyCardTrialEnabled: boolean;
   monthlyCardTrialDays: number;
+  stagingEmailDeliveryEnabled: boolean;
+  premiumCatalogCutoffAt: string | null;
   monthlyPriceId: string;
+  annualPriceId: string;
   lifetimePriceId: string;
+  pixAnnualPriceId: string;
   pixLifetimePriceId: string;
   currency: string;
   freeAccessType: string;
   freeDurationDays: number | null;
   prices: {
     monthly: BillingPriceSnapshot | null;
+    annual: BillingPriceSnapshot | null;
     lifetime: BillingPriceSnapshot | null;
+    pixAnnual: BillingPriceSnapshot | null;
     pixLifetime: BillingPriceSnapshot | null;
   };
   updatedAt: string;
@@ -88,15 +104,22 @@ export type BillingSettingsPayload = {
 
 export type BillingSettingsInput = {
   billingEnabled: boolean;
+  plansEnabled?: boolean;
   monthlyEnabled: boolean;
+  annualEnabled?: boolean;
   lifetimeEnabled: boolean;
   pixEnabled?: boolean;
   pixMonthlyEnabled?: boolean;
+  pixAnnualEnabled?: boolean;
   pixLifetimeEnabled?: boolean;
   monthlyCardTrialEnabled?: boolean;
   monthlyCardTrialDays?: number;
+  stagingEmailDeliveryEnabled?: boolean;
+  premiumCatalogCutoffAt?: string | null;
   monthlyPriceId?: string;
+  annualPriceId?: string;
   lifetimePriceId?: string;
+  pixAnnualPriceId?: string;
   pixLifetimePriceId?: string;
 };
 
@@ -270,31 +293,45 @@ export function assertBillingPlanPrice(planType: BillingPlanType, price: Billing
   if (planType === "monthly" && price.recurringInterval !== "month") {
     throw new HTTPException(400, { message: "O Price ID mensal precisa ser recorrente mensal." });
   }
+  if (planType === "annual" && price.recurringInterval !== "year") {
+    throw new HTTPException(400, { message: "O Price ID anual precisa ser recorrente anual." });
+  }
   if (planType === "lifetime" && price.recurringInterval !== null) {
     throw new HTTPException(400, { message: "O Price ID vitalicio precisa ser pagamento unico." });
   }
 }
 
 function envPriceId(c: AppContext, planType: BillingPlanType) {
-  return planType === "monthly" ? c.env.STRIPE_MONTHLY_PRICE_ID || "" : c.env.STRIPE_LIFETIME_PRICE_ID || "";
+  if (planType === "monthly") return c.env.STRIPE_MONTHLY_PRICE_ID || "";
+  if (planType === "annual") return c.env.STRIPE_ANNUAL_PRICE_ID || "";
+  return c.env.STRIPE_LIFETIME_PRICE_ID || "";
 }
 
 function mapBillingSettings(c: AppContext, row: BillingSettingsRow, prices: BillingSettingsPayload["prices"]): BillingSettingsPayload {
   const monthlyPriceId = normalizePriceId(row.monthly_price_id) || envPriceId(c, "monthly");
+  const annualPriceId = normalizePriceId(row.annual_price_id) || envPriceId(c, "annual");
   const lifetimePriceId = normalizePriceId(row.lifetime_price_id) || envPriceId(c, "lifetime");
+  const pixAnnualPriceId = normalizePriceId(row.pix_annual_price_id);
   const pixLifetimePriceId = normalizePriceId(row.pix_lifetime_price_id);
   return {
     billingEnabled: row.billing_enabled === 1,
     publicSignupEnabled: row.public_signup_enabled === 1,
+    plansEnabled: row.plans_enabled === 1,
     monthlyEnabled: row.monthly_enabled === 1,
+    annualEnabled: row.annual_enabled === 1,
     lifetimeEnabled: row.lifetime_enabled === 1,
     pixEnabled: row.pix_enabled === 1,
     pixMonthlyEnabled: row.pix_monthly_enabled === 1,
+    pixAnnualEnabled: row.pix_annual_enabled === 1,
     pixLifetimeEnabled: row.pix_lifetime_enabled === 1,
     monthlyCardTrialEnabled: row.monthly_card_trial_enabled === 1,
     monthlyCardTrialDays: normalizeTrialDays(row.monthly_card_trial_days),
+    stagingEmailDeliveryEnabled: row.staging_email_delivery_enabled === 1,
+    premiumCatalogCutoffAt: row.premium_catalog_cutoff_at || null,
     monthlyPriceId,
+    annualPriceId,
     lifetimePriceId,
+    pixAnnualPriceId,
     pixLifetimePriceId,
     currency: row.currency || "brl",
     freeAccessType: row.free_access_type || "free",
@@ -309,13 +346,20 @@ export async function getBillingSettings(c: AppContext) {
   let row = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
+        SELECT id, billing_enabled, public_signup_enabled,
+          COALESCE(plans_enabled, 0) AS plans_enabled,
+          monthly_enabled,
+          COALESCE(annual_enabled, 0) AS annual_enabled,
+          lifetime_enabled,
           COALESCE(pix_enabled, 0) AS pix_enabled,
           COALESCE(pix_monthly_enabled, 1) AS pix_monthly_enabled,
+          COALESCE(pix_annual_enabled, 1) AS pix_annual_enabled,
           COALESCE(pix_lifetime_enabled, 1) AS pix_lifetime_enabled,
           COALESCE(monthly_card_trial_enabled, 0) AS monthly_card_trial_enabled,
           COALESCE(monthly_card_trial_days, 30) AS monthly_card_trial_days,
-          monthly_price_id, lifetime_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+          COALESCE(staging_email_delivery_enabled, 0) AS staging_email_delivery_enabled,
+          premium_catalog_cutoff_at,
+          monthly_price_id, annual_price_id, lifetime_price_id, pix_annual_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         FROM billing_settings
         WHERE id = 1
       `,
@@ -327,10 +371,10 @@ export async function getBillingSettings(c: AppContext) {
       .prepare(
         `
           INSERT INTO billing_settings (
-            id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
-            pix_enabled, pix_monthly_enabled, pix_lifetime_enabled, monthly_card_trial_enabled, monthly_card_trial_days, currency, free_access_type, updated_at
+            id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, annual_enabled, lifetime_enabled,
+            pix_enabled, pix_monthly_enabled, pix_annual_enabled, pix_lifetime_enabled, monthly_card_trial_enabled, monthly_card_trial_days, staging_email_delivery_enabled, premium_catalog_cutoff_at, currency, free_access_type, updated_at
           )
-          VALUES (1, 0, 1, 1, 1, 0, 1, 1, 0, 30, 'brl', 'free', ?)
+          VALUES (1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 30, 0, NULL, 'brl', 'free', ?)
         `,
       )
       .bind(now)
@@ -339,15 +383,22 @@ export async function getBillingSettings(c: AppContext) {
       id: 1,
       billing_enabled: 0,
       public_signup_enabled: 1,
+      plans_enabled: 0,
       monthly_enabled: 1,
+      annual_enabled: 0,
       lifetime_enabled: 1,
       pix_enabled: 0,
       pix_monthly_enabled: 1,
+      pix_annual_enabled: 1,
       pix_lifetime_enabled: 1,
       monthly_card_trial_enabled: 0,
       monthly_card_trial_days: 30,
+      staging_email_delivery_enabled: 0,
+      premium_catalog_cutoff_at: null,
       monthly_price_id: null,
+      annual_price_id: null,
       lifetime_price_id: null,
+      pix_annual_price_id: null,
       pix_lifetime_price_id: null,
       currency: "brl",
       free_access_type: "free",
@@ -357,11 +408,15 @@ export async function getBillingSettings(c: AppContext) {
   }
 
   const monthlyPriceId = normalizePriceId(row.monthly_price_id) || envPriceId(c, "monthly");
+  const annualPriceId = normalizePriceId(row.annual_price_id) || envPriceId(c, "annual");
   const lifetimePriceId = normalizePriceId(row.lifetime_price_id) || envPriceId(c, "lifetime");
+  const pixAnnualPriceId = normalizePriceId(row.pix_annual_price_id);
   const pixLifetimePriceId = normalizePriceId(row.pix_lifetime_price_id);
   const prices = {
     monthly: await getReadableStripePriceSnapshot(c, monthlyPriceId),
+    annual: await getReadableStripePriceSnapshot(c, annualPriceId),
     lifetime: await getReadableStripePriceSnapshot(c, lifetimePriceId),
+    pixAnnual: await getReadableStripePriceSnapshot(c, pixAnnualPriceId),
     pixLifetime: await getReadableStripePriceSnapshot(c, pixLifetimePriceId),
   };
 
@@ -370,31 +425,48 @@ export async function getBillingSettings(c: AppContext) {
 
 export async function updateBillingSettings(c: AppContext, input: BillingSettingsInput & { publicSignupEnabled: boolean }) {
   const monthlyPriceId = normalizePriceId(input.monthlyPriceId);
+  const annualPriceId = normalizePriceId(input.annualPriceId);
   const lifetimePriceId = normalizePriceId(input.lifetimePriceId);
+  const pixAnnualPriceId = normalizePriceId(input.pixAnnualPriceId);
   const pixLifetimePriceId = normalizePriceId(input.pixLifetimePriceId);
   const monthlyCardTrialDays = normalizeTrialDays(input.monthlyCardTrialDays);
+  const stagingEmailDeliveryEnabled = c.env.ENVIRONMENT === "staging" && input.stagingEmailDeliveryEnabled === true;
+  const premiumCatalogCutoffAt = String(input.premiumCatalogCutoffAt || "").trim() || null;
+  const validateLegacySubscriptionPrices = !input.plansEnabled;
 
-  if (input.billingEnabled && !input.monthlyEnabled && !input.lifetimeEnabled) {
+  if (input.billingEnabled && !input.monthlyEnabled && !input.annualEnabled && !input.lifetimeEnabled) {
     throw new HTTPException(400, { message: "Ative pelo menos um plano para exigir pagamento." });
   }
 
-  const monthlyPrice = input.monthlyEnabled || monthlyPriceId
+  const monthlyPrice = validateLegacySubscriptionPrices && (input.monthlyEnabled || monthlyPriceId)
     ? await getStripePriceSnapshot(c, monthlyPriceId, { forceRefresh: true, allowStaleOnError: false })
     : null;
-  const lifetimePrice = input.lifetimeEnabled || lifetimePriceId
+  const annualPrice = validateLegacySubscriptionPrices && (input.annualEnabled || annualPriceId)
+    ? await getStripePriceSnapshot(c, annualPriceId, { forceRefresh: true, allowStaleOnError: false })
+    : null;
+  const lifetimePrice = validateLegacySubscriptionPrices && (input.lifetimeEnabled || lifetimePriceId)
     ? await getStripePriceSnapshot(c, lifetimePriceId, { forceRefresh: true, allowStaleOnError: false })
     : null;
-  const pixLifetimePrice = pixLifetimePriceId
+  const pixAnnualPrice = validateLegacySubscriptionPrices && pixAnnualPriceId
+    ? await getStripePriceSnapshot(c, pixAnnualPriceId, { forceRefresh: true, allowStaleOnError: false })
+    : null;
+  const pixLifetimePrice = validateLegacySubscriptionPrices && pixLifetimePriceId
     ? await getStripePriceSnapshot(c, pixLifetimePriceId, { forceRefresh: true, allowStaleOnError: false })
     : null;
 
-  if (input.monthlyEnabled) {
+  if (validateLegacySubscriptionPrices && input.monthlyEnabled) {
     assertBillingPlanPrice("monthly", monthlyPrice);
   }
-  if (input.lifetimeEnabled) {
+  if (validateLegacySubscriptionPrices && input.annualEnabled) {
+    assertBillingPlanPrice("annual", annualPrice);
+  }
+  if (validateLegacySubscriptionPrices && input.lifetimeEnabled) {
     assertBillingPlanPrice("lifetime", lifetimePrice);
   }
-  if (pixLifetimePriceId) {
+  if (validateLegacySubscriptionPrices && pixAnnualPriceId) {
+    assertBillingPlanPrice("annual", pixAnnualPrice);
+  }
+  if (validateLegacySubscriptionPrices && pixLifetimePriceId) {
     assertBillingPlanPrice("lifetime", pixLifetimePrice);
   }
 
@@ -403,24 +475,31 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
     .prepare(
       `
         INSERT INTO billing_settings (
-          id, billing_enabled, public_signup_enabled, monthly_enabled, lifetime_enabled,
-          pix_enabled, pix_monthly_enabled, pix_lifetime_enabled,
-          monthly_card_trial_enabled, monthly_card_trial_days,
-          monthly_price_id, lifetime_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
+          id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, annual_enabled, lifetime_enabled,
+          pix_enabled, pix_monthly_enabled, pix_annual_enabled, pix_lifetime_enabled,
+          monthly_card_trial_enabled, monthly_card_trial_days, staging_email_delivery_enabled, premium_catalog_cutoff_at,
+          monthly_price_id, annual_price_id, lifetime_price_id, pix_annual_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           billing_enabled = excluded.billing_enabled,
           public_signup_enabled = excluded.public_signup_enabled,
+          plans_enabled = excluded.plans_enabled,
           monthly_enabled = excluded.monthly_enabled,
+          annual_enabled = excluded.annual_enabled,
           lifetime_enabled = excluded.lifetime_enabled,
           pix_enabled = excluded.pix_enabled,
           pix_monthly_enabled = excluded.pix_monthly_enabled,
+          pix_annual_enabled = excluded.pix_annual_enabled,
           pix_lifetime_enabled = excluded.pix_lifetime_enabled,
           monthly_card_trial_enabled = excluded.monthly_card_trial_enabled,
           monthly_card_trial_days = excluded.monthly_card_trial_days,
+          staging_email_delivery_enabled = excluded.staging_email_delivery_enabled,
+          premium_catalog_cutoff_at = excluded.premium_catalog_cutoff_at,
           monthly_price_id = excluded.monthly_price_id,
+          annual_price_id = excluded.annual_price_id,
           lifetime_price_id = excluded.lifetime_price_id,
+          pix_annual_price_id = excluded.pix_annual_price_id,
           pix_lifetime_price_id = excluded.pix_lifetime_price_id,
           currency = excluded.currency,
           free_access_type = excluded.free_access_type,
@@ -431,19 +510,51 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
     .bind(
       input.billingEnabled ? 1 : 0,
       input.publicSignupEnabled ? 1 : 0,
+      input.plansEnabled ? 1 : 0,
       input.monthlyEnabled ? 1 : 0,
+      input.annualEnabled ? 1 : 0,
       input.lifetimeEnabled ? 1 : 0,
       input.pixEnabled ? 1 : 0,
       input.pixMonthlyEnabled !== false ? 1 : 0,
+      input.pixAnnualEnabled !== false ? 1 : 0,
       input.pixLifetimeEnabled !== false ? 1 : 0,
       input.monthlyCardTrialEnabled ? 1 : 0,
       monthlyCardTrialDays,
+      stagingEmailDeliveryEnabled ? 1 : 0,
+      premiumCatalogCutoffAt,
       monthlyPriceId || null,
+      annualPriceId || null,
       lifetimePriceId || null,
+      pixAnnualPriceId || null,
       pixLifetimePriceId || null,
       now,
     )
     .run();
+
+  return getBillingSettings(c);
+}
+
+export async function getPremiumCatalogCutoffAt(c: AppContext): Promise<string | null> {
+  const row = await c.env.merlin_db
+    .prepare("SELECT premium_catalog_cutoff_at FROM billing_settings WHERE id = 1")
+    .first<{ premium_catalog_cutoff_at: string | null }>();
+  return row?.premium_catalog_cutoff_at || null;
+}
+
+export async function refreshBillingPriceSnapshots(c: AppContext) {
+  const billing = await getBillingSettings(c);
+  const priceIds = billing.plansEnabled ? [] : [
+    billing.monthlyPriceId,
+    billing.annualPriceId,
+    billing.lifetimePriceId,
+    billing.pixAnnualPriceId,
+    billing.pixLifetimePriceId,
+  ].map(normalizePriceId).filter(Boolean);
+  const uniquePriceIds = [...new Set(priceIds)];
+
+  await Promise.all(uniquePriceIds.map((priceId) => (
+    getStripePriceSnapshot(c, priceId, { forceRefresh: true, allowStaleOnError: false })
+  )));
 
   return getBillingSettings(c);
 }

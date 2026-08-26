@@ -23,6 +23,7 @@ type LicenseRecord = {
 	hwid: string | null;
 	expires_at: string;
 	status: "active" | "revoked" | "expired";
+	plan_tier: "bronze" | "prata" | "ouro" | null;
 	access_type: string | null;
 	billing_status: string | null;
 	stripe_subscription_id: string | null;
@@ -42,6 +43,7 @@ async function getLicenseByKey(c: AppContext, licenseKey: string): Promise<Licen
 					hwid,
 					expires_at,
 					status,
+					plan_tier,
 					access_type,
 					billing_status,
 					stripe_subscription_id,
@@ -187,12 +189,13 @@ export class LoginRoute extends OpenAPIRoute {
 					name: license.name,
 					expiresAt: toDateOnly(license.expires_at),
 					status: license.status,
+					planTier: license.plan_tier || "ouro",
 					billing: {
 						accessType: license.access_type || "free",
 						billingStatus: license.billing_status || "none",
 						currentPeriodEnd: license.billing_current_period_end,
 						cancelAtPeriodEnd: license.billing_cancel_at_period_end === 1,
-						canManageSubscription: license.access_type === "monthly_subscription" && Boolean(license.stripe_subscription_id),
+						canManageSubscription: ["monthly_subscription", "annual_subscription"].includes(license.access_type || "") && Boolean(license.stripe_subscription_id),
 					},
 				},
 			},

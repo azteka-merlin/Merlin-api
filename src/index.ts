@@ -38,13 +38,41 @@ import {
   updateTestLicense,
   updateLicense,
 } from "./lib/admin-license-service";
-import { getBillingSettings, updateBillingSettings } from "./lib/billing-settings";
+import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings } from "./lib/billing-settings";
 import { runBillingNotificationCron } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
-import { createPublicAccessBillingPortal, createPublicAccessUpgradeCheckout, getPublicAccessDetails, getPublicAccessUpgradeStatus } from "./lib/public-access-management";
+import {
+  cancelPublicAccessPlanChange,
+  cancelPublicAccessPlanChangeForLicense,
+  createPublicAccessBillingPortal,
+  createPublicAccessBillingPortalForLicense,
+  createPublicAccessPlanChange,
+  createPublicAccessPlanChangeForLicense,
+  createPublicAccessUpgradeCheckout,
+  getPublicAccessDetails,
+  getPublicAccessDetailsForLicense,
+  getPublicAccessUpgradeStatus,
+  previewPublicAccessPlanChange,
+  previewPublicAccessPlanChangeForLicense,
+  validatePublicAccessCredentials,
+} from "./lib/public-access-management";
+import {
+  createPublicAccessSession,
+  requirePublicAccessSession,
+  revokePublicAccessSession,
+} from "./lib/public-access-session";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
+import {
+  cancelScheduledSubscriptionPlanChange,
+  createSubscriptionPlanChange,
+  listBillingPlanPrices,
+  listPublicBillingPlanPrices,
+  previewSubscriptionPlanChange,
+  refreshBillingPlanPrices,
+  upsertBillingPlanPrices,
+} from "./lib/subscription-plan-change";
 import {
   createPublicPixOrder,
   getPublicPixOrderStatus,
@@ -93,7 +121,8 @@ import {
 } from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
-import { enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { assertRecentPublicEmailVerification } from "./lib/email-verification";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
   getPublicSignupMetrics,
@@ -170,6 +199,24 @@ const adminLoginSchema = z.object({
 const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
   message: "Use 4 a 8 caracteres, sem espacos.",
 });
+const planTierSchema = z.enum(["bronze", "prata", "ouro"]);
+const billingPlanPeriodSchema = z.enum(["monthly", "annual"]);
+const billingPlanPaymentMethodSchema = z.enum(["card", "pix"]);
+const subscriptionPlanChangeSchema = z.object({
+  targetTier: planTierSchema,
+  targetPeriod: billingPlanPeriodSchema,
+});
+const billingPlanPriceUpsertSchema = z.object({
+  prices: z.array(z.object({
+    paymentMethod: billingPlanPaymentMethodSchema,
+    planTier: planTierSchema,
+    billingPeriod: billingPlanPeriodSchema,
+    priceId: z.string().trim().optional().nullable(),
+    amountCents: z.number().int().min(0).optional().nullable(),
+    currency: z.string().trim().min(3).max(3).optional().default("brl"),
+    active: z.boolean().optional().default(true),
+  })).max(24),
+});
 const updateLicenseSchema = z.object({
   name: z.string().min(1),
   contact: z.string().min(1).optional(),
@@ -178,6 +225,7 @@ const updateLicenseSchema = z.object({
   recoveryPin: recoverySecretSchema.optional(),
   expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   hwid: z.string().trim().optional().nullable(),
+  planTier: planTierSchema.nullable().optional(),
 }).refine((value) => Boolean(value.contact || value.phone), {
   message: "Contact is required",
   path: ["contact"],
@@ -220,15 +268,22 @@ const publicSignupSettingsSchema = z.object({
   isLifetime: z.boolean(),
   billing: z.object({
     billingEnabled: z.boolean(),
+    plansEnabled: z.boolean().optional().default(false),
     monthlyEnabled: z.boolean(),
+    annualEnabled: z.boolean().optional().default(false),
     lifetimeEnabled: z.boolean(),
     pixEnabled: z.boolean().optional().default(false),
     pixMonthlyEnabled: z.boolean().optional().default(true),
+    pixAnnualEnabled: z.boolean().optional().default(true),
     pixLifetimeEnabled: z.boolean().optional().default(true),
     monthlyCardTrialEnabled: z.boolean().optional().default(false),
     monthlyCardTrialDays: z.number().int().min(1).max(730).optional().default(30),
+    stagingEmailDeliveryEnabled: z.boolean().optional().default(false),
+    premiumCatalogCutoffAt: z.string().datetime().nullable().optional(),
     monthlyPriceId: z.string().trim().optional().default(""),
+    annualPriceId: z.string().trim().optional().default(""),
     lifetimePriceId: z.string().trim().optional().default(""),
+    pixAnnualPriceId: z.string().trim().optional().default(""),
     pixLifetimePriceId: z.string().trim().optional().default(""),
   }).optional(),
 });
@@ -237,7 +292,8 @@ const publicCheckoutSchema = z.object({
   contact: z.string().trim().email(),
   recoveryPin: recoverySecretSchema,
   acceptedRecoveryNotice: z.boolean(),
-  planType: z.enum(["monthly", "lifetime"]),
+  planType: z.enum(["monthly", "annual", "lifetime"]),
+  planTier: planTierSchema.optional().nullable(),
 });
 const publicPixOrderSchema = publicCheckoutSchema.extend({
   mercadoPagoDeviceId: z.string().trim().max(200).optional(),
@@ -257,6 +313,9 @@ const publicBillingPortalSchema = z.object({
 const publicAccessMeSchema = z.object({
   email: z.string().trim().email(),
   recoveryPin: recoverySecretSchema,
+});
+const publicAccessSessionSchema = publicAccessMeSchema.extend({
+  rememberDevice: z.boolean().optional().default(false),
 });
 const publicAccessUpgradeStatusQuerySchema = z.object({
   session_id: z.string().trim().min(1),
@@ -325,6 +384,9 @@ const premiumGameCreateSchema = z.object({
   activationType: z.enum(["steam_ticket", "third_party"]).optional(),
   launchExecutablePath: z.string().min(1).nullable().optional(),
   activationLimit: z.number().int().positive().optional(),
+  accessBronzeEnabled: z.boolean().optional(),
+  accessPrataEnabled: z.boolean().optional(),
+  accessOuroEnabled: z.boolean().optional(),
   enabled: z.boolean().optional(),
 });
 const premiumGameUpdateSchema = z.object({
@@ -335,6 +397,9 @@ const premiumGameUpdateSchema = z.object({
   activationType: z.enum(["steam_ticket", "third_party"]).nullable().optional(),
   launchExecutablePath: z.string().min(1).nullable().optional(),
   activationLimit: z.number().int().positive().optional(),
+  accessBronzeEnabled: z.boolean().optional(),
+  accessPrataEnabled: z.boolean().optional(),
+  accessOuroEnabled: z.boolean().optional(),
   enabled: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: "At least one premium game field must be provided",
@@ -698,6 +763,29 @@ async function servePanelApp(c: any) {
   });
 }
 
+async function serveDownloadApp(c: any) {
+  const response = await c.env.ASSETS.fetch(new Request(new URL("/download-assets/index.html", c.req.url).toString(), { method: "GET" }));
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+async function serveNoStoreAsset(c: any, pathname: string) {
+  const response = await c.env.ASSETS.fetch(new Request(new URL(pathname, c.req.url).toString(), { method: "GET" }));
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function isPagePreviewCrawler(c: any) {
   const cf = c.req.raw.cf as { verifiedBotCategory?: string } | undefined;
   const userAgent = String(c.req.header("user-agent") || "").toLowerCase();
@@ -822,11 +910,14 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
 
   const pixRuntimeAvailable = isMercadoPagoPixAvailable(c);
   const pixMonthlyAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.monthlyEnabled && billing.pixMonthlyEnabled;
+  const pixAnnualAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.annualEnabled && billing.pixAnnualEnabled;
   const pixLifetimeAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.lifetimeEnabled && billing.pixLifetimeEnabled;
 
   return {
     billingEnabled: billing.billingEnabled,
+    plansEnabled: billing.plansEnabled,
     monthlyEnabled: billing.monthlyEnabled,
+    annualEnabled: billing.annualEnabled,
     lifetimeEnabled: billing.lifetimeEnabled,
     monthlyCardTrial: {
       enabled: billing.monthlyCardTrialEnabled,
@@ -834,13 +925,16 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
     },
     paymentMethods: {
       card: true,
-      pix: pixMonthlyAvailable || pixLifetimeAvailable,
+      pix: pixMonthlyAvailable || pixAnnualAvailable || pixLifetimeAvailable,
       pixMonthly: pixMonthlyAvailable,
+      pixAnnual: pixAnnualAvailable,
       pixLifetime: pixLifetimeAvailable,
     },
     prices: {
       monthly: mapPrice(billing.prices.monthly),
+      annual: mapPrice(billing.prices.annual),
       lifetime: mapPrice(billing.prices.lifetime),
+      pixAnnual: mapPrice(billing.prices.pixAnnual),
       pixLifetime: mapPrice(billing.prices.pixLifetime),
     },
   };
@@ -1047,6 +1141,15 @@ app.get("/", (c) => {
   }
   return c.redirect("/download", 302);
 });
+
+app.get("/download", (c) => serveDownloadApp(c));
+app.get("/checkout", (c) => {
+  const target = new URL(c.req.url);
+  target.pathname = "/download";
+  return c.redirect(target.toString(), 302);
+});
+app.get("/download-assets/assets/app.js", (c) => serveNoStoreAsset(c, "/download-assets/assets/app.js"));
+app.get("/download-assets/assets/app.css", (c) => serveNoStoreAsset(c, "/download-assets/assets/app.css"));
 
 for (const route of pageRoutes) {
   app.get(route, handleProtectedPage);
@@ -1682,6 +1785,11 @@ app.get("/api/billing/settings-public", async (c) => {
   }, 200);
 });
 
+app.get("/api/billing/plan-prices-public", async (c) => {
+  const prices = await listPublicBillingPlanPrices(c);
+  return c.json({ success: true, prices }, 200);
+});
+
 app.post("/api/public/checkout", async (c) => {
   const body = parseBody(publicCheckoutSchema, await c.req.json());
   try {
@@ -1836,6 +1944,30 @@ app.put("/panel-api/public-signup", async (c) => {
     : await getBillingSettings(c);
   const metrics = await getPublicSignupMetrics(c);
   return c.json({ settings: getPublicSignupSettingsPayload(settings), billing, metrics }, 200);
+});
+
+app.post("/panel-api/public-signup/billing/refresh-prices", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const settings = await getPublicSignupSettings(c);
+  const billing = await refreshBillingPriceSnapshots(c);
+  const prices = billing.plansEnabled
+    ? await refreshBillingPlanPrices(c)
+    : await listBillingPlanPrices(c);
+  const metrics = await getPublicSignupMetrics(c);
+  return c.json({ success: true, settings: getPublicSignupSettingsPayload(settings), billing, prices, metrics }, 200);
+});
+
+app.get("/panel-api/billing/plan-prices", async (c) => {
+  await requireAdminSession(c);
+  const prices = await listBillingPlanPrices(c);
+  return c.json({ success: true, prices }, 200);
+});
+
+app.put("/panel-api/billing/plan-prices", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(billingPlanPriceUpsertSchema, await c.req.json());
+  const prices = await upsertBillingPlanPrices(c, body.prices);
+  return c.json({ success: true, prices }, 200);
 });
 
 app.get("/panel-api/public-feedbacks", async (c) => {
@@ -2208,6 +2340,131 @@ app.post("/panel-api/licenses/:id/sync-stripe", async (c) => {
   });
   const updated = await getLicense(c, licenseId);
   return c.json({ success: true, result, license: mapLicense(updated) }, 200);
+});
+
+app.post("/panel-api/licenses/:id/plan-change/preview", async (c) => {
+  await requireAdminSession(c);
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
+  const planChange = await previewSubscriptionPlanChange(c, {
+    licenseId,
+    targetTier: body.targetTier,
+    targetPeriod: body.targetPeriod,
+  });
+  return c.json({ success: true, planChange }, 200);
+});
+
+app.post("/panel-api/licenses/:id/plan-change", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
+  const planChange = await createSubscriptionPlanChange(c, {
+    licenseId,
+    targetTier: body.targetTier,
+    targetPeriod: body.targetPeriod,
+  });
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "license_plan_change_requested",
+    entityType: "license",
+    entityId: String(licenseId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: planChange,
+  });
+  const updated = await getLicense(c, licenseId);
+  return c.json({ success: true, planChange, license: mapLicense(updated) }, 201);
+});
+
+app.post("/api/public/access/identify", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  await enforcePublicAccessCredentialsRateLimit(c, body.email);
+  await validatePublicAccessCredentials(c, body);
+  return c.json({ success: true }, 200);
+});
+
+app.post("/api/public/access/session", async (c) => {
+  const body = parseBody(publicAccessSessionSchema, await c.req.json());
+  await enforcePublicAccessCredentialsRateLimit(c, body.email);
+  await assertRecentPublicEmailVerification(c, body.email);
+  const { license } = await validatePublicAccessCredentials(c, body);
+  const session = await createPublicAccessSession(c, license.id, body.rememberDevice);
+  const access = await getPublicAccessDetailsForLicense(c, license.id);
+  return c.json({ success: true, ...session, ...access }, 200);
+});
+
+app.get("/api/public/access/session", async (c) => {
+  const session = await requirePublicAccessSession(c);
+  const access = await getPublicAccessDetailsForLicense(c, session.session.license_id);
+  return c.json({ success: true, csrfToken: session.csrfToken, ...access }, 200);
+});
+
+app.post("/api/public/access/session/logout", async (c) => {
+  await requirePublicAccessSession(c, { mutate: true });
+  await revokePublicAccessSession(c);
+  return c.json({ success: true }, 200);
+});
+
+app.post("/api/public/access/session/plan-change/preview", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
+  const planChange = await previewPublicAccessPlanChangeForLicense(c, session.session.license_id, body);
+  return c.json({ success: true, planChange }, 200);
+});
+
+app.post("/api/public/access/session/plan-change", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
+  const license = await getLicense(c, session.session.license_id);
+  const planChange = await createPublicAccessPlanChangeForLicense(c, license, body, { returnPath: "/meu-acesso" });
+  return c.json({ success: true, planChange }, 201);
+});
+
+app.post("/api/public/access/session/plan-change/cancel", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const planChange = await cancelPublicAccessPlanChangeForLicense(c, session.session.license_id);
+  return c.json({ success: true, planChange }, 200);
+});
+
+app.post("/api/public/access/session/billing-portal", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const license = await getLicense(c, session.session.license_id);
+  const portal = await createPublicAccessBillingPortalForLicense(c, license, "/meu-acesso?access=portal-return");
+  return c.json({ success: true, ...portal }, 200);
+});
+
+app.post("/api/public/access/plan-change/preview", async (c) => {
+  const body = parseBody(publicAccessMeSchema.merge(subscriptionPlanChangeSchema), await c.req.json());
+  const planChange = await previewPublicAccessPlanChange(c, body);
+  return c.json({ success: true, planChange }, 200);
+});
+
+app.post("/api/public/access/plan-change", async (c) => {
+  const body = parseBody(publicAccessMeSchema.merge(subscriptionPlanChangeSchema), await c.req.json());
+  const planChange = await createPublicAccessPlanChange(c, body);
+  return c.json({ success: true, planChange }, 201);
+});
+
+app.post("/api/public/access/plan-change/cancel", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  const planChange = await cancelPublicAccessPlanChange(c, body);
+  return c.json({ success: true, planChange }, 200);
+});
+
+app.post("/panel-api/licenses/:id/plan-change/cancel", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const result = await cancelScheduledSubscriptionPlanChange(c, licenseId);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "license_plan_change_canceled",
+    entityType: "license",
+    entityId: String(licenseId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: result,
+  });
+  return c.json({ success: true, result }, 200);
 });
 
 app.get("/api/premium/catalog", async (c) => {

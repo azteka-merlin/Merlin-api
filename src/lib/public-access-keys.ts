@@ -256,9 +256,9 @@ export async function registerPublicAccessKey(
         .prepare(
           `
             INSERT INTO licenses (
-              license_key, name, contact, contact_type, source, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
+              license_key, name, contact, contact_type, source, plan_tier, premium_catalog_restricted, recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'public_signup', ?, ?, NULL, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, ?, ?, 'public_signup', 'bronze', 1, ?, ?, NULL, ?, 'active', NULL, ?, ?)
           `,
         )
         .bind(licenseKey, name, contact, input.contactType, recoveryPinHash, now, expiresAt, now, now)

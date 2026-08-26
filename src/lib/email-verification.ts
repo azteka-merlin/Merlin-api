@@ -1,5 +1,6 @@
 import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
+import { getBillingSettings } from "./billing-settings";
 
 type EmailVerificationRow = {
 	id: number;
@@ -201,8 +202,13 @@ export async function startPublicEmailVerification(c: AppContext, email: string)
 	const expiresAt = addSeconds(now, CODE_TTL_SECONDS);
 	const cooldownUntil = addSeconds(now, RESEND_COOLDOWN_SECONDS);
 	const idempotencyKey = `public-email-${normalizedEmail}-${now.getTime()}`;
+	const isStaging = c.env.ENVIRONMENT === "staging";
+	const billing = isStaging ? await getBillingSettings(c) : null;
+	const useStagingTestCode = isStaging && !billing?.stagingEmailDeliveryEnabled;
 
-	await sendVerificationEmail(c, { email, code, idempotencyKey });
+	if (!useStagingTestCode) {
+		await sendVerificationEmail(c, { email, code, idempotencyKey });
+	}
 
 	await c.env.merlin_db
 		.prepare(
@@ -222,16 +228,17 @@ export async function startPublicEmailVerification(c: AppContext, email: string)
 				INSERT INTO email_verifications (
 					email, email_normalized, code_hash, status, provider, verify_attempts, expires_at, cooldown_until, last_sent_at, created_at, updated_at
 				)
-				VALUES (?, ?, ?, 'pending', 'resend', 0, ?, ?, ?, ?, ?)
+				VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?)
 			`,
 		)
-		.bind(email.trim(), normalizedEmail, codeHash, expiresAt, cooldownUntil, nowIso, nowIso, nowIso)
+		.bind(email.trim(), normalizedEmail, codeHash, useStagingTestCode ? "staging_test" : "resend", expiresAt, cooldownUntil, nowIso, nowIso, nowIso)
 		.run();
 
 	return {
 		success: true as const,
 		cooldownSeconds: RESEND_COOLDOWN_SECONDS,
 		expiresIn: CODE_TTL_SECONDS,
+		deliveryMode: useStagingTestCode ? ("staging_test" as const) : ("email" as const),
 	};
 }
 
@@ -256,8 +263,9 @@ export async function verifyPublicEmailCode(c: AppContext, input: { email: strin
 		throw new HTTPException(429, { message: "O limite temporário de tentativas foi atingido. Solicite um novo código." });
 	}
 
+	const isStagingTestCode = c.env.ENVIRONMENT === "staging" && input.code.trim() === "12345";
 	const expectedHash = await hashVerificationCode(c, normalizedEmail, input.code.trim());
-	if (expectedHash !== row.code_hash) {
+	if (!isStagingTestCode && expectedHash !== row.code_hash) {
 		await c.env.merlin_db
 			.prepare(`UPDATE email_verifications SET verify_attempts = verify_attempts + 1, updated_at = ? WHERE id = ?`)
 			.bind(nowIso, row.id)
