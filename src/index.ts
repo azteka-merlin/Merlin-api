@@ -150,6 +150,13 @@ import {
   recordAnnouncementView,
   updateAnnouncement,
 } from "./lib/announcements";
+import {
+  createPublicPartner,
+  deletePublicPartner,
+  getPublicPartnerImageObject,
+  listPublicPartners,
+  updatePublicPartner,
+} from "./lib/public-partners";
 
 const app = new Hono<{ Bindings: AppBindings }>();
 
@@ -190,7 +197,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements"] as const;
+const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -444,6 +451,19 @@ const announcementBodySchema = z.object({
   imageFit: z.enum(["cover", "contain"]).optional().default("cover"),
   imagePositionX: z.coerce.number().int().min(0).max(100).optional().default(50),
   imagePositionY: z.coerce.number().int().min(0).max(100).optional().default(50),
+  imageCropX: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropY: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropWidth: z.coerce.number().min(0).max(100).nullable().optional(),
+  imageCropHeight: z.coerce.number().min(0).max(100).nullable().optional(),
+});
+const publicPartnerBodySchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  youtubeUrl: z.string().trim().nullable().optional(),
+  tiktokUrl: z.string().trim().nullable().optional(),
+  twitchUrl: z.string().trim().nullable().optional(),
+  sortOrder: z.coerce.number().int().min(0).max(10000).optional().default(0),
+  active: z.boolean().optional().default(true),
+  removeImage: z.boolean().optional().default(false),
   imageCropX: z.coerce.number().min(0).max(100).nullable().optional(),
   imageCropY: z.coerce.number().min(0).max(100).nullable().optional(),
   imageCropWidth: z.coerce.number().min(0).max(100).nullable().optional(),
@@ -888,6 +908,22 @@ function parseAnnouncementForm(formData: FormData) {
     imageFit: String(formData.get("imageFit") || "cover"),
     imagePositionX: String(formData.get("imagePositionX") || "50"),
     imagePositionY: String(formData.get("imagePositionY") || "50"),
+    imageCropX: formNullableString(formData.get("imageCropX")),
+    imageCropY: formNullableString(formData.get("imageCropY")),
+    imageCropWidth: formNullableString(formData.get("imageCropWidth")),
+    imageCropHeight: formNullableString(formData.get("imageCropHeight")),
+  });
+}
+
+function parsePublicPartnerForm(formData: FormData) {
+  return parseBody(publicPartnerBodySchema, {
+    name: String(formData.get("name") || ""),
+    youtubeUrl: formNullableString(formData.get("youtubeUrl")),
+    tiktokUrl: formNullableString(formData.get("tiktokUrl")),
+    twitchUrl: formNullableString(formData.get("twitchUrl")),
+    sortOrder: String(formData.get("sortOrder") || "0"),
+    active: formBoolean(formData.get("active"), true),
+    removeImage: formBoolean(formData.get("removeImage")),
     imageCropX: formNullableString(formData.get("imageCropX")),
     imageCropY: formNullableString(formData.get("imageCropY")),
     imageCropWidth: formNullableString(formData.get("imageCropWidth")),
@@ -1866,6 +1902,21 @@ app.get("/api/public/feedbacks/:id/image", async (c) => {
   return new Response(object.body, { headers });
 });
 
+app.get("/api/public/partners", async (c) => {
+  const partners = await listPublicPartners(c);
+  return c.json({ success: true, partners }, 200);
+});
+
+app.get("/api/public/partners/:id/image", async (c) => {
+  const { row, object } = await getPublicPartnerImageObject(c, c.req.param("id"));
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-type", row.image_content_type || "image/jpeg");
+  headers.set("cache-control", "public, max-age=3600");
+  headers.set("etag", object.httpEtag);
+  return new Response(object.body, { headers });
+});
+
 app.post("/api/public/access/me", async (c) => {
   const body = parseBody(publicAccessMeSchema, await c.req.json());
   const result = await getPublicAccessDetails(c, body);
@@ -2002,6 +2053,34 @@ app.put("/panel-api/public-feedbacks/:id", async (c) => {
 app.delete("/panel-api/public-feedbacks/:id", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const result = await deletePublicFeedbackImage(c, Number(c.req.param("id")));
+  return c.json(result, 200);
+});
+
+app.get("/panel-api/partners", async (c) => {
+  await requireAdminSession(c);
+  const partners = await listPublicPartners(c, { includeInactive: true });
+  return c.json({ success: true, partners }, 200);
+});
+
+app.post("/panel-api/partners", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const partner = await createPublicPartner(c, parsePublicPartnerForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, partner }, 201);
+});
+
+app.put("/panel-api/partners/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const partner = await updatePublicPartner(c, c.req.param("id"), parsePublicPartnerForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, partner }, 200);
+});
+
+app.delete("/panel-api/partners/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const result = await deletePublicPartner(c, c.req.param("id"));
   return c.json(result, 200);
 });
 
