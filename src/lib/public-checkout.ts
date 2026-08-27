@@ -106,6 +106,11 @@ function checkoutMode(planType: BillingPlanType) {
   return planType === "lifetime" ? "payment" : "subscription";
 }
 
+function isStagingAdaptivePricingEnabled(c: AppContext) {
+  return c.env.ENVIRONMENT === "staging"
+    && String(c.env.STRIPE_ADAPTIVE_PRICING_STAGING || "").trim().toLowerCase() === "true";
+}
+
 function normalizeEmail(email: string) {
   return normalizeContact(email, "email");
 }
@@ -393,6 +398,9 @@ async function createStripeCheckoutSession(
   params.set("line_items[0][quantity]", "1");
   params.set("payment_method_types[0]", "card");
   params.set("payment_method_options[card][request_three_d_secure]", "automatic");
+  if (isStagingAdaptivePricingEnabled(c)) {
+    params.set("adaptive_pricing[enabled]", "true");
+  }
   params.set("success_url", `${origin}/download?checkout=success&session_id={CHECKOUT_SESSION_ID}`);
   params.set("cancel_url", `${origin}/download?checkout=cancel`);
   params.set("expires_at", String(Math.floor(Date.now() / 1000) + CHECKOUT_SESSION_TTL_SECONDS));

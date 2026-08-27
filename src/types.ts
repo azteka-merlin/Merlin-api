@@ -11,6 +11,7 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   STRIPE_LIFETIME_PRICE_ID?: string;
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_BILLING_PORTAL_CONFIGURATION_ID?: string;
+  STRIPE_ADAPTIVE_PRICING_STAGING?: string;
   PIX_ENABLED?: string;
   PIX_PROVIDER?: string;
   PIX_ENV?: string;
