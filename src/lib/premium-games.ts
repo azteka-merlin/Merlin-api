@@ -63,6 +63,7 @@ export type PremiumGameRecord = {
   activation_type: PremiumActivationType | null;
   launch_executable_path: string | null;
   activation_limit: number;
+  activation_cooldown_hours: number | null;
   access_bronze_enabled?: number | null;
   access_prata_enabled?: number | null;
   access_ouro_enabled?: number | null;
@@ -81,6 +82,7 @@ export type PremiumGame = {
   activationType: PremiumActivationType;
   launchExecutablePath: string | null;
   activationLimit: number;
+  activationCooldownHours: number | null;
   accessBronzeEnabled: boolean;
   accessPrataEnabled: boolean;
   accessOuroEnabled: boolean;
@@ -171,6 +173,7 @@ export type PremiumGameCreateInput = {
   activationType?: PremiumActivationType | null;
   launchExecutablePath?: string | null;
   activationLimit?: number | null;
+  activationCooldownHours?: number | null;
   accessBronzeEnabled?: boolean | null;
   accessPrataEnabled?: boolean | null;
   accessOuroEnabled?: boolean | null;
@@ -185,6 +188,7 @@ export type PremiumGameUpdateInput = {
   activationType?: PremiumActivationType | null;
   launchExecutablePath?: string | null;
   activationLimit?: number | null;
+  activationCooldownHours?: number | null;
   accessBronzeEnabled?: boolean | null;
   accessPrataEnabled?: boolean | null;
   accessOuroEnabled?: boolean | null;
@@ -195,7 +199,7 @@ const USER_AGENT = "Merlin/2.0";
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 const FALLBACK_GAMES_CATALOG_URL = "https://generator.ryuu.lol/files/games.json";
 const METADATA_TIMEOUT_MS = 3000;
-const PREMIUM_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_PREMIUM_ACTIVATION_COOLDOWN_HOURS = 24;
 const PREMIUM_RESERVATION_TIMEOUT_MS = 3 * 60 * 1000;
 
 function normalizeAppId(appId: string): string {
@@ -281,6 +285,28 @@ function normalizeActivationLimit(value: number | null | undefined): number {
   return limit;
 }
 
+function normalizeActivationCooldownHours(value: number | null | undefined): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Number.isInteger(value) || value < DEFAULT_PREMIUM_ACTIVATION_COOLDOWN_HOURS) {
+    throw new HTTPException(400, { message: "Activation cooldown must be at least 24 hours" });
+  }
+  return value;
+}
+
+export function premiumGameCooldownMs(hours: number | null | undefined): number {
+  const resolvedHours = hours ?? DEFAULT_PREMIUM_ACTIVATION_COOLDOWN_HOURS;
+  return resolvedHours * 60 * 60 * 1000;
+}
+
+export function planCooldownUntil(activatedAt: string | null, cooldownMs: number): string | null {
+  if (!activatedAt) return null;
+  const parsed = new Date(activatedAt);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Date(parsed.getTime() + cooldownMs).toISOString();
+}
+
 function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
   return {
     id: row.id,
@@ -292,6 +318,7 @@ function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
     activationType: normalizeActivationType(row.activation_type),
     launchExecutablePath: row.launch_executable_path,
     activationLimit: row.activation_limit,
+    activationCooldownHours: row.activation_cooldown_hours,
     accessBronzeEnabled: row.access_bronze_enabled === 1,
     accessPrataEnabled: row.access_prata_enabled === 1,
     accessOuroEnabled: row.access_ouro_enabled !== 0,
@@ -314,6 +341,15 @@ function getReservedUntil(record: PremiumActivationRecord): string | null {
 
 function isActiveActivation(record: PremiumActivationRecord, nowIso: string): boolean {
   return record.status === "active" && Boolean(record.cooldown_until) && String(record.cooldown_until) > nowIso;
+}
+
+function planCooldownActiveUntil(record: PremiumActivationRecord, plan: EffectivePlan, nowIso: string): string | null {
+  if (record.status !== "active") return null;
+  const cooldownUntil = planCooldownUntil(
+    record.activated_at,
+    PLAN_RULES[plan.effectiveTier].premiumCooldownMs,
+  );
+  return cooldownUntil && cooldownUntil > nowIso ? cooldownUntil : null;
 }
 
 function isReservedActivation(record: PremiumActivationRecord, nowIso: string): boolean {
@@ -730,7 +766,7 @@ export async function requireAuthenticatedPremiumLicense(c: AppContext): Promise
 export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
   const rows = await c.env.merlin_db
     .prepare(`
-      SELECT id, app_id, name, cover_url, archive_key, activation_limit, enabled, created_at, updated_at,
+      SELECT id, app_id, name, cover_url, archive_key, activation_limit, activation_cooldown_hours, enabled, created_at, updated_at,
         install_subpath,
         activation_type,
         launch_executable_path,
@@ -781,8 +817,13 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
   let globalCooldownUntil: string | null = null;
   let globalReservedUntil: string | null = null;
   for (const row of licenseCurrentRows) {
-    if (isActiveActivation(row, nowIso) && row.cooldown_until && (!globalCooldownUntil || row.cooldown_until > globalCooldownUntil)) {
-      globalCooldownUntil = row.cooldown_until;
+    const planCooldownUntil = planCooldownActiveUntil(row, plan, nowIso);
+    if (
+      PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "global"
+      && planCooldownUntil
+      && (!globalCooldownUntil || planCooldownUntil > globalCooldownUntil)
+    ) {
+      globalCooldownUntil = planCooldownUntil;
     }
     if (isReservedActivation(row, nowIso)) {
       const rowReservedUntil = getReservedUntil(row);
@@ -923,7 +964,7 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
   const normalizedAppId = normalizeAppId(appId);
   const row = await c.env.merlin_db
     .prepare(`
-      SELECT id, app_id, name, cover_url, archive_key, activation_limit, enabled, created_at, updated_at,
+      SELECT id, app_id, name, cover_url, archive_key, activation_limit, activation_cooldown_hours, enabled, created_at, updated_at,
         install_subpath,
         activation_type,
         launch_executable_path,
@@ -973,8 +1014,15 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
     PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "game" ? game.appId : undefined,
   );
   for (const row of licenseRows) {
-    if (isActiveActivation(row, nowIso)) {
+    if (row.app_id === game.appId && isActiveActivation(row, nowIso)) {
       throw new HTTPException(409, { message: `Premium activation is in cooldown until ${row.cooldown_until}` });
+    }
+
+    const globalCooldownUntil = PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "global"
+      ? planCooldownActiveUntil(row, plan, nowIso)
+      : null;
+    if (globalCooldownUntil) {
+      throw new HTTPException(409, { message: `Premium activation is in cooldown until ${globalCooldownUntil}` });
     }
 
     if (isReservedActivation(row, nowIso)) {
@@ -1188,6 +1236,11 @@ export async function completePremiumActivation(
   let bronzeCycleStart: string | null = null;
   let bronzeSlotConsumed = false;
   try {
+    const game = await getPremiumGame(c, reservation.app_id);
+    if (!game) {
+      throw new HTTPException(404, { message: "Premium game not found" });
+    }
+
     if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
       const cycle = resolveCurrentMonthlyCycle(license);
       const consumed = await consumeBronzePremiumActivationSlot(
@@ -1207,7 +1260,9 @@ export async function completePremiumActivation(
 
     const activatedAt = new Date();
     const activatedAtIso = activatedAt.toISOString();
-    const cooldownUntilIso = new Date(activatedAt.getTime() + PLAN_RULES[plan.effectiveTier].premiumCooldownMs).toISOString();
+    const cooldownUntilIso = new Date(
+      activatedAt.getTime() + premiumGameCooldownMs(game.activationCooldownHours),
+    ).toISOString();
 
     const completion = await c.env.merlin_db
       .prepare(`
@@ -1284,6 +1339,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
     throw new HTTPException(400, { message: "launchExecutablePath is required for third-party activations" });
   }
   const activationLimit = normalizeActivationLimit(input.activationLimit);
+  const activationCooldownHours = normalizeActivationCooldownHours(input.activationCooldownHours);
   const accessBronzeEnabled = Boolean(input.accessBronzeEnabled);
   const accessPrataEnabled = Boolean(input.accessPrataEnabled);
   const accessOuroEnabled = input.accessOuroEnabled !== false;
@@ -1305,6 +1361,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
           activation_type,
           launch_executable_path,
           activation_limit,
+          activation_cooldown_hours,
           access_bronze_enabled,
           access_prata_enabled,
           access_ouro_enabled,
@@ -1312,7 +1369,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         appId,
@@ -1323,6 +1380,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
         activationType,
         launchExecutablePath,
         activationLimit,
+        activationCooldownHours,
         accessBronzeEnabled ? 1 : 0,
         accessPrataEnabled ? 1 : 0,
         accessOuroEnabled ? 1 : 0,
@@ -1377,6 +1435,9 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
   const nextActivationLimit = input.activationLimit !== undefined
     ? normalizeActivationLimit(input.activationLimit)
     : existing.activationLimit;
+  const nextActivationCooldownHours = input.activationCooldownHours !== undefined
+    ? normalizeActivationCooldownHours(input.activationCooldownHours)
+    : existing.activationCooldownHours;
   const nextAccessBronzeEnabled = input.accessBronzeEnabled !== undefined
     ? Boolean(input.accessBronzeEnabled)
     : existing.accessBronzeEnabled;
@@ -1402,6 +1463,7 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
         activation_type = ?,
         launch_executable_path = ?,
         activation_limit = ?,
+        activation_cooldown_hours = ?,
         access_bronze_enabled = ?,
         access_prata_enabled = ?,
         access_ouro_enabled = ?,
@@ -1417,6 +1479,7 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
       nextActivationType,
       nextLaunchExecutablePath,
       nextActivationLimit,
+      nextActivationCooldownHours,
       nextAccessBronzeEnabled ? 1 : 0,
       nextAccessPrataEnabled ? 1 : 0,
       nextAccessOuroEnabled ? 1 : 0,
