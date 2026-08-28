@@ -80,6 +80,11 @@ export function toIsoDateStart(date: string): string {
 	return new Date(`${date}T00:00:00.000Z`).toISOString();
 }
 
+// Admin-entered dates represent a full calendar day in the Brazilian admin timezone.
+export function toIsoDateEndBrt(date: string): string {
+	return new Date(`${date}T23:59:59.999-03:00`).toISOString();
+}
+
 export function toDateOnly(value: string): string {
 	return value.slice(0, 10);
 }

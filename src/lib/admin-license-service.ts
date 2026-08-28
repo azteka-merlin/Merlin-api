@@ -1,6 +1,6 @@
 import { HTTPException } from "hono/http-exception";
 import type { AppContext } from "../types";
-import { generateLicenseKey, resolveLicenseStatus, toDateOnly, toIsoDateStart, type LicenseRecord, type LicenseStatusValue } from "./licenses";
+import { generateLicenseKey, resolveLicenseStatus, toDateOnly, toIsoDateEndBrt, toIsoDateStart, type LicenseRecord, type LicenseStatusValue } from "./licenses";
 import { writeAdminAuditLog } from "./admin-security";
 import { hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
@@ -251,7 +251,9 @@ export async function createLicense(
 ) {
   const now = new Date().toISOString();
   const licenseType = input.licenseType || "normal";
-  const expiresAt = toIsoDateStart(licenseType === "test" ? TEST_LICENSE_DEFAULT_EXPIRY : String(input.expiresAt || ""));
+  const expiresAt = licenseType === "test"
+    ? toIsoDateStart(TEST_LICENSE_DEFAULT_EXPIRY)
+    : toIsoDateEndBrt(String(input.expiresAt || ""));
   const status = statusForExpiresAt(expiresAt);
   const contactType = licenseType === "test" ? "none" : input.contactType || "phone";
   const normalizedContact = licenseType === "test" ? "" : normalizeContact(input.contact || input.phone || "", contactType);
@@ -322,7 +324,7 @@ export async function updateLicense(
   const recoveryPinSql = recoveryPin ? ", recovery_pin_hash = ?, recovery_notice_accepted_at = ?" : "";
   const recoveryPinBindings = recoveryPin ? [recoveryPinHash, new Date().toISOString()] : [];
   const now = new Date().toISOString();
-  const expiresAt = toIsoDateStart(input.expiresAt);
+  const expiresAt = toIsoDateEndBrt(input.expiresAt);
   const nextStatus = statusForExpiresAt(expiresAt, current.status);
   const planTier = normalizeStoredPlanTier(input.planTier || current.plan_tier, "ouro");
   try {
@@ -436,7 +438,7 @@ export async function resetTestLicenseUsage(c: AppContext, id: number, actor?: L
 
 export async function renewLicense(c: AppContext, id: number, expiresAt: string, actor?: LicenseActionActor) {
   const current = await getLicense(c, id);
-  const nextExpiresAt = toIsoDateStart(expiresAt);
+  const nextExpiresAt = toIsoDateEndBrt(expiresAt);
   const nextStatus = statusForExpiresAt(nextExpiresAt, current.status);
   await c.env.merlin_db
     .prepare(`UPDATE licenses SET expires_at = ?, status = ?, updated_at = ? WHERE id = ?`)
