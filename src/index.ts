@@ -39,6 +39,7 @@ import {
   updateLicense,
 } from "./lib/admin-license-service";
 import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings } from "./lib/billing-settings";
+import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSourceSettings } from "./lib/manifest-source-settings";
 import { runBillingNotificationCron } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
@@ -320,6 +321,9 @@ const publicBillingPortalSchema = z.object({
 const publicAccessMeSchema = z.object({
   email: z.string().trim().email(),
   recoveryPin: recoverySecretSchema,
+});
+const manifestSourceSettingsSchema = z.object({
+  primarySource: z.enum(MANIFEST_PRIMARY_SOURCES),
 });
 const publicAccessSessionSchema = publicAccessMeSchema.extend({
   rememberDevice: z.boolean().optional().default(false),
@@ -2008,6 +2012,18 @@ app.post("/panel-api/public-signup/billing/refresh-prices", async (c) => {
     : await listBillingPlanPrices(c);
   const metrics = await getPublicSignupMetrics(c);
   return c.json({ success: true, settings: getPublicSignupSettingsPayload(settings), billing, prices, metrics }, 200);
+});
+
+app.get("/panel-api/manifest-source-settings", async (c) => {
+  await requireAdminSession(c);
+  return c.json({ success: true, settings: await getManifestSourceSettings(c) }, 200);
+});
+
+app.put("/panel-api/manifest-source-settings", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(manifestSourceSettingsSchema, await c.req.json());
+  const settings = await updateManifestSourceSettings(c, body.primarySource);
+  return c.json({ success: true, settings }, 200);
 });
 
 app.get("/panel-api/billing/plan-prices", async (c) => {

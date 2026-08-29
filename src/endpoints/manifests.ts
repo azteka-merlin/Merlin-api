@@ -2,6 +2,7 @@ import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
+import { getManifestSourceSettings, manifestPrimarySourceOrder, type ManifestPrimarySource } from "../lib/manifest-source-settings";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { writeUserActivityLog } from "../lib/user-activity-service";
@@ -119,15 +120,15 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 	return null;
 }
 
-function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
+function createSources(appId: string, env: ManifestEnv, primarySource: ManifestPrimarySource): ManifestSource[] {
 	const commonHeaders = {
 		"User-Agent": USER_AGENT,
 		Accept: "application/zip, application/octet-stream",
 	};
 	const sources: ManifestSource[] = [];
 
-	if (env.DEPOTBOX_API_KEY) {
-		sources.push({
+	const depotboxSource = env.DEPOTBOX_API_KEY
+		? {
 			name: "depotbox",
 			url: DEPOTBOX_DIRECT_DOWNLOAD_URL,
 			init: {
@@ -141,20 +142,26 @@ function createSources(appId: string, env: ManifestEnv): ManifestSource[] {
 			},
 			maxAttempts: 1,
 			timeoutMs: SOURCE_TIMEOUT_MS,
-		});
-	}
+		}
+		: null;
 
+	let ryuuSource: ManifestSource | null = null;
 	if (env.RYU_API_URL && env.RYUU_AUTH_CODE) {
 		const ryuUrl = new URL(env.RYU_API_URL);
 		ryuUrl.searchParams.set("appid", appId);
 		ryuUrl.searchParams.set("auth_code", env.RYUU_AUTH_CODE);
-		sources.push({
+		ryuuSource = {
 			name: "ryu",
 			url: ryuUrl.toString(),
 			init: { headers: commonHeaders },
 			maxAttempts: 1,
 			timeoutMs: SOURCE_TIMEOUT_MS,
-		});
+		};
+	}
+
+	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
+		const source = sourceName === "depotbox" ? depotboxSource : ryuuSource;
+		if (source) sources.push(source);
 	}
 
 	if (env.HUBCAP_TOKEN) {
@@ -284,7 +291,8 @@ export class ManifestsRoute extends OpenAPIRoute {
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
-		for (const source of createSources(appId, env)) {
+		const sourceSettings = await getManifestSourceSettings(c);
+		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
 			const response = await fetchSource(source);
 			if (!response || !response.body) continue;
 
