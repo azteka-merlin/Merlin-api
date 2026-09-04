@@ -9,7 +9,7 @@ Use this file as the docs router. Do not open every `.md` by default; pick the s
 3. `INTEGRATIONS.md` — external systems used by the API and which flows depend on each one.
 4. `STAGING.md` — planned staging setup for API, public signup, admin panel, and launcher tests.
 5. `STAGING_OPERATIONS.md` — current staging-only behavior for public e-mail verification.
-6. `PLANO_TIERS_OPERACAO.md` — current plan, Pix, catalog-cutoff, and activation rules.
+6. `PLANO_TIERS_OPERACAO.md` — current plan, Pix, catalog-cutoff, activation, and individual early-access rules.
 7. `CONTEXT.md` — architecture, routes, modules, and behavior notes for code changes.
 
 ## Quick rule

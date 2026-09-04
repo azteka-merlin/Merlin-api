@@ -104,10 +104,13 @@ import {
   failPremiumActivationReservationForLicense,
   findPremiumActivationReservationForLicense,
   getPremiumGame,
+  grantPremiumGameEarlyAccess,
   listPremiumCatalog,
+  listPremiumGameEarlyAccess,
   listPremiumGames,
   requireAuthenticatedPremiumLicense,
   reservePremiumActivation,
+  revokePremiumGameEarlyAccess,
   updatePremiumGame,
 } from "./lib/premium-games";
 import {
@@ -416,6 +419,9 @@ const premiumGameUpdateSchema = z.object({
   enabled: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: "At least one premium game field must be provided",
+});
+const premiumGameEarlyAccessSchema = z.object({
+  licenseId: z.number().int().positive(),
 });
 const pollOptionSchema = z.object({
   label: z.string().trim().min(1),
@@ -1298,6 +1304,45 @@ app.get("/panel-api/premium/games/:appId", async (c) => {
   }
 
   return c.json({ game }, 200);
+});
+
+app.get("/panel-api/premium/games/:appId/early-access", async (c) => {
+  await requireAdminSession(c);
+  const entries = await listPremiumGameEarlyAccess(c, c.req.param("appId"));
+  return c.json({ entries }, 200);
+});
+
+app.post("/panel-api/premium/games/:appId/early-access", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = parseBody(premiumGameEarlyAccessSchema, await c.req.json());
+  const entry = await grantPremiumGameEarlyAccess(c, c.req.param("appId"), body.licenseId);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "premium_game_early_access_granted",
+    entityType: "premium_game",
+    entityId: c.req.param("appId"),
+    metadata: { licenseId: body.licenseId },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true, entry }, 201);
+});
+
+app.delete("/panel-api/premium/games/:appId/early-access/:licenseId", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = Number(c.req.param("licenseId"));
+  const removed = await revokePremiumGameEarlyAccess(c, c.req.param("appId"), licenseId);
+  if (!removed) throw new HTTPException(404, { message: "Early access entry not found" });
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "premium_game_early_access_revoked",
+    entityType: "premium_game",
+    entityId: c.req.param("appId"),
+    metadata: { licenseId },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true }, 200);
 });
 
 app.post("/panel-api/premium/games", async (c) => {

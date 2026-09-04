@@ -68,6 +68,7 @@ export type PremiumGameRecord = {
   access_prata_enabled?: number | null;
   access_ouro_enabled?: number | null;
   enabled: number;
+  early_access_count?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -87,6 +88,7 @@ export type PremiumGame = {
   accessPrataEnabled: boolean;
   accessOuroEnabled: boolean;
   enabled: boolean;
+  earlyAccessCount: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -141,6 +143,17 @@ export type PremiumCatalogItem = {
       availableAt: string | null;
     }>;
   };
+};
+
+export type PremiumGameEarlyAccess = {
+  licenseId: number;
+  licenseKey: string;
+  name: string;
+  contact: string;
+  contactType: string;
+  planTier: PlanTier | null;
+  status: string;
+  grantedAt: string;
 };
 
 type PremiumLicensePlanRow = {
@@ -323,6 +336,7 @@ function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
     accessPrataEnabled: row.access_prata_enabled === 1,
     accessOuroEnabled: row.access_ouro_enabled !== 0,
     enabled: Boolean(row.enabled),
+    earlyAccessCount: Number(row.early_access_count || 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -341,6 +355,28 @@ function getReservedUntil(record: PremiumActivationRecord): string | null {
 
 function isActiveActivation(record: PremiumActivationRecord, nowIso: string): boolean {
   return record.status === "active" && Boolean(record.cooldown_until) && String(record.cooldown_until) > nowIso;
+}
+
+function mapPremiumGameEarlyAccess(row: {
+  license_id: number;
+  license_key: string;
+  name: string;
+  contact: string;
+  contact_type: string;
+  plan_tier: PlanTier | null;
+  status: string;
+  granted_at: string;
+}): PremiumGameEarlyAccess {
+  return {
+    licenseId: row.license_id,
+    licenseKey: row.license_key,
+    name: row.name,
+    contact: row.contact,
+    contactType: row.contact_type,
+    planTier: row.plan_tier,
+    status: row.status,
+    grantedAt: row.granted_at,
+  };
 }
 
 function planCooldownActiveUntil(record: PremiumActivationRecord, plan: EffectivePlan, nowIso: string): string | null {
@@ -772,13 +808,77 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
         launch_executable_path,
         COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
         COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
-        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled
+        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled,
+        (SELECT COUNT(*) FROM premium_game_early_access pea WHERE pea.app_id = premium_games.app_id) AS early_access_count
       FROM premium_games
       ORDER BY enabled DESC, updated_at DESC, id DESC
     `)
     .all<PremiumGameRecord>();
 
   return (rows.results || []).map(mapPremiumGame);
+}
+
+export async function listPremiumGameEarlyAccess(c: AppContext, appId: string): Promise<PremiumGameEarlyAccess[]> {
+  const normalizedAppId = normalizeAppId(appId);
+  const rows = await c.env.merlin_db
+    .prepare(`
+      SELECT pea.license_id, l.license_key, l.name, l.contact, l.contact_type, l.plan_tier, l.status, pea.granted_at
+      FROM premium_game_early_access pea
+      INNER JOIN licenses l ON l.id = pea.license_id
+      WHERE pea.app_id = ?
+      ORDER BY pea.granted_at DESC, pea.license_id DESC
+    `)
+    .bind(normalizedAppId)
+    .all<{
+      license_id: number;
+      license_key: string;
+      name: string;
+      contact: string;
+      contact_type: string;
+      plan_tier: PlanTier | null;
+      status: string;
+      granted_at: string;
+    }>();
+  return (rows.results || []).map(mapPremiumGameEarlyAccess);
+}
+
+export async function grantPremiumGameEarlyAccess(c: AppContext, appId: string, licenseId: number) {
+  const normalizedAppId = normalizeAppId(appId);
+  if (!Number.isInteger(licenseId) || licenseId <= 0) throw new HTTPException(400, { message: "Invalid license id" });
+
+  const [game, license] = await Promise.all([
+    getPremiumGame(c, normalizedAppId),
+    c.env.merlin_db.prepare("SELECT id FROM licenses WHERE id = ? LIMIT 1").bind(licenseId).first<{ id: number }>(),
+  ]);
+  if (!game) throw new HTTPException(404, { message: "Premium game not found" });
+  if (!license) throw new HTTPException(404, { message: "License not found" });
+
+  await c.env.merlin_db
+    .prepare("INSERT OR IGNORE INTO premium_game_early_access (app_id, license_id, granted_at) VALUES (?, ?, ?)")
+    .bind(normalizedAppId, licenseId, new Date().toISOString())
+    .run();
+
+  return (await listPremiumGameEarlyAccess(c, normalizedAppId)).find((entry) => entry.licenseId === licenseId) || null;
+}
+
+export async function revokePremiumGameEarlyAccess(c: AppContext, appId: string, licenseId: number) {
+  const normalizedAppId = normalizeAppId(appId);
+  if (!Number.isInteger(licenseId) || licenseId <= 0) throw new HTTPException(400, { message: "Invalid license id" });
+  const result = await c.env.merlin_db
+    .prepare("DELETE FROM premium_game_early_access WHERE app_id = ? AND license_id = ?")
+    .bind(normalizedAppId, licenseId)
+    .run();
+  return Number(result.meta.changes || 0) > 0;
+}
+
+async function listPremiumGameEarlyAccessAppIds(c: AppContext, licenseId: number, appIds: string[]) {
+  if (!appIds.length) return new Set<string>();
+  const placeholders = appIds.map(() => "?").join(", ");
+  const result = await c.env.merlin_db
+    .prepare(`SELECT app_id FROM premium_game_early_access WHERE license_id = ? AND app_id IN (${placeholders})`)
+    .bind(licenseId, ...appIds)
+    .all<{ app_id: string }>();
+  return new Set((result.results || []).map((row) => row.app_id));
 }
 
 export async function listPremiumCatalog(c: AppContext, licenseId: number): Promise<PremiumCatalogItem[]> {
@@ -794,9 +894,10 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
   }
 
   const bronzeCycle = resolveCurrentMonthlyCycle(license);
-  const [archiveStates, activationRows] = await Promise.all([
+  const [archiveStates, activationRows, earlyAccessAppIds] = await Promise.all([
     Promise.all(games.map((game) => headArchiveAvailability(c, game.archiveKey))),
     listCurrentPremiumActivations(c, games.map((game) => game.appId)),
+    listPremiumGameEarlyAccessAppIds(c, licenseId, games.map((game) => game.appId)),
   ]);
   const [licenseCurrentRows, bronzeUsed] = await Promise.all([
     listLicensePremiumActivations(c, licenseId),
@@ -891,7 +992,9 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     const archiveAvailable = archiveStates[index] || false;
     const occupiedSlots = activeCount + reservedCount;
     const availableSlots = Math.max(0, game.activationLimit - occupiedSlots);
-    const tierAccess = resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
+    const tierAccess = earlyAccessAppIds.has(game.appId)
+      ? { allowed: true, releaseAvailableAt: null, nearestAvailableTier: null, lockedReason: null }
+      : resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
 
     if (viewerStatus === "available" && PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "global" && globalCooldownUntil) {
       viewerStatus = "cooldown";
@@ -970,7 +1073,8 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
         launch_executable_path,
         COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
         COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
-        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled
+        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled,
+        (SELECT COUNT(*) FROM premium_game_early_access pea WHERE pea.app_id = premium_games.app_id) AS early_access_count
       FROM premium_games
       WHERE app_id = ?
       LIMIT 1
@@ -993,7 +1097,10 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
     throw new HTTPException(404, { message: "Premium game not found" });
   }
 
-  const tierAccess = resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
+  const hasEarlyAccess = (await listPremiumGameEarlyAccessAppIds(c, licenseId, [game.appId])).has(game.appId);
+  const tierAccess = hasEarlyAccess
+    ? { allowed: true, releaseAvailableAt: null, nearestAvailableTier: null, lockedReason: null }
+    : resolvePremiumTierAccess(game, plan, license, catalogCutoffAt);
   if (!tierAccess.allowed) {
     throw new HTTPException(403, {
       message: tierAccess.nearestAvailableTier

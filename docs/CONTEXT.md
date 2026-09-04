@@ -65,7 +65,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Audit and user activity.
 - Blocked IPs.
 - Manifest/fix overrides.
-- Premium games and uploads.
+- Premium games, activation archives, and individual early-access grants.
 - Polls.
 - Public signup configuration.
 - Launcher update upload/publishing.
