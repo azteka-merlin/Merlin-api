@@ -3,6 +3,7 @@ import {
   DEFAULT_PREMIUM_ACTIVATION_COOLDOWN_HOURS,
   planCooldownUntil,
   premiumGameCooldownMs,
+  premiumGameSlotAvailableAt,
 } from "../src/lib/premium-games";
 import { PLAN_RULES } from "../src/lib/plan-tiers";
 
@@ -16,10 +17,12 @@ describe("premium game cooldowns", () => {
       .toBe("2026-08-28T12:00:00.000Z");
   });
 
-  test("extends only the configured game's activation window", () => {
-    const crimsonCooldownMs = premiumGameCooldownMs(72);
-    expect(planCooldownUntil(activatedAt, crimsonCooldownMs))
-      .toBe("2026-08-30T12:00:00.000Z");
+  test("keeps a configured cooldown with the activating license while releasing its game slot after 24 hours", () => {
+    const sevenDayCooldownMs = premiumGameCooldownMs(7 * 24);
+    expect(planCooldownUntil(activatedAt, sevenDayCooldownMs))
+      .toBe("2026-09-03T12:00:00.000Z");
+    expect(premiumGameSlotAvailableAt(activatedAt))
+      .toBe("2026-08-28T12:00:00.000Z");
   });
 
   test("preserves the 24-hour global cooldown for Bronze and Prata", () => {

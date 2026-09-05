@@ -213,6 +213,9 @@ const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 const FALLBACK_GAMES_CATALOG_URL = "https://generator.ryuu.lol/files/games.json";
 const METADATA_TIMEOUT_MS = 3000;
 export const DEFAULT_PREMIUM_ACTIVATION_COOLDOWN_HOURS = 24;
+// A slot is shared by the catalog for one day. A game's configured cooldown
+// applies only to the license that completed that activation.
+export const PREMIUM_GAME_SLOT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const PREMIUM_RESERVATION_TIMEOUT_MS = 3 * 60 * 1000;
 
 function normalizeAppId(appId: string): string {
@@ -320,6 +323,10 @@ export function planCooldownUntil(activatedAt: string | null, cooldownMs: number
   return new Date(parsed.getTime() + cooldownMs).toISOString();
 }
 
+export function premiumGameSlotAvailableAt(activatedAt: string | null): string | null {
+  return planCooldownUntil(activatedAt, PREMIUM_GAME_SLOT_COOLDOWN_MS);
+}
+
 function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
   return {
     id: row.id,
@@ -355,6 +362,12 @@ function getReservedUntil(record: PremiumActivationRecord): string | null {
 
 function isActiveActivation(record: PremiumActivationRecord, nowIso: string): boolean {
   return record.status === "active" && Boolean(record.cooldown_until) && String(record.cooldown_until) > nowIso;
+}
+
+function occupiesPremiumGameSlot(record: PremiumActivationRecord, nowIso: string): boolean {
+  if (record.status !== "active") return false;
+  const availableAt = premiumGameSlotAvailableAt(record.activated_at);
+  return availableAt !== null && availableAt > nowIso;
 }
 
 function mapPremiumGameEarlyAccess(row: {
@@ -949,24 +962,26 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     let nearestAvailableTier: PlanTier | null = null;
 
     for (const row of rows) {
-      if (isActiveActivation(row, nowIso)) {
+      if (occupiesPremiumGameSlot(row, nowIso)) {
         activeCount += 1;
-        if (row.cooldown_until) {
+        const slotAvailableAt = premiumGameSlotAvailableAt(row.activated_at);
+        if (slotAvailableAt) {
           cooldownEntries.push({
-            availableAt: row.cooldown_until,
+            availableAt: slotAvailableAt,
             kind: "cooldown",
           });
         }
-        if (!nextSlotAt || String(row.cooldown_until) < nextSlotAt) {
-          nextSlotAt = row.cooldown_until;
+        if (slotAvailableAt && (!nextSlotAt || slotAvailableAt < nextSlotAt)) {
+          nextSlotAt = slotAvailableAt;
         }
+      }
 
-        if (row.license_id === licenseId) {
-          viewerStatus = "cooldown";
-          cooldownUntil = row.cooldown_until;
-          lastActivatedAt = row.activated_at || lastActivatedAt;
-        }
-        continue;
+      // The owner remains blocked for the game's configured cooldown even
+      // after their catalog slot is released for another license.
+      if (row.license_id === licenseId && isActiveActivation(row, nowIso)) {
+        viewerStatus = "cooldown";
+        cooldownUntil = row.cooldown_until;
+        lastActivatedAt = row.activated_at || lastActivatedAt;
       }
 
       if (isReservedActivation(row, nowIso)) {
@@ -1152,10 +1167,11 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
   let occupiedSlots = 0;
   let nextSlotAt: string | null = null;
   for (const row of appRows) {
-    if (isActiveActivation(row, nowIso)) {
+    if (occupiesPremiumGameSlot(row, nowIso)) {
       occupiedSlots += 1;
-      if (!nextSlotAt || String(row.cooldown_until) < nextSlotAt) {
-        nextSlotAt = row.cooldown_until;
+      const slotAvailableAt = premiumGameSlotAvailableAt(row.activated_at);
+      if (slotAvailableAt && (!nextSlotAt || slotAvailableAt < nextSlotAt)) {
+        nextSlotAt = slotAvailableAt;
       }
       continue;
     }
