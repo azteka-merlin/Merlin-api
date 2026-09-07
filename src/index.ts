@@ -7,6 +7,9 @@ import { FixesCatalogRoute } from "./endpoints/fixes-catalog";
 import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { GamesSearchRoute } from "./endpoints/games-search";
+import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
+import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
+import { PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
@@ -3148,6 +3151,8 @@ app.get("/api/activations/download", async (c) => {
 openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
+openapi.get("/api/public/catalog", PublicCatalogRoute);
+openapi.post("/api/public/catalog/consult", PublicCatalogConsultRoute);
 app.get("/api/manifests/status", async (c) => {
   await requireLauncherLicense(c);
 
@@ -3235,7 +3240,15 @@ app.notFound((c) => {
 
 export default {
   fetch: app.fetch,
-  async scheduled(_controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
-    await runBillingNotificationCron(env);
+  async scheduled(controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
+    const scheduledAt = new Date(controller.scheduledTime);
+    if (scheduledAt.getUTCMinutes() !== 0) {
+      await Promise.all([runCatalogEnrichment(env), runCatalogAvailabilitySync(env)]);
+      return;
+    }
+    if (scheduledAt.getUTCHours() === 12) await runBillingNotificationCron(env);
+    {
+      await Promise.all([runCatalogAvailabilitySync(env), refreshConfirmedDenuvo(env)]);
+    }
   },
 };

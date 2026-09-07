@@ -678,9 +678,10 @@ async function upsertGamesCatalogItems(c: AppContext, items: GamesCatalogUpsertI
 				ON CONFLICT(app_id) DO UPDATE SET
 					name = excluded.name,
 					cover_url = COALESCE(excluded.cover_url, games_catalog.cover_url),
-					cover_source = COALESCE(excluded.cover_source, games_catalog.cover_source),
-					catalog_source = excluded.catalog_source,
-					catalog_synced_at = excluded.catalog_synced_at
+					cover_source = COALESCE(excluded.cover_source, games_catalog.cover_source)
+				WHERE games_catalog.name IS NOT excluded.name
+					OR (excluded.cover_url IS NOT NULL AND games_catalog.cover_url IS NOT excluded.cover_url)
+					OR (excluded.cover_source IS NOT NULL AND games_catalog.cover_source IS NOT excluded.cover_source)
 			`,
 		)
 		.bind(
@@ -693,6 +694,16 @@ async function upsertGamesCatalogItems(c: AppContext, items: GamesCatalogUpsertI
 		));
 
 	await c.env.merlin_db.batch(statements);
+}
+
+export async function searchGamesForCatalog(c: AppContext, searchTerm: string, limit: number): Promise<SearchItem[]> {
+	const local = await searchD1Catalog(c, searchTerm, limit);
+	if (local.length >= limit) return local;
+	const depotbox = await searchDepotbox(c.env as Env & GameSearchEnv, searchTerm, limit);
+	if (!depotbox.ok) return local;
+	c.executionCtx.waitUntil(upsertGamesCatalogItems(c, depotbox.items.map((item) => ({ ...item, catalogSource: "depotbox" }))));
+	const seen = new Set(local.map((item) => item.appId));
+	return [...local, ...depotbox.items.filter((item) => !seen.has(item.appId))].slice(0, limit);
 }
 
 export class GamesSearchRoute extends OpenAPIRoute {

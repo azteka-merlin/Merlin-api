@@ -1,33 +1,35 @@
 {
-    "name":  "merlin-api",
-    "version":  "1.1.8",
-    "private":  true,
-    "scripts":  {
-                    "deploy":  "wrangler deploy",
-                    "deploy-stage":  "wrangler deploy --env staging",
-                    "dev":  "wrangler dev",
-                    "start":  "wrangler dev",
-                    "typecheck":  "tsc --noEmit",
-                    "test":  "vitest run",
-                    "types":  "wrangler types",
-                    "types:stage":  "wrangler types --env staging",
-                    "cf-typegen":  "wrangler types",
-                    "admin:bootstrap":  "node scripts/bootstrap-admin.mjs",
-                    "build:panel":  "npm --prefix ../merlin-admin run build",
-                    "d1:migrate:remote":  "node scripts/d1-migrate.mjs production",
-                    "d1:migrate:stage":  "node scripts/d1-migrate.mjs staging",
-                    "deploy:panel":  "npm run build:panel \u0026\u0026 npm run types \u0026\u0026 npm run deploy",
-                    "deploy-stage:panel":  "npm run build:panel \u0026\u0026 npm run deploy-stage"
-                },
-    "dependencies":  {
-                         "chanfana":  "^3.3.0",
-                         "hono":  "^4.12.12",
-                         "zod":  "^4.3.6"
-                     },
-    "devDependencies":  {
-                            "@types/node":  "^25.9.4",
-                            "typescript":  "^6.0.3",
-                            "vitest":  "^4.1.11",
-                            "wrangler":  "^4.103.0"
-                        }
+    "name": "merlin-api",
+    "version": "1.1.8",
+    "private": true,
+    "scripts": {
+        "deploy": "wrangler deploy",
+        "deploy-stage": "wrangler deploy --env staging",
+        "dev": "wrangler dev",
+        "start": "wrangler dev",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "types": "wrangler types",
+        "types:stage": "wrangler types --env staging",
+        "cf-typegen": "wrangler types",
+        "admin:bootstrap": "node scripts/bootstrap-admin.mjs",
+        "build:panel": "npm --prefix ../merlin-admin run build",
+        "d1:migrate:remote": "node scripts/d1-migrate.mjs production",
+        "d1:migrate:stage": "node scripts/d1-migrate.mjs staging",
+        "catalog:seed-denuvo": "node scripts/import-denuvo-seed.mjs",
+        "deploy:panel": "npm run build:panel && npm run types && npm run deploy",
+        "deploy-stage:panel": "npm run build:panel && npm run deploy-stage"
+    },
+    "dependencies": {
+        "chanfana": "^3.3.0",
+        "hono": "^4.12.12",
+        "zod": "^4.3.6"
+    },
+    "devDependencies": {
+        "@types/node": "^25.9.4",
+        "typescript": "^6.0.3",
+        "vitest": "^4.1.11",
+        "wrangler": "^4.103.0",
+        "xlsx": "^0.18.5"
+    }
 }
