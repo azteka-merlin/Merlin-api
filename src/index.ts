@@ -42,6 +42,7 @@ import {
   updateLicense,
 } from "./lib/admin-license-service";
 import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings } from "./lib/billing-settings";
+import { getLauncherUpdatePolicySettings, updateLauncherUpdatePolicySettings } from "./lib/launcher-update-policy-settings";
 import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSourceSettings } from "./lib/manifest-source-settings";
 import { runBillingNotificationCron } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
@@ -330,6 +331,9 @@ const publicAccessMeSchema = z.object({
 });
 const manifestSourceSettingsSchema = z.object({
   primarySource: z.enum(MANIFEST_PRIMARY_SOURCES),
+});
+const launcherUpdatePolicySettingsSchema = z.object({
+  automaticUpdatesEnabled: z.boolean(),
 });
 const publicAccessSessionSchema = publicAccessMeSchema.extend({
   rememberDevice: z.boolean().optional().default(false),
@@ -2074,6 +2078,27 @@ app.put("/panel-api/manifest-source-settings", async (c) => {
   return c.json({ success: true, settings }, 200);
 });
 
+app.get("/panel-api/launcher-update-policy-settings", async (c) => {
+  await requireAdminSession(c);
+  return c.json({ success: true, settings: await getLauncherUpdatePolicySettings(c) }, 200);
+});
+
+app.put("/panel-api/launcher-update-policy-settings", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = parseBody(launcherUpdatePolicySettingsSchema, await c.req.json());
+  const settings = await updateLauncherUpdatePolicySettings(c, body.automaticUpdatesEnabled);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "launcher_automatic_updates_policy_updated",
+    entityType: "launcher_update_policy_settings",
+    entityId: "global",
+    metadata: { automaticUpdatesEnabled: settings.automaticUpdatesEnabled },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true, settings }, 200);
+});
+
 app.get("/panel-api/billing/plan-prices", async (c) => {
   await requireAdminSession(c);
   const prices = await listBillingPlanPrices(c);
@@ -3161,13 +3186,17 @@ app.get("/api/manifests/status", async (c) => {
     throw new HTTPException(400, { message: "Invalid appid" });
   }
 
-  const overrides = await readOverrides(c.env);
-  const requiresVersionPin = Boolean(overrides[appId]?.manifestOverride?.enabled);
+  const [overrides, updatePolicy] = await Promise.all([
+    readOverrides(c.env),
+    getLauncherUpdatePolicySettings(c),
+  ]);
+  const requiresVersionPin = !updatePolicy.automaticUpdatesEnabled || Boolean(overrides[appId]?.manifestOverride?.enabled);
 
   return c.json({
     success: true,
     appId,
     requiresVersionPin,
+    automaticUpdatesEnabled: updatePolicy.automaticUpdatesEnabled,
   }, 200);
 });
 

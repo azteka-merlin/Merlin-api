@@ -17,9 +17,9 @@ export type DenuvoResolution = {
 };
 
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
-const JOB_BATCH_SIZE = 40;
-const STEAM_REQUEST_INTERVAL_MS = 750;
-const DENUVO_REFRESH_LIMIT = 500;
+const JOB_BATCH_SIZE = 25;
+const STEAM_REQUEST_INTERVAL_MS = 1_000;
+const DENUVO_REFRESH_LIMIT = 30;
 const RETRY_DELAY_MS = 15 * 60_000;
 const RELEASE_DATE_RETRY_DELAY_MS = 24 * 60 * 60_000;
 let nextSteamRequestAt = 0;
@@ -131,8 +131,15 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
     LEFT JOIN catalog_availability a ON a.app_id = j.app_id
     LEFT JOIN catalog_game_metadata m ON m.app_id = j.app_id
     LEFT JOIN premium_games p ON p.app_id = j.app_id AND p.enabled = 1
-    WHERE j.status IN ('pending', 'retry') AND j.next_attempt_at <= ? AND (j.locked_until IS NULL OR j.locked_until <= ?)
-    ORDER BY CASE WHEN m.category IN ('premium', 'standard') AND m.release_date IS NULL THEN 0 ELSE 1 END,
+    WHERE (
+      (j.status IN ('pending', 'retry') AND j.next_attempt_at <= ?)
+      OR (j.status = 'processing' AND (j.locked_until IS NULL OR j.locked_until <= ?))
+    )
+    ORDER BY CASE
+      WHEN j.status = 'processing' THEN 0
+      WHEN m.category IN ('premium', 'standard') AND m.release_date IS NULL THEN 1
+      ELSE 2
+    END,
       COALESCE(a.available_in_merlin, 0) DESC, p.updated_at DESC, j.next_attempt_at LIMIT ?
   `).bind(now, now, JOB_BATCH_SIZE).all<Job>();
 
