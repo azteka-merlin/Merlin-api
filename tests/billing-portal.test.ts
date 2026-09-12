@@ -46,7 +46,11 @@ class FakeD1Database {
 function context(db: FakeD1Database) {
   return {
     req: { raw: new Request("https://staging.api-merlin.com/api/public/access/session/plan-change") },
-    env: { merlin_db: db, STRIPE_SECRET_KEY: "sk_test_fake" },
+    env: {
+      merlin_db: db,
+      STRIPE_SECRET_KEY: "sk_test_fake",
+      PUBLIC_APP_ORIGIN: "https://staging.api-merlin.com",
+    },
   } as any;
 }
 
