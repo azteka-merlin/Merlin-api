@@ -5,6 +5,7 @@ import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePaymentFailedNotification } from "./billing-notifications";
 import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier } from "./plan-tiers";
+import { getPublicAppOrigin } from "./public-origin";
 import {
   LIFETIME_EXPIRES_AT,
   UPGRADE_OPERATION,
@@ -309,11 +310,6 @@ function getSubscriptionEffectivePeriodEnd(subscription: Pick<StripeSubscription
 
 function getSubscriptionEffectivePeriodStart(subscription: Pick<StripeSubscription, "current_period_start">) {
   return unixToIso(subscription.current_period_start);
-}
-
-function requestOrigin(c: AppContext) {
-  const url = new URL(c.req.raw.url);
-  return `${url.protocol}//${url.host}`;
 }
 
 function isSubscriptionCancelScheduled(subscription: Pick<StripeSubscription, "cancel_at_period_end" | "cancel_at">) {
@@ -1121,7 +1117,7 @@ async function handleInvoiceFailed(c: AppContext, invoice: Record<string, unknow
   c.executionCtx.waitUntil(sendStripeInvoicePaymentFailedNotification(c, {
     subscriptionId,
     invoice,
-    origin: requestOrigin(c),
+    origin: getPublicAppOrigin(c),
   }).catch((error) => {
     console.warn("[stripe-webhook] payment failed email failed", error instanceof Error ? error.message : error);
   }));

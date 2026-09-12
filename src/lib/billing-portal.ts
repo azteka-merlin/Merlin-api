@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import type { AppContext } from "../types";
 import { normalizeContact } from "./admin-license-service";
 import { assertRecentPublicEmailVerification } from "./email-verification";
+import { getPublicAppOrigin } from "./public-origin";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 
@@ -132,11 +133,6 @@ async function getCurrentLicenseBilling(c: AppContext, customerId: number, email
     .first<LicenseBillingRow>();
 }
 
-function requestOrigin(c: AppContext) {
-  const url = new URL(c.req.raw.url);
-  return `${url.protocol}//${url.host}`;
-}
-
 function stripeBillingPortalConfigurationId(c: AppContext) {
   return String(c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || "").trim();
 }
@@ -211,7 +207,7 @@ function isStripeSubscriptionAccess(accessType: string | null | undefined) {
 export async function createStripeBillingPortalSession(c: AppContext, input: { stripeCustomerId: string; returnPath: string }) {
   const params = new URLSearchParams();
   params.set("customer", input.stripeCustomerId);
-  params.set("return_url", `${requestOrigin(c)}${input.returnPath}`);
+  params.set("return_url", `${getPublicAppOrigin(c)}${input.returnPath}`);
   const configurationId = stripeBillingPortalConfigurationId(c);
   if (configurationId) {
     params.set("configuration", configurationId);
@@ -237,7 +233,7 @@ export async function createStripeSubscriptionUpdateConfirmPortalSession(c: AppC
 }) {
   const params = new URLSearchParams();
   params.set("customer", input.stripeCustomerId);
-  params.set("return_url", `${requestOrigin(c)}${input.returnPath}`);
+  params.set("return_url", `${getPublicAppOrigin(c)}${input.returnPath}`);
   params.set("configuration", await getOrCreateSubscriptionUpdateConfiguration(c, input.targetPriceId));
   params.set("flow_data[type]", "subscription_update_confirm");
   params.set("flow_data[subscription_update_confirm][subscription]", input.subscriptionId);
@@ -245,7 +241,7 @@ export async function createStripeSubscriptionUpdateConfirmPortalSession(c: AppC
   params.set("flow_data[subscription_update_confirm][items][0][price]", input.targetPriceId);
   params.set("flow_data[subscription_update_confirm][items][0][quantity]", "1");
   params.set("flow_data[after_completion][type]", "redirect");
-  params.set("flow_data[after_completion][redirect][return_url]", `${requestOrigin(c)}${input.completedPath}`);
+  params.set("flow_data[after_completion][redirect][return_url]", `${getPublicAppOrigin(c)}${input.completedPath}`);
 
   const session = await stripePost<StripePortalSession>(c, "/billing_portal/sessions", params);
   if (session.object !== "billing_portal.session" || !session.url) {

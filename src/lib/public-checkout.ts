@@ -7,6 +7,7 @@ import { assertRecentPublicEmailVerification, consumePublicEmailVerification } f
 import { generateLicenseKey } from "./licenses";
 import { getCardPlanPrice } from "./subscription-plan-change";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
+import { getPublicAppOrigin } from "./public-origin";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
@@ -371,11 +372,6 @@ function stripeTimestampToIso(value: number | null) {
   return new Date(value * 1000).toISOString();
 }
 
-function requestOrigin(c: AppContext) {
-  const url = new URL(c.req.raw.url);
-  return `${url.protocol}//${url.host}`;
-}
-
 async function createStripeCheckoutSession(
   c: AppContext,
   input: {
@@ -389,7 +385,7 @@ async function createStripeCheckoutSession(
     trialDays?: number | null;
   },
 ) {
-  const origin = requestOrigin(c);
+  const origin = getPublicAppOrigin(c);
   const params = new URLSearchParams();
   params.set("mode", checkoutMode(input.planType));
   params.set("customer", input.stripeCustomerId);

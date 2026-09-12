@@ -6,6 +6,7 @@ import { createStripeBillingPortalSession, createStripeSubscriptionUpdateConfirm
 import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, type BillingPriceSnapshot } from "./billing-settings";
 import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
+import { getPublicAppOrigin } from "./public-origin";
 import { compareRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 import {
   cancelScheduledSubscriptionPlanChange,
@@ -127,11 +128,6 @@ function normalizeEmail(email: string) {
 
 function toDateOnly(value: string | null | undefined) {
   return value ? value.slice(0, 10) : null;
-}
-
-function requestOrigin(c: AppContext) {
-  const url = new URL(c.req.raw.url);
-  return `${url.protocol}//${url.host}`;
 }
 
 function appendAccessState(returnPath: string, state: string) {
@@ -534,7 +530,7 @@ async function createStripeUpgradeCheckoutSession(
     idempotencyKey: string;
   },
 ) {
-  const origin = requestOrigin(c);
+  const origin = getPublicAppOrigin(c);
   const params = new URLSearchParams();
   params.set("mode", "payment");
   params.set("customer", input.stripeCustomerId);
