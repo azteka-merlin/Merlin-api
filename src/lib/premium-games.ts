@@ -815,16 +815,23 @@ export async function requireAuthenticatedPremiumLicense(c: AppContext): Promise
 export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
   const rows = await c.env.merlin_db
     .prepare(`
-      SELECT id, app_id, name, cover_url, archive_key, activation_limit, activation_cooldown_hours, enabled, created_at, updated_at,
-        install_subpath,
-        activation_type,
-        launch_executable_path,
-        COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
-        COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
-        COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled,
+      SELECT premium_games.id, premium_games.app_id, premium_games.name, premium_games.cover_url, premium_games.archive_key,
+        premium_games.activation_limit, premium_games.activation_cooldown_hours, premium_games.enabled,
+        premium_games.created_at, premium_games.updated_at,
+        premium_games.install_subpath,
+        premium_games.activation_type,
+        premium_games.launch_executable_path,
+        COALESCE(premium_games.access_bronze_enabled, 0) AS access_bronze_enabled,
+        COALESCE(premium_games.access_prata_enabled, 0) AS access_prata_enabled,
+        COALESCE(premium_games.access_ouro_enabled, 1) AS access_ouro_enabled,
         (SELECT COUNT(*) FROM premium_game_early_access pea WHERE pea.app_id = premium_games.app_id) AS early_access_count
       FROM premium_games
-      ORDER BY enabled DESC, updated_at DESC, id DESC
+      LEFT JOIN catalog_game_metadata metadata ON metadata.app_id = premium_games.app_id
+      ORDER BY
+        premium_games.enabled DESC,
+        metadata.release_date IS NULL ASC,
+        metadata.release_date DESC,
+        premium_games.app_id ASC
     `)
     .all<PremiumGameRecord>();
 
