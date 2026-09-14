@@ -141,7 +141,10 @@ See `STAGING.md` for the full staging policy.
 - Admin login creates a secure session cookie.
 - `/panel-api/licenses` only responds when authenticated.
 - `/api/updates/latest` returns metadata when an update is published.
+- Test a manifest known to be absent and another with a temporarily unavailable source: both return HTTP `200` with `success: false`, but their codes must be `manifest_unavailable` and `manifest_sources_unavailable`, respectively.
+- In Workers Observability, review `manifest_sources_unavailable` warnings; they must include only the App ID, source name, failure type, and HTTP status.
 - `/api/updates/download` returns the installer from R2.
+- Launcher access handoff: after applying the D1 migration, verify that an authenticated launcher can create a handoff, the public site can consume it once, and replaying the same token returns `401`. Do not put handoff tokens, JWTs, cookies, or secrets in logs or documentation.
 
 ## Current Cloudflare references
 

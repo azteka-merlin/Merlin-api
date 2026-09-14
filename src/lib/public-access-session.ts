@@ -5,6 +5,7 @@ import type { AppContext } from "../types";
 export const PUBLIC_ACCESS_SESSION_COOKIE = "merlin_public_access_session";
 const STANDARD_TTL_SECONDS = 30 * 60;
 const REMEMBERED_TTL_SECONDS = 7 * 24 * 60 * 60;
+const HANDOFF_TTL_SECONDS = 90;
 const encoder = new TextEncoder();
 
 type PublicAccessSessionRow = {
@@ -92,6 +93,54 @@ export async function createPublicAccessSession(c: AppContext, licenseId: number
     csrfToken: await hmacHex(secret, "public-access-csrf", token),
     expiresAt: addSeconds(ttlSeconds),
   };
+}
+
+export async function createLauncherAccessHandoff(c: AppContext, licenseId: number) {
+  const secret = sessionSecret(c);
+  const token = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const now = new Date().toISOString();
+  const expiresAt = addSeconds(HANDOFF_TTL_SECONDS);
+  await c.env.merlin_db.prepare(`
+    INSERT INTO launcher_access_handoffs (id, license_id, token_hash, created_at, expires_at, consumed_at)
+    VALUES (?, ?, ?, ?, ?, NULL)
+  `).bind(
+    crypto.randomUUID(),
+    licenseId,
+    await hmacHex(secret, "launcher-access-handoff", token),
+    now,
+    expiresAt,
+  ).run();
+  return { token, expiresAt };
+}
+
+export async function consumeLauncherAccessHandoff(c: AppContext, token: string) {
+  const normalizedToken = String(token || "").trim();
+  if (!normalizedToken) throw new HTTPException(401, { message: "Invalid access handoff" });
+
+  const secret = sessionSecret(c);
+  const tokenHash = await hmacHex(secret, "launcher-access-handoff", normalizedToken);
+  const row = await c.env.merlin_db.prepare(`
+    SELECT id, license_id, expires_at
+    FROM launcher_access_handoffs
+    WHERE token_hash = ? AND consumed_at IS NULL
+    LIMIT 1
+  `).bind(tokenHash).first<{ id: string; license_id: number; expires_at: string }>();
+
+  if (!row || new Date(row.expires_at) <= new Date()) {
+    throw new HTTPException(401, { message: "Access handoff expired" });
+  }
+
+  const consumedAt = new Date().toISOString();
+  const update = await c.env.merlin_db.prepare(`
+    UPDATE launcher_access_handoffs
+    SET consumed_at = ?
+    WHERE id = ? AND consumed_at IS NULL
+  `).bind(consumedAt, row.id).run();
+  if (Number(update.meta?.changes || 0) !== 1) {
+    throw new HTTPException(401, { message: "Access handoff already used" });
+  }
+
+  return createPublicAccessSession(c, row.license_id, true);
 }
 
 export async function readPublicAccessSession(c: AppContext, options: { touch?: boolean } = {}) {

@@ -64,6 +64,8 @@ import {
   validatePublicAccessCredentials,
 } from "./lib/public-access-management";
 import {
+  consumeLauncherAccessHandoff,
+  createLauncherAccessHandoff,
   createPublicAccessSession,
   requirePublicAccessSession,
   revokePublicAccessSession,
@@ -2551,6 +2553,20 @@ app.post("/api/public/access/identify", async (c) => {
   await enforcePublicAccessCredentialsRateLimit(c, body.email);
   await validatePublicAccessCredentials(c, body);
   return c.json({ success: true }, 200);
+});
+
+app.post("/api/public/access/launcher-handoff", async (c) => {
+  const license = await requireLauncherLicense(c);
+  await enforcePublicAccessKeyRateLimit(c, `launcher-handoff:${license.id}`);
+  const handoff = await createLauncherAccessHandoff(c, license.id);
+  return c.json({ success: true, ...handoff }, 201);
+});
+
+app.post("/api/public/access/handoff/consume", async (c) => {
+  const body = parseBody(z.object({ token: z.string().trim().min(1).max(160) }), await c.req.json());
+  await enforcePublicAccessKeyRateLimit(c, body.token);
+  const session = await consumeLauncherAccessHandoff(c, body.token);
+  return c.json({ success: true, ...session }, 200);
 });
 
 app.post("/api/public/access/session", async (c) => {

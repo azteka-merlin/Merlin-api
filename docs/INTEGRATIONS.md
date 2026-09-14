@@ -21,7 +21,13 @@ Short map of external systems touched by the API. Do not add real credentials, p
 
 - Launcher calls `/api/*` for health/version, login, manifests, fixes, premium catalog, premium activations, polls, updates, and downloads.
 - Launcher authentication uses license login plus bearer JWT.
+- The launcher button for managing access uses `POST /api/public/access/launcher-handoff`; the public site exchanges the opaque token through `POST /api/public/access/handoff/consume`. Tokens are short-lived, single-use, HMAC-hashed in D1, and passed in the URL fragment so they are not sent in HTTP requests or normal server logs.
+- Keep the existing public login/session flow unchanged. If handoff creation or exchange fails, the launcher may fall back to the regular `/meu-acesso` route.
 - Manifest and premium download behavior must preserve existing response headers and validation rules because the launcher depends on them.
+- Quando nenhuma fonte de manifest entrega um ZIP, a rota ainda retorna HTTP `200` com `success: false`, para separar resultado de negocio de falha do Worker:
+  - `manifest_unavailable`: todas as fontes responderam ausencia (`404`).
+  - `manifest_sources_unavailable`: houve timeout, `5xx`, erro de rede ou payload que nao era ZIP em pelo menos uma fonte.
+- Nos dois casos, registre atividade com a mesma `reason`. Para visibilidade operacional, emita `console.info` no primeiro caso e `console.warn` estruturado com `appId`, nome da fonte, tipo e status no segundo. Nao inclua URLs assinadas, tokens ou outros secrets nesses logs.
 
 ## Depotbox
 

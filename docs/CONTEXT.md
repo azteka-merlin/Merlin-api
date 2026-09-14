@@ -53,6 +53,11 @@ Main public routes:
 - `GET /api/updates/download`
 - `POST /api/public/access-keys/register`
 - `POST /api/public/access-keys/recover`
+- `POST /api/public/access/launcher-handoff` (launcher-authenticated, one-time handoff creation)
+- `POST /api/public/access/handoff/consume` (short-lived, one-time handoff exchange)
+- `POST /api/public/access/session`
+- `GET /api/public/access/session`
+- `POST /api/public/access/session/logout`
 - `POST /api/public/email-verification/start`
 - `POST /api/public/email-verification/verify`
 
@@ -92,6 +97,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Steam Store API: game metadata.
 - Merlin Admin: static assets served by the Worker.
 - Merlin Launcher: consumes `/api/*`, updates, and downloads.
+- Merlin Launcher → public Meu acesso: the launcher creates a short-lived opaque handoff token; the public site consumes it once and creates the normal HttpOnly access session. Tokens are never persisted in plaintext or logged.
 
 ## Notes
 
@@ -99,6 +105,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - `.dev.vars` and `.env` are local-only and must not be committed.
 - Run `npm run types` after changing `wrangler.jsonc`.
 - Apply remote D1 migrations before the final deploy when schema changes exist.
+- Handoff changes require the `launcher_access_handoffs` D1 migration before deploying API code; verify replay returns `401` and never reuse a consumed token.
 - Staging deploy uses `npm run deploy-stage`; staging panel deploy uses `npm run deploy-stage:panel`.
 - Overrides are shared through R2 and are not migrated between D1 databases.
 - Mutating admin routes must validate admin session and CSRF.

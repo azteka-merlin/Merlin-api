@@ -24,6 +24,18 @@ type ManifestSource = {
 	timeoutMs?: number;
 };
 
+type ManifestSourceOutcome = {
+	name: string;
+	result: "missing" | "unavailable";
+	kind: "http" | "timeout" | "request_failed" | "invalid_zip";
+	status?: number;
+};
+
+type ManifestFetchResult = {
+	response: Response | null;
+	outcome: ManifestSourceOutcome;
+};
+
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
@@ -84,7 +96,12 @@ async function validatedZipResponse(response: Response): Promise<Response | null
 	});
 }
 
-async function fetchSource(source: ManifestSource): Promise<Response | null> {
+async function fetchSource(source: ManifestSource): Promise<ManifestFetchResult> {
+	let lastOutcome: ManifestSourceOutcome = {
+		name: source.name,
+		result: "unavailable",
+		kind: "request_failed",
+	};
 	for (let attempt = 1; attempt <= source.maxAttempts; attempt += 1) {
 		const controller = new AbortController();
 		const timeoutHandle = setTimeout(() => controller.abort("timeout"), source.timeoutMs || SOURCE_TIMEOUT_MS);
@@ -97,17 +114,28 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 				const zipResponse = await validatedZipResponse(response);
 				if (zipResponse) {
 					console.info(`${source.name} returned HTTP ${response.status}`);
-					return zipResponse;
+					return { response: zipResponse, outcome: { name: source.name, result: "missing", kind: "http", status: response.status } };
 				}
 				console.warn(`${source.name} returned a non-ZIP payload`);
-				return null;
+				return { response: null, outcome: { name: source.name, result: "unavailable", kind: "invalid_zip", status: response.status } };
 			}
 
 			console.warn(`${source.name} returned HTTP ${response.status}`);
 			await response.body?.cancel();
-			if (!isRetryableStatus(response.status)) return null;
+			lastOutcome = {
+				name: source.name,
+				result: response.status === 404 ? "missing" : "unavailable",
+				kind: "http",
+				status: response.status,
+			};
+			if (!isRetryableStatus(response.status)) return { response: null, outcome: lastOutcome };
 		} catch (error) {
 			console.warn(`${source.name} request failed:`, error instanceof Error ? error.message : "unknown error");
+			lastOutcome = {
+				name: source.name,
+				result: "unavailable",
+				kind: controller.signal.aborted ? "timeout" : "request_failed",
+			};
 		} finally {
 			clearTimeout(timeoutHandle);
 		}
@@ -117,7 +145,7 @@ async function fetchSource(source: ManifestSource): Promise<Response | null> {
 		}
 	}
 
-	return null;
+	return { response: null, outcome: lastOutcome };
 }
 
 function createSources(appId: string, env: ManifestEnv, primarySource: ManifestPrimarySource): ManifestSource[] {
@@ -292,8 +320,10 @@ export class ManifestsRoute extends OpenAPIRoute {
 		}
 
 		const sourceSettings = await getManifestSourceSettings(c);
+		const sourceOutcomes: ManifestSourceOutcome[] = [];
 		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
-			const response = await fetchSource(source);
+			const { response, outcome } = await fetchSource(source);
+			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
 
 			await writeUserActivityLog(c, {
@@ -312,6 +342,20 @@ export class ManifestsRoute extends OpenAPIRoute {
 			return buildZipResponse(response.body, appId, source.name);
 		}
 
+		const allSourcesReportedMissing = sourceOutcomes.length > 0
+			&& sourceOutcomes.every((outcome) => outcome.result === "missing");
+		const reason = allSourcesReportedMissing ? "manifest_unavailable" : "manifest_sources_unavailable";
+		const outcomeSummary = sourceOutcomes.map(({ name, result, kind, status }) => ({ name, result, kind, ...(status ? { status } : {}) }));
+		const sourceFailures = outcomeSummary.filter((outcome) => outcome.result === "unavailable");
+		if (sourceFailures.length > 0) {
+			console.warn("[manifests] manifest source failures", { appId, sources: sourceFailures });
+		}
+		if (reason === "manifest_unavailable") {
+			console.info("[manifests] manifest unavailable", { appId, sources: outcomeSummary });
+		} else {
+			console.warn("[manifests] manifest sources unavailable", { appId, sources: outcomeSummary });
+		}
+
 		await writeUserActivityLog(c, {
 			licenseId: license.id,
 			licenseKey: license.licenseKey,
@@ -322,9 +366,15 @@ export class ManifestsRoute extends OpenAPIRoute {
 			gameName: null,
 			ipAddress: clientIp,
 			hwid: license.hwid,
-			reason: "manifest_unavailable",
+			reason,
 		});
 
-		return c.json({ error: "No manifest source returned a valid ZIP" }, 502);
+		return c.json({
+			success: false,
+			error: allSourcesReportedMissing
+				? "No manifest source has this game"
+				: "No manifest source returned a valid ZIP",
+			code: reason,
+		}, 200);
 	}
 }
