@@ -66,6 +66,7 @@ export function mapLicense(record: LicenseRecord) {
     recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
     phone: record.contact,
     hwid: record.hwid,
+		hwidResetAt: record.hwid_reset_at || null,
     expiresAt: toDateOnly(record.expires_at),
     status: resolveLicenseStatus(record),
     revokedReason: record.revoked_reason,
@@ -102,7 +103,7 @@ export async function listLicenses(c: AppContext) {
       `
         SELECT id, license_key, name, contact, contact_type, source,
           ${licenseActivationSelect},
-          recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          recovery_pin_hash, recovery_notice_accepted_at, hwid, hwid_reset_at, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           plan_tier,
           ${billingColumns},
           created_at, updated_at
@@ -121,7 +122,7 @@ export async function getLicense(c: AppContext, id: number) {
       `
         SELECT id, license_key, name, contact, contact_type, source,
           ${licenseActivationSelect},
-          recovery_pin_hash, recovery_notice_accepted_at, hwid, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
+          recovery_pin_hash, recovery_notice_accepted_at, hwid, hwid_reset_at, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           plan_tier,
           COALESCE(premium_catalog_restricted, 0) AS premium_catalog_restricted,
           customer_id,
@@ -516,6 +517,27 @@ export async function resetLicenseHwid(c: AppContext, id: number, actor?: Licens
       entityId: String(updated.id),
       ipHash: actor.ipHash,
       userAgentHash: actor.userAgentHash,
+    });
+  }
+  return updated;
+}
+
+export async function clearLicenseHwidResetLimit(c: AppContext, id: number, actor?: LicenseActionActor) {
+  const current = await getLicense(c, id);
+  await c.env.merlin_db
+    .prepare(`UPDATE licenses SET hwid_reset_at = NULL, updated_at = ? WHERE id = ?`)
+    .bind(new Date().toISOString(), id)
+    .run();
+  const updated = await getLicense(c, id);
+  if (actor) {
+    await writeAdminAuditLog(c, {
+      adminUserId: actor.adminUserId,
+      action: "license_hwid_reset_limit_cleared",
+      entityType: "license",
+      entityId: String(updated.id),
+      ipHash: actor.ipHash,
+      userAgentHash: actor.userAgentHash,
+      metadata: { previousResetAt: current.hwid_reset_at || null },
     });
   }
   return updated;

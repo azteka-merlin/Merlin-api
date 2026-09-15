@@ -23,6 +23,7 @@ export type LicenseRecord = {
 	recovery_pin_hash: string | null;
 	recovery_notice_accepted_at: string | null;
 	hwid: string | null;
+	hwid_reset_at?: string | null;
 	expires_at: string;
 	status: LicenseStatusValue;
 	revoked_reason: string | null;

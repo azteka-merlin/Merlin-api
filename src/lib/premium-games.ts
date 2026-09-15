@@ -166,6 +166,16 @@ type PremiumLicensePlanRow = {
   premium_catalog_restricted: number;
 };
 
+export type BronzePremiumActivationCycleSummary = {
+  cycleStart: string;
+  cycleEnd: string;
+  used: number;
+  baseLimit: number;
+  credits: number;
+  totalLimit: number;
+  available: number;
+};
+
 export type PremiumReservationResult = {
   reservationId: number;
   game: PremiumGame;
@@ -723,6 +733,68 @@ async function countBronzePremiumActivationsInCycle(c: AppContext, licenseId: nu
   return Number(row?.count || 0);
 }
 
+async function getBronzePremiumActivationCredits(c: AppContext, licenseId: number, cycleStart: string): Promise<number> {
+  const row = await c.env.merlin_db
+    .prepare(`SELECT credit_count FROM premium_activation_cycle_credits WHERE license_id = ? AND cycle_start = ? LIMIT 1`)
+    .bind(licenseId, cycleStart)
+    .first<{ credit_count: number }>();
+  return Math.max(0, Number(row?.credit_count || 0));
+}
+
+async function getBronzePremiumActivationCycleSummaryForLicense(
+  c: AppContext,
+  licenseId: number,
+  license: PremiumLicensePlanRow,
+): Promise<BronzePremiumActivationCycleSummary> {
+  const cycle = resolveCurrentMonthlyCycle(license);
+  const baseLimit = PLAN_RULES.bronze.premiumLimitPerCycle || 0;
+  const [used, credits] = await Promise.all([
+    countBronzePremiumActivationsInCycle(c, licenseId, cycle.cycleStart, cycle.cycleEnd),
+    getBronzePremiumActivationCredits(c, licenseId, cycle.cycleStart),
+  ]);
+  const totalLimit = baseLimit + credits;
+  return {
+    cycleStart: cycle.cycleStart,
+    cycleEnd: cycle.cycleEnd,
+    used,
+    baseLimit,
+    credits,
+    totalLimit,
+    available: Math.max(0, totalLimit - used),
+  };
+}
+
+export async function getBronzePremiumActivationCycleSummary(c: AppContext, licenseId: number) {
+  const { license, plan } = await getPremiumLicensePlan(c, licenseId);
+  if (plan.effectiveTier !== "bronze" || PLAN_RULES.bronze.premiumLimitPerCycle === null) {
+    throw new HTTPException(400, { message: "Esta licença não usa o limite mensal Bronze." });
+  }
+  return getBronzePremiumActivationCycleSummaryForLicense(c, licenseId, license);
+}
+
+export async function setBronzePremiumActivationCredits(
+  c: AppContext,
+  licenseId: number,
+  creditCount: number,
+) {
+  if (!Number.isInteger(creditCount) || creditCount < 0 || creditCount > 100) {
+    throw new HTTPException(400, { message: "Informe de 0 a 100 créditos extras." });
+  }
+
+  const summary = await getBronzePremiumActivationCycleSummary(c, licenseId);
+  const now = new Date().toISOString();
+  await c.env.merlin_db
+    .prepare(`
+      INSERT INTO premium_activation_cycle_credits (license_id, cycle_start, credit_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(license_id, cycle_start) DO UPDATE SET credit_count = excluded.credit_count, updated_at = excluded.updated_at
+    `)
+    .bind(licenseId, summary.cycleStart, creditCount, now, now)
+    .run();
+
+  return getBronzePremiumActivationCycleSummary(c, licenseId);
+}
+
 async function consumeBronzePremiumActivationSlot(
   c: AppContext,
   licenseId: number,
@@ -913,18 +985,19 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     return [];
   }
 
-  const bronzeCycle = resolveCurrentMonthlyCycle(license);
   const [archiveStates, activationRows, earlyAccessAppIds] = await Promise.all([
     Promise.all(games.map((game) => headArchiveAvailability(c, game.archiveKey))),
     listCurrentPremiumActivations(c, games.map((game) => game.appId)),
     listPremiumGameEarlyAccessAppIds(c, licenseId, games.map((game) => game.appId)),
   ]);
-  const [licenseCurrentRows, bronzeUsed] = await Promise.all([
+  const [licenseCurrentRows, bronzeSummary] = await Promise.all([
     listLicensePremiumActivations(c, licenseId),
     plan.effectiveTier === "bronze"
-      ? countBronzePremiumActivationsInCycle(c, licenseId, bronzeCycle.cycleStart, bronzeCycle.cycleEnd)
-      : Promise.resolve(0),
+      ? getBronzePremiumActivationCycleSummaryForLicense(c, licenseId, license)
+      : Promise.resolve(null),
   ]);
+  const bronzeUsed = bronzeSummary?.used || 0;
+  const bronzeLimit = bronzeSummary?.totalLimit ?? PLAN_RULES.bronze.premiumLimitPerCycle;
 
   const now = new Date();
   const nowIso = now.toISOString();
@@ -1028,7 +1101,7 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
       reservedUntil = globalReservedUntil;
     }
 
-    if (viewerStatus === "available" && plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null && bronzeUsed >= PLAN_RULES.bronze.premiumLimitPerCycle) {
+    if (viewerStatus === "available" && plan.effectiveTier === "bronze" && bronzeLimit !== null && bronzeUsed >= bronzeLimit) {
       viewerStatus = "locked";
       lockedReason = "bronze_limit";
     }
@@ -1077,8 +1150,8 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
         planTier: plan.effectiveTier,
         plansEnabled: plan.plansEnabled,
         premiumActivationsUsed: plan.effectiveTier === "bronze" ? bronzeUsed : null,
-        premiumActivationLimit: PLAN_RULES[plan.effectiveTier].premiumLimitPerCycle,
-        premiumActivationsResetAt: plan.effectiveTier === "bronze" ? bronzeCycle.cycleEnd : null,
+        premiumActivationLimit: plan.effectiveTier === "bronze" ? bronzeLimit : PLAN_RULES[plan.effectiveTier].premiumLimitPerCycle,
+        premiumActivationsResetAt: plan.effectiveTier === "bronze" ? bronzeSummary?.cycleEnd || null : null,
         tierAvailability: plan.plansEnabled ? getTierAvailability(game, now) : [],
       },
     };
@@ -1161,9 +1234,8 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
   }
 
   if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
-    const cycle = resolveCurrentMonthlyCycle(license);
-    const used = await countBronzePremiumActivationsInCycle(c, licenseId, cycle.cycleStart, cycle.cycleEnd);
-    if (used >= PLAN_RULES.bronze.premiumLimitPerCycle) {
+    const summary = await getBronzePremiumActivationCycleSummaryForLicense(c, licenseId, license);
+    if (summary.used >= summary.totalLimit) {
       throw new HTTPException(409, { message: "Bronze premium activation limit reached for the current cycle." });
     }
   }
@@ -1372,19 +1444,19 @@ export async function completePremiumActivation(
     }
 
     if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
-      const cycle = resolveCurrentMonthlyCycle(license);
+      const summary = await getBronzePremiumActivationCycleSummaryForLicense(c, reservation.license_id, license);
       const consumed = await consumeBronzePremiumActivationSlot(
         c,
         reservation.license_id,
-        cycle.cycleStart,
-        cycle.cycleEnd,
-        PLAN_RULES.bronze.premiumLimitPerCycle,
+        summary.cycleStart,
+        summary.cycleEnd,
+        summary.totalLimit,
       );
       if (!consumed) {
         await failPremiumActivationReservation(c, reservationId, "bronze_limit", "Bronze premium activation limit reached for the current cycle.");
         throw new HTTPException(409, { message: "Bronze premium activation limit reached for the current cycle." });
       }
-      bronzeCycleStart = cycle.cycleStart;
+      bronzeCycleStart = summary.cycleStart;
       bronzeSlotConsumed = true;
     }
 

@@ -22,6 +22,7 @@ export type UserActivityInput = {
   userName: string;
   action:
     | "user_login_success"
+    | "hwid_reset_success"
     | "game_activation_success"
     | "game_activation_denied"
     | "premium_activation_success"

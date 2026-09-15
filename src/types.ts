@@ -187,6 +187,7 @@ export const LicenseResponse = z.object({
 	recoveryNoticeAcceptedAt: z.string().nullable().optional(),
 	phone: z.string(),
 	hwid: z.string().nullable(),
+	hwidResetAt: z.string().nullable().optional(),
 	expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 	status: LicenseStatus,
 	revokedReason: z.string().nullable(),
@@ -243,6 +244,10 @@ export const OverrideEntry = z.object({
 	hidden: z.boolean().optional(),
 	manifestOverride: ManifestOverrideConfig.optional(),
 	fixOverride: FixOverrideConfig.optional(),
+});
+
+export const UpdateBronzePremiumActivationCycleRequest = z.object({
+	creditCount: z.number().int().min(0).max(100),
 });
 
 export const OverrideParams = z.object({

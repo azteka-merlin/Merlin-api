@@ -34,6 +34,7 @@ import {
   listLicenses,
   mapLicense,
   renewLicense,
+  clearLicenseHwidResetLimit,
   resetLicenseHwid,
   resetTestLicenseUsage,
   revokeLicense,
@@ -96,7 +97,7 @@ import {
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
 import { requireLauncherLicense } from "./lib/launcher-auth";
-import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest } from "./types";
+import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest, UpdateBronzePremiumActivationCycleRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
 import {
@@ -110,6 +111,7 @@ import {
   failPremiumActivationReservationForLicense,
   findPremiumActivationReservationForLicense,
   getPremiumGame,
+  getBronzePremiumActivationCycleSummary,
   grantPremiumGameEarlyAccess,
   listPremiumCatalog,
   listPremiumGameEarlyAccess,
@@ -117,6 +119,7 @@ import {
   requireAuthenticatedPremiumLicense,
   reservePremiumActivation,
   revokePremiumGameEarlyAccess,
+  setBronzePremiumActivationCredits,
   updatePremiumGame,
 } from "./lib/premium-games";
 import {
@@ -131,7 +134,7 @@ import {
 } from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
-import { enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { enforceLoginRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
@@ -212,6 +215,10 @@ const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
   rememberMe: z.boolean().optional().default(false),
+});
+const launcherHwidResetSchema = z.object({
+  licenseKey: z.string().regex(/^MERLIN-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/),
+  hwid: z.string().trim().min(1).max(256),
 });
 const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
   message: "Use 4 a 8 caracteres, sem espacos.",
@@ -2493,6 +2500,39 @@ app.post("/panel-api/licenses/:id/reset-hwid", async (c) => {
   return c.json(mapLicense(updated), 200);
 });
 
+app.post("/panel-api/licenses/:id/clear-hwid-reset-limit", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const updated = await clearLicenseHwidResetLimit(c, parseLicenseId(c.req.param("id")), {
+    adminUserId: session.session.admin_user_id,
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json(mapLicense(updated), 200);
+});
+
+app.get("/panel-api/licenses/:id/premium-activation-cycle", async (c) => {
+  await requireAdminSession(c);
+  const summary = await getBronzePremiumActivationCycleSummary(c, parseLicenseId(c.req.param("id")));
+  return c.json({ summary }, 200);
+});
+
+app.put("/panel-api/licenses/:id/premium-activation-cycle", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const body = parseBody(UpdateBronzePremiumActivationCycleRequest, await c.req.json());
+  const summary = await setBronzePremiumActivationCredits(c, licenseId, body.creditCount);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "license_bronze_premium_cycle_updated",
+    entityType: "license",
+    entityId: String(licenseId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: { ...summary, creditCount: body.creditCount },
+  });
+  return c.json({ success: true, summary }, 200);
+});
+
 app.post("/panel-api/licenses/:id/sync-stripe", async (c) => {
   const session = await requireAdminSession(c, { mutate: true });
   const licenseId = parseLicenseId(c.req.param("id"));
@@ -3220,6 +3260,50 @@ app.post("/api/launcher/billing-portal", async (c) => {
   const license = await requireLauncherLicense(c);
   const result = await createLauncherBillingPortalSession(c, license.id);
   return c.json({ success: true, ...result }, 200);
+});
+
+app.post("/api/auth/reset-hwid", async (c) => {
+  const body = parseBody(launcherHwidResetSchema, await c.req.json());
+  await enforceLoginRateLimit(c, body);
+
+  const license = await c.env.merlin_db
+    .prepare(`SELECT id, license_key, name, hwid, hwid_reset_at, expires_at, status FROM licenses WHERE license_key = ? LIMIT 1`)
+    .bind(body.licenseKey)
+    .first<{ id: number; license_key: string; name: string; hwid: string | null; hwid_reset_at: string | null; expires_at: string; status: string }>();
+  const now = new Date();
+  if (!license || license.status !== "active" || Number.isNaN(new Date(license.expires_at).getTime()) || new Date(license.expires_at) < now) {
+    throw new HTTPException(401, { message: "Não foi possível redefinir esta licença." });
+  }
+  if (!license.hwid) {
+    return c.json({ success: true, reset: false, message: "Esta licença já está pronta para ser ativada neste computador." }, 200);
+  }
+
+  const resetAt = license.hwid_reset_at ? new Date(license.hwid_reset_at) : null;
+  const nextResetAt = resetAt && !Number.isNaN(resetAt.getTime()) ? new Date(resetAt.getTime() + 30 * 24 * 60 * 60 * 1000) : null;
+  if (nextResetAt && nextResetAt > now) {
+    return c.json({ success: false, code: "hwid_reset_unavailable", retryAt: nextResetAt.toISOString() }, 409);
+  }
+
+  const nowIso = now.toISOString();
+  const changed = await c.env.merlin_db
+    .prepare(`UPDATE licenses SET hwid = NULL, hwid_reset_at = ?, updated_at = ? WHERE id = ? AND hwid IS NOT NULL AND (hwid_reset_at IS NULL OR hwid_reset_at <= ?)`)
+    .bind(nowIso, nowIso, license.id, new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString())
+    .run();
+  if (Number(changed.meta.changes || 0) !== 1) {
+    return c.json({ success: false, code: "hwid_reset_unavailable", retryAt: nextResetAt?.toISOString() || null }, 409);
+  }
+
+  await writeUserActivityLog(c, {
+    licenseId: license.id,
+    licenseKey: license.license_key,
+    userName: license.name,
+    action: "hwid_reset_success",
+    status: "success",
+    ipAddress: getClientIp(c),
+    hwid: body.hwid,
+    metadata: { source: "launcher", monthlyLimitDays: 30 },
+  });
+  return c.json({ success: true, reset: true }, 200);
 });
 
 openapi.get("/api/manifests", ManifestsRoute);
