@@ -124,12 +124,12 @@ async function fetchWithTimeout(
 	}
 }
 
-function normalizeSearchKey(searchTerm: string, limit: number): string {
-	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}`;
+function normalizeSearchKey(searchTerm: string, limit: number, includeUnavailable: boolean): string {
+	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}::${includeUnavailable ? "all" : "available"}`;
 }
 
-function getCachedDepotSearch(searchTerm: string, limit: number): SearchItem[] | null {
-	const key = normalizeSearchKey(searchTerm, limit);
+function getCachedDepotSearch(searchTerm: string, limit: number, includeUnavailable: boolean): SearchItem[] | null {
+	const key = normalizeSearchKey(searchTerm, limit, includeUnavailable);
 	const cached = depotSearchCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) {
 		return cached.items.map((item) => ({ ...item }));
@@ -138,8 +138,8 @@ function getCachedDepotSearch(searchTerm: string, limit: number): SearchItem[] |
 	return null;
 }
 
-function setCachedDepotSearch(searchTerm: string, limit: number, items: SearchItem[]): void {
-	depotSearchCache.set(normalizeSearchKey(searchTerm, limit), {
+function setCachedDepotSearch(searchTerm: string, limit: number, includeUnavailable: boolean, items: SearchItem[]): void {
+	depotSearchCache.set(normalizeSearchKey(searchTerm, limit, includeUnavailable), {
 		expiresAt: Date.now() + DEPOT_QUERY_CACHE_TTL_MS,
 		items: items.map((item) => ({ ...item })),
 	});
@@ -537,13 +537,18 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 	);
 }
 
-async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: number): Promise<SearchSourceResult> {
+async function searchDepotbox(
+	env: GameSearchEnv,
+	searchTerm: string,
+	limit: number,
+	includeUnavailable = false,
+): Promise<SearchSourceResult> {
 	if (!env.DEPOTBOX_API_KEY) {
 		console.warn("[games-search] depotbox api key is not configured");
 		return { ok: false, items: [] };
 	}
 
-	const cached = getCachedDepotSearch(searchTerm, limit);
+	const cached = getCachedDepotSearch(searchTerm, limit, includeUnavailable);
 	if (cached) {
 		return { ok: true, items: cached };
 	}
@@ -561,7 +566,7 @@ async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: num
 				searchTerm,
 				limit,
 				filter_dlc: "exclude",
-				filter_availability: true,
+				filter_availability: !includeUnavailable,
 			}),
 		}, SEARCH_SOURCE_TIMEOUT_MS);
 
@@ -583,7 +588,7 @@ async function searchDepotbox(env: GameSearchEnv, searchTerm: string, limit: num
 			.slice(0, limit);
 
 		const validatedItems = await validateDepotboxResultsWithSteam(items);
-		setCachedDepotSearch(searchTerm, limit, validatedItems);
+		setCachedDepotSearch(searchTerm, limit, includeUnavailable, validatedItems);
 		return { ok: true, items: validatedItems };
 	} catch (error) {
 		console.warn("[games-search] depotbox request failed:", error instanceof Error ? error.message : "unknown error");
@@ -769,15 +774,8 @@ export class GamesSearchRoute extends OpenAPIRoute {
 			console.warn("[games-search] D1 catalog search failed:", error instanceof Error ? error.message : "unknown error");
 		}
 
-		const depotboxResult = await searchDepotbox(env, searchTerm, limit);
+		const depotboxResult = await searchDepotbox(env, searchTerm, limit, true);
 		if (depotboxResult.ok) {
-			c.executionCtx.waitUntil(upsertGamesCatalogItems(c, depotboxResult.items.map((item) => ({
-				...item,
-				catalogSource: "depotbox",
-			}))).catch((error) => {
-				console.warn("[games-search] D1 catalog upsert failed:", error instanceof Error ? error.message : "unknown error");
-			}));
-
 			return c.json({
 				success: true,
 				source: "depotbox",

@@ -33,6 +33,10 @@ Short map of external systems touched by the API. Do not add real credentials, p
 
 - Used for game search and direct download of manifests/fixes.
 - Requires `DEPOTBOX_API_KEY`.
+- The authenticated launcher search keeps the availability filter disabled so titles
+  without a DepotBox manifest are discoverable. Public catalog discovery keeps that
+  filter enabled. Manifest availability is checked only when the launcher starts the
+  installation and can fall back to the other configured sources.
 - Calls must keep upstream failures isolated so other manifest sources/fallbacks can still be tried.
 
 ## Ryuu
