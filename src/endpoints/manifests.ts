@@ -9,6 +9,7 @@ import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, ManifestQuery } from "../types";
 
 type ManifestEnv = {
+	CONTRARY_CDN_API_KEY?: string;
 	DEPOTBOX_API_KEY?: string;
 	RYU_API_URL?: string;
 	RYUU_AUTH_CODE?: string;
@@ -40,7 +41,9 @@ const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
+const CONTRARY_SOURCE_TIMEOUT_MS = 300_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
+const CONTRARY_MANIFEST_URL = "https://contrarycdnapi.duckdns.org/api/v1/contrary/manifest";
 
 function getClientIp(c: AppContext): string | null {
 	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
@@ -148,7 +151,7 @@ async function fetchSource(source: ManifestSource): Promise<ManifestFetchResult>
 	return { response: null, outcome: lastOutcome };
 }
 
-function createSources(appId: string, env: ManifestEnv, primarySource: ManifestPrimarySource): ManifestSource[] {
+export function createSources(appId: string, env: ManifestEnv, primarySource: ManifestPrimarySource): ManifestSource[] {
 	const commonHeaders = {
 		"User-Agent": USER_AGENT,
 		Accept: "application/zip, application/octet-stream",
@@ -190,6 +193,22 @@ function createSources(appId: string, env: ManifestEnv, primarySource: ManifestP
 	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
 		const source = sourceName === "depotbox" ? depotboxSource : ryuuSource;
 		if (source) sources.push(source);
+	}
+
+	const contraryApiKey = env.CONTRARY_CDN_API_KEY?.trim();
+	if (contraryApiKey) {
+		sources.push({
+			name: "contrarycdn",
+			url: `${CONTRARY_MANIFEST_URL}/${encodeURIComponent(appId)}`,
+			init: {
+				headers: {
+					...commonHeaders,
+					Authorization: `Bearer ${contraryApiKey}`,
+				},
+			},
+			maxAttempts: 1,
+			timeoutMs: CONTRARY_SOURCE_TIMEOUT_MS,
+		});
 	}
 
 	if (env.HUBCAP_TOKEN) {

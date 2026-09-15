@@ -72,6 +72,7 @@
 	},
 	"secrets": {
 		"required": [
+			"CONTRARY_CDN_API_KEY",
 			"DEPOTBOX_API_KEY",
 			"RYUU_AUTH_CODE",
 			"HUBCAP_TOKEN",
@@ -147,6 +148,7 @@
 			},
 			"secrets": {
 				"required": [
+					"CONTRARY_CDN_API_KEY",
 					"DEPOTBOX_API_KEY",
 					"RYUU_AUTH_CODE",
 					"HUBCAP_TOKEN",
