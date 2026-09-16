@@ -220,32 +220,6 @@ async function upsertCatalogGames(c: AppContext, games: Array<{ appId: string; n
   ]));
 }
 
-async function searchIsolatedCatalog(c: AppContext, search: string, category?: "premium" | "standard"): Promise<CatalogRow[]> {
-  const tokens = normalizedName(search).split(" ").filter(Boolean).slice(0, 6);
-  if (!tokens.length) return [];
-  const filters = tokens.map(() => "g.normalized_name LIKE ?");
-  const values: Array<string> = tokens.map((token) => `%${token}%`);
-  if (category) {
-    filters.push("COALESCE(m.category, 'reviewing') = ?");
-    values.push(category);
-  }
-  const rows = await c.env.merlin_db.prepare(`
-    SELECT g.app_id, g.name, g.cover_url,
-      COALESCE(m.category, 'reviewing') AS category,
-      COALESCE(a.available_in_merlin, 0) AS available_in_merlin,
-      m.release_date
-    FROM catalog_games g
-    LEFT JOIN catalog_game_metadata m ON m.app_id = g.app_id
-    LEFT JOIN catalog_availability a ON a.app_id = g.app_id
-    WHERE ${filters.join(" AND ")}
-    ORDER BY COALESCE(a.available_in_merlin, 0) DESC,
-      CASE WHEN g.normalized_name = ? THEN 0 ELSE 1 END,
-      m.release_date IS NULL ASC, m.release_date DESC, g.name COLLATE NOCASE ASC
-    LIMIT ?
-  `).bind(...values, normalizedName(search), SEARCH_CANDIDATE_LIMIT).all<CatalogRow>();
-  return dedupeCatalogRows(rows.results || [], 3);
-}
-
 export class PublicCatalogRoute extends OpenAPIRoute {
   schema = {
     tags: ["Public"],
@@ -302,11 +276,10 @@ export class PublicCatalogRoute extends OpenAPIRoute {
       `).bind(...values, limit + 1, (query.page - 1) * limit).all<CatalogRow>();
       items = rows.results || [];
     } else {
-      const isolated = await searchIsolatedCatalog(c, search, query.category);
       const discovered = await searchGamesForCatalog(c, search, SEARCH_CANDIDATE_LIMIT);
       if (discovered.length) {
         await upsertCatalogGames(c, discovered);
-        const orderedAppIds = [...new Set([...isolated.map((game) => game.app_id), ...discovered.map((game) => game.appId)])];
+        const orderedAppIds = [...new Set(discovered.map((game) => game.appId))];
         const placeholders = orderedAppIds.map(() => "?").join(", ");
         const found = (await c.env.merlin_db.prepare(`
           SELECT g.app_id, g.name, g.cover_url, COALESCE(m.category, 'reviewing') AS category, COALESCE(a.available_in_merlin, 0) AS available_in_merlin, m.release_date
@@ -316,7 +289,7 @@ export class PublicCatalogRoute extends OpenAPIRoute {
         const byAppId = new Map(found.map((game) => [game.app_id, game]));
         items = dedupeCatalogRows(orderedAppIds.map((appId) => byAppId.get(appId)).filter((game): game is CatalogRow => Boolean(game)), limit);
       } else {
-        items = isolated;
+        items = [];
       }
     }
     return c.json({

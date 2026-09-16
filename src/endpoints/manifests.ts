@@ -99,7 +99,19 @@ async function validatedZipResponse(response: Response): Promise<Response | null
 	});
 }
 
-async function fetchSource(source: ManifestSource): Promise<ManifestFetchResult> {
+function logManifestSourceFailure(appId: string, source: ManifestSource, attempt: number, outcome: ManifestSourceOutcome) {
+	console.warn("[manifests] source attempt failed", {
+		appId,
+		source: source.name,
+		attempt,
+		stage: outcome.kind === "invalid_zip" ? "validate_zip" : "fetch",
+		reason: outcome.kind,
+		result: outcome.result,
+		...(outcome.status ? { status: outcome.status } : {}),
+	});
+}
+
+async function fetchSource(source: ManifestSource, appId: string): Promise<ManifestFetchResult> {
 	let lastOutcome: ManifestSourceOutcome = {
 		name: source.name,
 		result: "unavailable",
@@ -116,14 +128,19 @@ async function fetchSource(source: ManifestSource): Promise<ManifestFetchResult>
 			if (response.ok) {
 				const zipResponse = await validatedZipResponse(response);
 				if (zipResponse) {
-					console.info(`${source.name} returned HTTP ${response.status}`);
+					console.info("[manifests] source succeeded", {
+						appId,
+						source: source.name,
+						attempt,
+						status: response.status,
+					});
 					return { response: zipResponse, outcome: { name: source.name, result: "missing", kind: "http", status: response.status } };
 				}
-				console.warn(`${source.name} returned a non-ZIP payload`);
-				return { response: null, outcome: { name: source.name, result: "unavailable", kind: "invalid_zip", status: response.status } };
+				const outcome = { name: source.name, result: "unavailable" as const, kind: "invalid_zip" as const, status: response.status };
+				logManifestSourceFailure(appId, source, attempt, outcome);
+				return { response: null, outcome };
 			}
 
-			console.warn(`${source.name} returned HTTP ${response.status}`);
 			await response.body?.cancel();
 			lastOutcome = {
 				name: source.name,
@@ -131,14 +148,15 @@ async function fetchSource(source: ManifestSource): Promise<ManifestFetchResult>
 				kind: "http",
 				status: response.status,
 			};
+			logManifestSourceFailure(appId, source, attempt, lastOutcome);
 			if (!isRetryableStatus(response.status)) return { response: null, outcome: lastOutcome };
 		} catch (error) {
-			console.warn(`${source.name} request failed:`, error instanceof Error ? error.message : "unknown error");
 			lastOutcome = {
 				name: source.name,
 				result: "unavailable",
 				kind: controller.signal.aborted ? "timeout" : "request_failed",
 			};
+			logManifestSourceFailure(appId, source, attempt, lastOutcome);
 		} finally {
 			clearTimeout(timeoutHandle);
 		}
@@ -341,7 +359,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 		const sourceSettings = await getManifestSourceSettings(c);
 		const sourceOutcomes: ManifestSourceOutcome[] = [];
 		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
-			const { response, outcome } = await fetchSource(source);
+			const { response, outcome } = await fetchSource(source, appId);
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
 

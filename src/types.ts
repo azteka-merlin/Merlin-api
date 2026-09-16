@@ -3,6 +3,7 @@ import { z } from "zod";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
 
 export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | "PIX_ENV" | "MERCADO_PAGO_API_BASE" | "MERCADO_PAGO_TEST_PAYER_EMAIL" | "STEAM_ACCOUNT_ID"> {
+	PUBLIC_APP_ORIGIN?: string;
 	CONTRARY_CDN_API_KEY: string;
   SESSION_HASH_SECRET: string;
   RESEND_API_KEY: string;

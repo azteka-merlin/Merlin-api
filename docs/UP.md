@@ -145,6 +145,8 @@ See `STAGING.md` for the full staging policy.
 - In Workers Observability, review `manifest_sources_unavailable` warnings; they must include only the App ID, source name, failure type, and HTTP status.
 - `/api/updates/download` returns the installer from R2.
 - Launcher access handoff: after applying the D1 migration, verify that an authenticated launcher can create a handoff, the public site can consume it once, and replaying the same token returns `401`. Do not put handoff tokens, JWTs, cookies, or secrets in logs or documentation.
+- Pix checkout: verify that a Mercado Pago device session ID at the supported 1,024-character limit is accepted and forwarded unchanged. This prevents a provider-issued ID from being rejected or silently discarded.
+- Billing return: start a billing portal or plan-change session and verify its return URL begins with `PUBLIC_APP_ORIGIN` and ends at `/meu-acesso`; it must never use the API origin. A previous regression sent customers to `https://api-merlin.com/meu-acesso`, where the public page is not served.
 
 ## Current Cloudflare references
 

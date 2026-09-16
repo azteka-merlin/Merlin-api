@@ -49,7 +49,7 @@ function context(db: FakeD1Database) {
     env: {
       merlin_db: db,
       STRIPE_SECRET_KEY: "sk_test_fake",
-      PUBLIC_APP_ORIGIN: "https://staging.api-merlin.com",
+      PUBLIC_APP_ORIGIN: "https://staging.merlin.test",
     },
   } as any;
 }
@@ -105,6 +105,8 @@ describe("Stripe plan-change confirmation portal", () => {
     expect(configurationCall?.body).toContain("features%5Bpayment_method_update%5D%5Benabled%5D=true");
     expect(configurationCall?.body).toContain("features%5Bsubscription_update%5D%5Bbilling_cycle_anchor%5D=now");
     const portalSession = calls.filter((call) => call.url.endsWith("/billing_portal/sessions"))[0];
+    expect(portalSession.body).toContain("return_url=https%3A%2F%2Fstaging.merlin.test%2Fmeu-acesso%3Faccess%3Dplan-change-cancel");
+    expect(portalSession.body).not.toContain("staging.api-merlin.com%2Fmeu-acesso");
     expect(portalSession.body).toContain("configuration=bpc_ouro_annual");
     expect(portalSession.body).toContain("flow_data%5Bsubscription_update_confirm%5D%5Bitems%5D%5B0%5D%5Bprice%5D=price_ouro_annual");
   });

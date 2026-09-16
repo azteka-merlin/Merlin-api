@@ -98,6 +98,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Merlin Admin: static assets served by the Worker.
 - Merlin Launcher: consumes `/api/*`, updates, and downloads.
 - Merlin Launcher → public Meu acesso: the launcher creates a short-lived opaque handoff token; the public site consumes it once and creates the normal HttpOnly access session. Tokens are never persisted in plaintext or logged.
+- Mercado Pago Pix: the public checkout accepts a provider device session ID with up to 1,024 characters and forwards it as `X-meli-session-id`. Keep the request validation and normalization limits aligned so a valid provider ID is never dropped after validation.
 
 ## Notes
 
@@ -106,6 +107,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Run `npm run types` after changing `wrangler.jsonc`.
 - Apply remote D1 migrations before the final deploy when schema changes exist.
 - Handoff changes require the `launcher_access_handoffs` D1 migration before deploying API code; verify replay returns `401` and never reuse a consumed token.
+- Billing URLs must use the configured `PUBLIC_APP_ORIGIN`, not the Worker/API request origin. This guarantees return links open the public `/meu-acesso` page.
 - Staging deploy uses `npm run deploy-stage`; staging panel deploy uses `npm run deploy-stage:panel`.
 - Overrides are shared through R2 and are not migrated between D1 databases.
 - Mutating admin routes must validate admin session and CSRF.

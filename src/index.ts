@@ -85,6 +85,7 @@ import {
   createPublicPixOrder,
   getPublicPixOrderStatus,
   isMercadoPagoPixAvailable,
+  mercadoPagoDeviceIdSchema,
   parseAndVerifyMercadoPagoWebhook,
   processMercadoPagoWebhookEvent,
 } from "./lib/mercadopago-pix";
@@ -320,7 +321,7 @@ const publicCheckoutSchema = z.object({
   planTier: planTierSchema.optional().nullable(),
 });
 const publicPixOrderSchema = publicCheckoutSchema.extend({
-  mercadoPagoDeviceId: z.string().trim().max(1024).optional(),
+  mercadoPagoDeviceId: mercadoPagoDeviceIdSchema.optional(),
 });
 const publicPixOrderStatusParamsSchema = z.object({
   paymentIntentId: z.string().trim().min(1),

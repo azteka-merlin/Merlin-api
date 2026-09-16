@@ -702,13 +702,10 @@ async function upsertGamesCatalogItems(c: AppContext, items: GamesCatalogUpsertI
 }
 
 export async function searchGamesForCatalog(c: AppContext, searchTerm: string, limit: number): Promise<SearchItem[]> {
-	const local = await searchD1Catalog(c, searchTerm, limit);
-	if (local.length >= limit) return local;
 	const depotbox = await searchDepotbox(c.env as Env & GameSearchEnv, searchTerm, limit);
-	if (!depotbox.ok) return local;
+	if (!depotbox.ok) return [];
 	c.executionCtx.waitUntil(upsertGamesCatalogItems(c, depotbox.items.map((item) => ({ ...item, catalogSource: "depotbox" }))));
-	const seen = new Set(local.map((item) => item.appId));
-	return [...local, ...depotbox.items.filter((item) => !seen.has(item.appId))].slice(0, limit);
+	return depotbox.items;
 }
 
 export class GamesSearchRoute extends OpenAPIRoute {

@@ -1,4 +1,5 @@
 import { HTTPException } from "hono/http-exception";
+import { z } from "zod";
 import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { findLicenseByEmailContact, normalizeContact } from "./admin-license-service";
@@ -15,6 +16,8 @@ const PIX_MODE = "pix";
 const CHECKOUT_SESSION_TTL_SECONDS = 30 * 60;
 const MAX_USER_AGENT_LENGTH = 500;
 const MP_SIGNATURE_TOLERANCE_SECONDS = 300;
+export const MERCADO_PAGO_DEVICE_ID_MAX_LENGTH = 1024;
+export const mercadoPagoDeviceIdSchema = z.string().trim().min(8).max(MERCADO_PAGO_DEVICE_ID_MAX_LENGTH).regex(/^[A-Za-z0-9._:-]+$/);
 type MercadoPagoRuntimeEnvironment = "test" | "production";
 
 type CustomerRow = {
@@ -201,9 +204,13 @@ function splitPayerName(name: string) {
   return { firstName, lastName };
 }
 
-function normalizeDeviceId(deviceId: unknown) {
+export function normalizeMercadoPagoDeviceId(deviceId: unknown) {
   const value = typeof deviceId === "string" ? deviceId.trim() : "";
-  return /^[A-Za-z0-9._:-]{8,200}$/.test(value) ? value : "";
+  return value.length >= 8
+    && value.length <= MERCADO_PAGO_DEVICE_ID_MAX_LENGTH
+    && /^[A-Za-z0-9._:-]+$/.test(value)
+    ? value
+    : "";
 }
 
 function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEmailContact>>) {
@@ -1071,7 +1078,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   if (!recoveryPin) {
     throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
-  const mercadoPagoDeviceId = normalizeDeviceId(input.mercadoPagoDeviceId);
+  const mercadoPagoDeviceId = normalizeMercadoPagoDeviceId(input.mercadoPagoDeviceId);
 
   const planEnabled = input.planType === "monthly"
     ? billing.monthlyEnabled
