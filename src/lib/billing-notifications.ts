@@ -127,10 +127,15 @@ async function reserveBillingNotification(
   await c.env.merlin_db
     .prepare(
       `
-        INSERT OR IGNORE INTO billing_notifications (
+        INSERT INTO billing_notifications (
           license_id, customer_id, provider, notification_type, dedupe_key, email, status, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        ON CONFLICT(dedupe_key) DO UPDATE SET
+          status = 'pending',
+          error_message = NULL,
+          updated_at = excluded.updated_at
+        WHERE billing_notifications.status = 'failed'
       `,
     )
     .bind(
@@ -313,6 +318,65 @@ async function listExpirationReminderCandidates(c: BillingNotificationContext, n
     )
     .bind(start, end, CRON_LIMIT)
     .all<BillingLicenseRow>();
+}
+
+export async function getExpirationReminderEligibility(
+  c: BillingNotificationContext,
+  licenseId: number,
+  now = new Date(),
+) {
+  const start = addDays(now, REMINDER_WINDOW_START_DAYS).toISOString();
+  const end = addDays(now, REMINDER_WINDOW_END_DAYS).toISOString();
+  const license = await c.env.merlin_db
+    .prepare(
+      `
+        SELECT l.id, l.customer_id, l.license_key, l.name, l.contact, l.expires_at,
+               l.access_type, l.billing_status, l.stripe_customer_id, l.stripe_subscription_id,
+               l.billing_cancel_at_period_end,
+               s.status AS subscription_status,
+               s.cancel_at_period_end AS subscription_cancel_at_period_end,
+               cst.stripe_customer_id AS customer_stripe_customer_id
+        FROM licenses l
+        LEFT JOIN subscriptions s ON s.license_id = l.id
+        LEFT JOIN customers cst ON cst.id = l.customer_id
+        WHERE l.id = ?
+          AND l.status = 'active'
+          AND l.contact_type = 'email'
+          AND COALESCE(l.access_type, 'free') = 'monthly_subscription'
+          AND datetime(l.expires_at) BETWEEN datetime(?) AND datetime(?)
+          AND NOT (
+            l.stripe_subscription_id IS NOT NULL
+            AND COALESCE(l.billing_cancel_at_period_end, 0) = 0
+            AND COALESCE(s.cancel_at_period_end, 0) = 0
+            AND COALESCE(s.status, l.billing_status, '') IN ('active', 'trialing')
+          )
+        LIMIT 1
+      `,
+    )
+    .bind(licenseId, start, end)
+    .first<BillingLicenseRow>();
+
+  if (!license) return { eligible: false as const, reason: "Licença fora da janela de aviso." };
+
+  const dedupeKey = `expiration_reminder:license:${license.id}:expires:${dateOnly(license.expires_at)}`;
+  const notification = await c.env.merlin_db
+    .prepare("SELECT status FROM billing_notifications WHERE dedupe_key = ? LIMIT 1")
+    .bind(dedupeKey)
+    .first<{ status: string }>();
+
+  if (notification?.status === "sent" || notification?.status === "pending") {
+    return { eligible: false as const, reason: "Aviso já enviado para este vencimento." };
+  }
+
+  return { eligible: true as const, license };
+}
+
+export async function sendExpirationReminderForLicense(c: BillingNotificationContext, licenseId: number) {
+  const eligibility = await getExpirationReminderEligibility(c, licenseId);
+  if (!eligibility.eligible) return { ...eligibility, sent: false as const };
+
+  const sent = await sendExpirationReminder(c, eligibility.license, publicOriginFromEnv(c.env));
+  return { eligible: true as const, sent, license: eligibility.license };
 }
 
 async function listExpiredAccessCandidates(c: BillingNotificationContext, now: Date) {

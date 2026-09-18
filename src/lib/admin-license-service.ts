@@ -46,6 +46,16 @@ function statusForExpiresAt(expiresAt: string, currentStatus?: LicenseStatusValu
   return resolveLicenseStatus({ status: "active", expires_at: expiresAt });
 }
 
+// Mercado Pago Pix is paid one period at a time. When an admin manually changes
+// that period's end date, its billing display must follow the same date. Stripe
+// dates remain provider-owned and are intentionally never changed here.
+export function shouldSyncManualPixBillingPeriod(license: Pick<LicenseRecord, "source" | "access_type" | "stripe_customer_id" | "stripe_subscription_id">) {
+  return license.source === "mercadopago_pix"
+    && license.access_type !== "lifetime"
+    && !license.stripe_customer_id
+    && !license.stripe_subscription_id;
+}
+
 export function mapLicense(record: LicenseRecord) {
   return {
     id: record.id,
@@ -78,8 +88,8 @@ export function mapLicense(record: LicenseRecord) {
     stripeCustomerId: record.stripe_customer_id || null,
     stripeSubscriptionId: record.stripe_subscription_id || null,
     stripeCheckoutSessionId: record.stripe_checkout_session_id || null,
-    billingCurrentPeriodEnd: record.billing_current_period_end || null,
-    billingCurrentPeriodStart: record.billing_current_period_start || null,
+    billingCurrentPeriodEnd: record.billing_current_period_end ? toDateOnly(record.billing_current_period_end) : null,
+    billingCurrentPeriodStart: record.billing_current_period_start ? toDateOnly(record.billing_current_period_start) : null,
     billingCancelAtPeriodEnd: Boolean(record.billing_cancel_at_period_end),
     createdAt: record.created_at,
     updatedAt: record.updated_at,
@@ -328,16 +338,19 @@ export async function updateLicense(
   const expiresAt = toIsoDateEndBrt(input.expiresAt);
   const nextStatus = statusForExpiresAt(expiresAt, current.status);
   const planTier = normalizeStoredPlanTier(input.planTier || current.plan_tier, "ouro");
+  const syncPixBillingPeriod = shouldSyncManualPixBillingPeriod(current);
+  const pixBillingPeriodSql = syncPixBillingPeriod ? ", billing_current_period_end = ?" : "";
+  const pixBillingPeriodBindings = syncPixBillingPeriod ? [expiresAt] : [];
   try {
     await c.env.merlin_db
       .prepare(
         `
           UPDATE licenses
-          SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, status = ?, plan_tier = ?${recoveryPinSql}, updated_at = ?
+          SET name = ?, contact = ?, contact_type = ?, hwid = ?, expires_at = ?, status = ?, plan_tier = ?${recoveryPinSql}${pixBillingPeriodSql}, updated_at = ?
           WHERE id = ?
         `,
       )
-      .bind(input.name, normalizedContact, contactType, nextHwid, expiresAt, nextStatus, planTier, ...recoveryPinBindings, now, current.id)
+      .bind(input.name, normalizedContact, contactType, nextHwid, expiresAt, nextStatus, planTier, ...recoveryPinBindings, ...pixBillingPeriodBindings, now, current.id)
       .run();
   } catch (error) {
     if (isDuplicateEmailLicenseError(error)) {
@@ -441,10 +454,18 @@ export async function renewLicense(c: AppContext, id: number, expiresAt: string,
   const current = await getLicense(c, id);
   const nextExpiresAt = toIsoDateEndBrt(expiresAt);
   const nextStatus = statusForExpiresAt(nextExpiresAt, current.status);
-  await c.env.merlin_db
-    .prepare(`UPDATE licenses SET expires_at = ?, status = ?, updated_at = ? WHERE id = ?`)
-    .bind(nextExpiresAt, nextStatus, new Date().toISOString(), id)
-    .run();
+  const now = new Date().toISOString();
+  if (shouldSyncManualPixBillingPeriod(current)) {
+    await c.env.merlin_db
+      .prepare(`UPDATE licenses SET expires_at = ?, status = ?, billing_current_period_end = ?, updated_at = ? WHERE id = ?`)
+      .bind(nextExpiresAt, nextStatus, nextExpiresAt, now, id)
+      .run();
+  } else {
+    await c.env.merlin_db
+      .prepare(`UPDATE licenses SET expires_at = ?, status = ?, updated_at = ? WHERE id = ?`)
+      .bind(nextExpiresAt, nextStatus, now, id)
+      .run();
+  }
   const updated = await getLicense(c, id);
   if (actor) {
     await writeAdminAuditLog(c, {

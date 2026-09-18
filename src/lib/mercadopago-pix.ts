@@ -21,6 +21,12 @@ export const MERCADO_PAGO_DEVICE_ID_MAX_LENGTH = 1024;
 export const mercadoPagoDeviceIdSchema = z.string().trim().min(8).max(MERCADO_PAGO_DEVICE_ID_MAX_LENGTH).regex(/^[A-Za-z0-9._:-]+$/);
 type MercadoPagoRuntimeEnvironment = "test" | "production";
 
+// Pix is always a one-off payment. Recurring plans must remain manually renewable,
+// while a lifetime purchase has no renewal state at all.
+export function getPixBillingCancelAtPeriodEnd(planType: BillingPlanType) {
+  return planType === "lifetime" ? 0 : 1;
+}
+
 type CustomerRow = {
   id: number;
   email: string;
@@ -49,6 +55,9 @@ type PixCheckoutRow = {
   payment_status: string | null;
   license_id: number | null;
   reactivation_license_id: number | null;
+  scheduled_renewal_license_id: number | null;
+  renewal_effective_at: string | null;
+  renewal_applied_at: string | null;
   pending_license_key: string | null;
   pending_name: string | null;
   pending_recovery_pin_hash: string | null;
@@ -181,6 +190,13 @@ function oneYearFromNowIso() {
   return next.toISOString();
 }
 
+function addRenewalPeriod(start: string, planType: BillingPlanType) {
+  const next = new Date(start);
+  if (planType === "annual") next.setUTCFullYear(next.getUTCFullYear() + 1);
+  else next.setUTCMonth(next.getUTCMonth() + 1);
+  return next.toISOString();
+}
+
 function addSeconds(date: Date, seconds: number) {
   return new Date(date.getTime() + seconds * 1000).toISOString();
 }
@@ -237,10 +253,17 @@ function canPayAgain(existingLicense: Awaited<ReturnType<typeof findLicenseByEma
     || existingLicense.revoked_origin === "stripe_subscription";
 }
 
-function isSamePixCheckoutContext(checkout: PixCheckoutRow, planType: BillingPlanType, planTier: PlanTier | null, reactivationLicenseId: number | null) {
+function isSamePixCheckoutContext(
+  checkout: PixCheckoutRow,
+  planType: BillingPlanType,
+  planTier: PlanTier | null,
+  reactivationLicenseId: number | null,
+  scheduledRenewalLicenseId: number | null,
+) {
   return checkout.plan_type === planType
     && normalizeStoredPlanTier(checkout.plan_tier, "ouro") === (planTier || normalizeStoredPlanTier(checkout.plan_tier, "ouro"))
-    && (checkout.reactivation_license_id ?? null) === reactivationLicenseId;
+    && (checkout.reactivation_license_id ?? null) === reactivationLicenseId
+    && (checkout.scheduled_renewal_license_id ?? null) === scheduledRenewalLicenseId;
 }
 
 function getClientIp(c: AppContext) {
@@ -641,7 +664,7 @@ async function findPendingPixCheckout(c: AppContext, customerId: number) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE customer_id = ?
@@ -691,7 +714,7 @@ async function getPixCheckoutByReference(c: AppContext, reference: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE provider = ?
@@ -709,7 +732,7 @@ async function getPixCheckoutBySessionId(c: AppContext, sessionId: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE provider = ? AND provider_session_id = ?
@@ -747,6 +770,34 @@ async function getCustomer(c: AppContext, customerId: number) {
 }
 
 async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
+  if (checkout.scheduled_renewal_license_id) {
+    const existing = await getLicenseById(c, checkout.scheduled_renewal_license_id);
+    if (!existing) {
+      throw new Error(`Scheduled Pix renewal license ${checkout.scheduled_renewal_license_id} not found`);
+    }
+    const now = new Date().toISOString();
+    const currentExpiry = new Date(existing.expires_at).getTime();
+    const effectiveAt = Number.isFinite(currentExpiry) && currentExpiry > Date.now()
+      ? existing.expires_at
+      : now;
+    await c.env.merlin_db
+      .prepare(
+        `
+          UPDATE checkout_sessions
+          SET license_id = ?,
+              status = 'completed',
+              completed_at = COALESCE(completed_at, ?),
+              processed_at = COALESCE(processed_at, ?),
+              payment_status = 'paid',
+              renewal_effective_at = COALESCE(renewal_effective_at, ?),
+              updated_at = ?
+          WHERE id = ?
+        `,
+      )
+      .bind(existing.id, now, now, effectiveAt, now, checkout.id)
+      .run();
+    return existing;
+  }
   if (checkout.license_id) {
     const existing = await getLicenseById(c, checkout.license_id);
     if (existing) {
@@ -825,7 +876,7 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
         accessType,
         now,
         periodEnd,
-        0,
+        getPixBillingCancelAtPeriodEnd(checkout.plan_type),
         now,
         existing.id,
       )
@@ -892,7 +943,7 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
         accessType,
         now,
         periodEnd,
-        checkout.plan_type === "monthly" ? 1 : 0,
+        getPixBillingCancelAtPeriodEnd(checkout.plan_type),
       )
       .run();
     licenseId = Number(result.meta.last_row_id);
@@ -972,6 +1023,75 @@ async function savePixPayment(c: AppContext, checkout: PixCheckoutRow, order: Me
     .run();
 }
 
+async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow, now = new Date()) {
+  if (!checkout.scheduled_renewal_license_id || checkout.renewal_applied_at || !checkout.renewal_effective_at) {
+    return false;
+  }
+  if (new Date(checkout.renewal_effective_at).getTime() > now.getTime()) return false;
+
+  const effectiveAt = checkout.renewal_effective_at;
+  const accessType = checkout.plan_type === "annual" ? "annual_manual" : "monthly_subscription";
+  const expiresAt = addRenewalPeriod(effectiveAt, checkout.plan_type);
+  const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
+  const appliedAt = now.toISOString();
+  await c.env.merlin_db
+    .prepare(
+      `
+        UPDATE licenses
+        SET plan_tier = ?,
+            access_type = ?,
+            expires_at = ?,
+            status = 'active',
+            billing_status = 'active',
+            billing_current_period_start = ?,
+            billing_current_period_end = ?,
+            billing_cancel_at_period_end = 1,
+            updated_at = ?
+        WHERE id = ?
+      `,
+    )
+    .bind(planTier, accessType, expiresAt, effectiveAt, expiresAt, appliedAt, checkout.scheduled_renewal_license_id)
+    .run();
+  await c.env.merlin_db
+    .prepare(
+      `
+        UPDATE checkout_sessions
+        SET renewal_applied_at = ?, updated_at = ?
+        WHERE id = ? AND renewal_applied_at IS NULL
+      `,
+    )
+    .bind(appliedAt, appliedAt, checkout.id)
+    .run();
+  return true;
+}
+
+export async function applyDuePixScheduledRenewals(c: AppContext, now = new Date()) {
+  const rows = await c.env.merlin_db
+    .prepare(
+      `
+        SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
+          provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
+        FROM checkout_sessions
+        WHERE provider = ?
+          AND payment_status = 'paid'
+          AND scheduled_renewal_license_id IS NOT NULL
+          AND renewal_applied_at IS NULL
+          AND renewal_effective_at <= ?
+        ORDER BY renewal_effective_at ASC
+        LIMIT 100
+      `,
+    )
+    .bind(PROVIDER_MP, now.toISOString())
+    .all<PixCheckoutRow>();
+  let applied = 0;
+  for (const checkout of rows.results || []) {
+    if (await applyPixScheduledRenewal(c, checkout, now)) applied += 1;
+  }
+  return { applied };
+}
+
 function publicPixPayload(checkout: PixCheckoutRow) {
   return {
     paymentIntentId: checkout.provider_external_reference || checkout.provider_session_id,
@@ -982,6 +1102,8 @@ function publicPixPayload(checkout: PixCheckoutRow) {
     qrCodeBase64: checkout.provider_qr_code_base64,
     ticketUrl: checkout.provider_ticket_url,
     expiresAt: checkout.provider_session_expires_at,
+    renewalEffectiveAt: checkout.renewal_effective_at,
+    renewalAppliedAt: checkout.renewal_applied_at,
   };
 }
 
@@ -1037,6 +1159,7 @@ async function updateCheckoutFromOrder(c: AppContext, checkout: PixCheckoutRow, 
 
 async function applyPaidPixOrder(c: AppContext, checkout: PixCheckoutRow, order: MercadoPagoOrder) {
   if (checkout.processed_at && checkout.license_id) {
+    await applyPixScheduledRenewal(c, checkout);
     const existing = await getLicenseById(c, checkout.license_id);
     if (existing) {
       return existing;
@@ -1045,7 +1168,9 @@ async function applyPaidPixOrder(c: AppContext, checkout: PixCheckoutRow, order:
 
   const refreshed = await updateCheckoutFromOrder(c, checkout, order) || checkout;
   const license = await activatePixLicense(c, refreshed);
-  await savePixPayment(c, refreshed, order, license.id);
+  const completedCheckout = await getPixCheckoutByReference(c, refreshed.provider_external_reference || refreshed.provider_session_id) || refreshed;
+  await savePixPayment(c, completedCheckout, order, license.id);
+  await applyPixScheduledRenewal(c, completedCheckout);
   return license;
 }
 
@@ -1125,6 +1250,7 @@ export async function reconcileMercadoPagoCheckout(c: AppContext, sessionId: str
   if (!updated) {
     throw new HTTPException(404, { message: "Checkout Mercado Pago nao encontrado." });
   }
+  const scheduled = await applyDuePixScheduledRenewals(c);
   return {
     checkoutId: updated.id,
     paymentStatus: updated.payment_status || updated.status,
@@ -1132,11 +1258,13 @@ export async function reconcileMercadoPagoCheckout(c: AppContext, sessionId: str
     providerStatusDetail: updated.provider_status_detail,
     processed: Boolean(updated.processed_at || updated.license_id),
     licenseId: updated.license_id || null,
+    scheduledRenewalsApplied: scheduled.applied,
   };
 }
 
 type TrustedRenewalOptions = {
-  reactivationLicenseId: number;
+  reactivationLicenseId?: number;
+  scheduledRenewalLicenseId?: number;
 };
 
 export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderInput, trustedRenewal?: TrustedRenewalOptions) {
@@ -1169,11 +1297,35 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const email = normalizeEmail(input.contact);
   const existingLicense = await findLicenseByEmailContact(c, email);
-  if (trustedRenewal && existingLicense?.id !== trustedRenewal.reactivationLicenseId) {
+  const reactivationLicenseId = trustedRenewal?.reactivationLicenseId || null;
+  const scheduledRenewalLicenseId = trustedRenewal?.scheduledRenewalLicenseId || null;
+  if (trustedRenewal && existingLicense?.id !== (reactivationLicenseId || scheduledRenewalLicenseId)) {
     throw new HTTPException(403, { message: "Acesso de renovacao invalido." });
   }
-  const reactivationLicenseId = existingLicense && canPayAgain(existingLicense) ? existingLicense.id : null;
-  if (existingLicense && !reactivationLicenseId) {
+  const canReactivate = Boolean(reactivationLicenseId && existingLicense && canPayAgain(existingLicense));
+  if (reactivationLicenseId && !canReactivate) {
+    throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix." });
+  }
+  if (scheduledRenewalLicenseId && (!existingLicense || existingLicense.status !== "active")) {
+    throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix antecipada." });
+  }
+  if (scheduledRenewalLicenseId) {
+    const scheduled = await c.env.merlin_db
+      .prepare(`
+        SELECT id FROM checkout_sessions
+        WHERE provider = ?
+          AND scheduled_renewal_license_id = ?
+          AND payment_status = 'paid'
+          AND renewal_applied_at IS NULL
+        LIMIT 1
+      `)
+      .bind(PROVIDER_MP, scheduledRenewalLicenseId)
+      .first<{ id: number }>();
+    if (scheduled) {
+      throw new HTTPException(409, { message: "Ja existe uma renovacao Pix confirmada para esta licenca." });
+    }
+  }
+  if (existingLicense && !canReactivate && !scheduledRenewalLicenseId) {
     if (existingLicense.status === "revoked") {
       throw new HTTPException(409, { message: "Esta licenca nao pode ser reativada automaticamente. Fale com o suporte." });
     }
@@ -1253,7 +1405,8 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
         pendingCheckout,
         input.planType,
         selectedTierForCheckout,
-        reactivationLicenseId,
+        canReactivate ? reactivationLicenseId : null,
+        scheduledRenewalLicenseId,
       )
     ) {
       if (verificationId) await consumePublicEmailVerification(c, verificationId);
@@ -1267,7 +1420,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const externalReference = `mpix_${crypto.randomUUID()}`;
   const idempotencyKey = `merlin_pix:${externalReference}`;
-  const licenseKey = reactivationLicenseId ? existingLicense?.license_key || "" : generateLicenseKey();
+  const licenseKey = (canReactivate || scheduledRenewalLicenseId) ? existingLicense?.license_key || "" : generateLicenseKey();
   const recoveryPinHash = trustedRenewal
     ? existingLicense?.recovery_pin_hash || null
     : await hashRecoveryPin(c, { licenseKey, recoveryPin: recoveryPin || "" });
@@ -1288,11 +1441,11 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       `
         INSERT INTO checkout_sessions (
           customer_id, provider, provider_session_id, provider_price_id, plan_tier, plan_type, mode, status,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, reactivation_license_id,
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, reactivation_license_id, scheduled_renewal_license_id,
           provider_session_expires_at, payment_status, checkout_ip, checkout_user_agent, checkout_country,
           checkout_evidence_json, idempotency_key, provider_external_reference, provider_environment, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
     .bind(
@@ -1303,11 +1456,12 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       selectedTierForCheckout,
       input.planType,
       checkoutMode(input.planType),
-      reactivationLicenseId ? null : licenseKey,
+      canReactivate || scheduledRenewalLicenseId ? null : licenseKey,
       name,
       recoveryPinHash,
       now,
-      reactivationLicenseId,
+      canReactivate ? reactivationLicenseId : null,
+      scheduledRenewalLicenseId,
       expiresAt,
       getClientIp(c),
       getCheckoutUserAgent(c),
@@ -1377,6 +1531,8 @@ export async function getPublicPixOrderStatus(c: AppContext, paymentIntentId: st
         paymentStatus: "paid",
         planType: refreshed.plan_type,
         planTier: refreshed.plan_tier ? normalizeStoredPlanTier(refreshed.plan_tier, "ouro") : null,
+        renewalEffectiveAt: refreshed.renewal_effective_at,
+        renewalAppliedAt: refreshed.renewal_applied_at,
         license: {
           licenseKey: license.license_key,
           name: license.name,

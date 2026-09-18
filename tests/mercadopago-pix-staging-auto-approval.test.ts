@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { shouldAutoApproveStagingTestPix } from "../src/lib/mercadopago-pix";
+import { getPixBillingCancelAtPeriodEnd, shouldAutoApproveStagingTestPix } from "../src/lib/mercadopago-pix";
 
 describe("staging Mercado Pago Pix auto approval", () => {
   const expiresAt = "2026-09-18T06:11:09.634Z";
@@ -21,5 +21,13 @@ describe("staging Mercado Pago Pix auto approval", () => {
     expect(shouldAutoApproveStagingTestPix({ ...waitingTestOrder, appEnvironment: "production", nowMs: createdAt + 5_000 })).toBe(false);
     expect(shouldAutoApproveStagingTestPix({ ...waitingTestOrder, providerStatus: "processed", nowMs: createdAt + 5_000 })).toBe(false);
     expect(shouldAutoApproveStagingTestPix({ ...waitingTestOrder, nowMs: new Date(expiresAt).getTime() })).toBe(false);
+  });
+});
+
+describe("Pix renewal policy", () => {
+  test("keeps every recurring Pix plan manually renewable", () => {
+    expect(getPixBillingCancelAtPeriodEnd("monthly")).toBe(1);
+    expect(getPixBillingCancelAtPeriodEnd("annual")).toBe(1);
+    expect(getPixBillingCancelAtPeriodEnd("lifetime")).toBe(0);
   });
 });

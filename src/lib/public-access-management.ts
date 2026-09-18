@@ -8,6 +8,8 @@ import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { getPublicAppOrigin } from "./public-origin";
 import { compareRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { isEligibleForEarlyPixRenewal } from "./expired-card-renewal";
+import { toDateOnly } from "./licenses";
 import {
   cancelScheduledSubscriptionPlanChange,
   createSubscriptionPlanChange,
@@ -124,10 +126,6 @@ async function stripeGet<T>(c: AppContext, path: string) {
 
 function normalizeEmail(email: string) {
   return normalizeContact(email, "email");
-}
-
-function toDateOnly(value: string | null | undefined) {
-  return value ? value.slice(0, 10) : null;
 }
 
 function appendAccessState(returnPath: string, state: string) {
@@ -275,6 +273,11 @@ async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, 
     available,
     card: available && !pixOnlyRenewal,
     pix: available && pixOnlyRenewal && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled,
+    earlyPix: pixOnlyRenewal
+      && isEligibleForEarlyPixRenewal(license)
+      && isPixRuntimeAvailable(c)
+      && billing.pixEnabled
+      && pixEnabled,
     price: available ? mapPrice(price) : null,
   };
 }
@@ -300,8 +303,30 @@ async function getPublicPlanChange(c: AppContext, licenseId: number) {
     targetTier: row.target_plan_tier,
     targetPeriod: row.target_billing_period,
     timing: row.timing,
-    effectiveAt: toDateOnly(row.effective_at),
+    effectiveAt: row.effective_at ? toDateOnly(row.effective_at) : null,
     canCancel: row.status === "scheduled",
+  };
+}
+
+async function getPublicPixScheduledRenewal(c: AppContext, licenseId: number) {
+  const row = await c.env.merlin_db
+    .prepare(`
+      SELECT plan_tier, plan_type, renewal_effective_at
+      FROM checkout_sessions
+      WHERE provider = 'mercadopago'
+        AND scheduled_renewal_license_id = ?
+        AND payment_status = 'paid'
+        AND renewal_applied_at IS NULL
+      ORDER BY completed_at DESC, id DESC
+      LIMIT 1
+    `)
+    .bind(licenseId)
+    .first<{ plan_tier: string | null; plan_type: BillingPeriod; renewal_effective_at: string | null }>();
+  if (!row?.renewal_effective_at) return null;
+  return {
+    targetTier: normalizeStoredPlanTier(row.plan_tier, "ouro"),
+    targetPeriod: row.plan_type,
+    effectiveAt: row.renewal_effective_at ? toDateOnly(row.renewal_effective_at) : null,
   };
 }
 
@@ -311,11 +336,18 @@ function mapAccessPayload(
   upgrade: Awaited<ReturnType<typeof getUpgradeAvailability>>,
   renewal: Awaited<ReturnType<typeof getRenewalAvailability>>,
   planChange: Awaited<ReturnType<typeof getPublicPlanChange>>,
+  pixRenewal: Awaited<ReturnType<typeof getPublicPixScheduledRenewal>>,
 ) {
   const kind = accessKind(license);
   const current = isCurrentLicense(license);
-  const cancelAtPeriodEnd = Boolean(license.billing_cancel_at_period_end || subscription?.cancel_at_period_end);
-  const currentPeriodEnd = license.billing_current_period_end || subscription?.current_period_end || null;
+  // Legacy/manual Pix rows can carry stale Stripe-period metadata. Pix has no
+  // subscription lifecycle: its only entitlement boundary is `expires_at`.
+  const hasStripeSubscription = Boolean(license.stripe_customer_id && license.stripe_subscription_id);
+  const cancelAtPeriodEnd = hasStripeSubscription
+    && Boolean(license.billing_cancel_at_period_end || subscription?.cancel_at_period_end);
+  const currentPeriodEnd = hasStripeSubscription
+    ? license.billing_current_period_end || subscription?.current_period_end || null
+    : license.expires_at;
   return {
     status: "found" as const,
     access: {
@@ -328,17 +360,18 @@ function mapAccessPayload(
       expiresAt: toDateOnly(license.expires_at),
       subscription: kind === "monthly" || kind === "annual" ? {
         status: subscription?.status || license.billing_status || "active",
-        currentPeriodEnd: toDateOnly(currentPeriodEnd),
+        currentPeriodEnd: currentPeriodEnd ? toDateOnly(currentPeriodEnd) : null,
         cancelAtPeriodEnd,
         // Payment origin must remain stable after expiration. `canManage` is
         // intentionally false for expired access, but that does not turn a
         // Stripe subscription into a Pix purchase in the client UI.
-        paymentMethod: license.stripe_customer_id && license.stripe_subscription_id ? "card" : "pix",
-        canManage: current && Boolean(license.stripe_customer_id && license.stripe_subscription_id),
+        paymentMethod: hasStripeSubscription ? "card" : "pix",
+        canManage: current && hasStripeSubscription,
       } : null,
       upgrade,
       renewal,
       planChange,
+      pixRenewal,
     },
   };
 }
@@ -353,7 +386,8 @@ export async function getPublicAccessDetails(c: AppContext, input: { email: stri
   const upgrade = await getUpgradeAvailability(c, license, current);
   const renewal = await getRenewalAvailability(c, license, current);
   const planChange = await getPublicPlanChange(c, license.id);
-  return mapAccessPayload(license, subscription, upgrade, renewal, planChange);
+  const pixRenewal = await getPublicPixScheduledRenewal(c, license.id);
+  return mapAccessPayload(license, subscription, upgrade, renewal, planChange, pixRenewal);
 }
 
 export async function getPublicAccessDetailsForLicense(c: AppContext, licenseId: number) {
@@ -366,7 +400,8 @@ export async function getPublicAccessDetailsForLicense(c: AppContext, licenseId:
   const upgrade = await getUpgradeAvailability(c, license, current);
   const renewal = await getRenewalAvailability(c, license, current);
   const planChange = await getPublicPlanChange(c, license.id);
-  return mapAccessPayload(license, subscription, upgrade, renewal, planChange);
+  const pixRenewal = await getPublicPixScheduledRenewal(c, license.id);
+  return mapAccessPayload(license, subscription, upgrade, renewal, planChange, pixRenewal);
 }
 
 export async function previewPublicAccessPlanChange(

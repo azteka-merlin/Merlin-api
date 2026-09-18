@@ -45,7 +45,7 @@ import {
 import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings } from "./lib/billing-settings";
 import { getLauncherUpdatePolicySettings, updateLauncherUpdatePolicySettings } from "./lib/launcher-update-policy-settings";
 import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSourceSettings } from "./lib/manifest-source-settings";
-import { runBillingNotificationCron } from "./lib/billing-notifications";
+import { getExpirationReminderEligibility, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
@@ -72,7 +72,7 @@ import {
   revokePublicAccessSession,
 } from "./lib/public-access-session";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
-import { isEligibleForExpiredCardRenewal, isEligibleForExpiredPixRenewal } from "./lib/expired-card-renewal";
+import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardRenewal, isEligibleForExpiredPixRenewal } from "./lib/expired-card-renewal";
 import { normalizeStoredPlanTier } from "./lib/plan-tiers";
 import {
   cancelScheduledSubscriptionPlanChange,
@@ -84,6 +84,7 @@ import {
   upsertBillingPlanPrices,
 } from "./lib/subscription-plan-change";
 import {
+  applyDuePixScheduledRenewals,
   createPublicPixOrder,
   getPublicPixOrderStatus,
   isMercadoPagoPixAvailable,
@@ -2689,6 +2690,34 @@ app.post("/panel-api/licenses/:id/send-welcome-email", async (c) => {
   return c.json({ success: true }, 200);
 });
 
+app.get("/panel-api/licenses/:id/expiration-reminder", async (c) => {
+  await requireAdminSession(c);
+  const result = await getExpirationReminderEligibility(c, parseLicenseId(c.req.param("id")));
+  return c.json({ eligible: result.eligible, reason: result.eligible ? null : result.reason }, 200);
+});
+
+app.post("/panel-api/licenses/:id/send-expiration-reminder", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const licenseId = parseLicenseId(c.req.param("id"));
+  const result = await sendExpirationReminderForLicense(c, licenseId);
+  if (!result.eligible) {
+    throw new HTTPException(400, { message: result.reason });
+  }
+  if (!result.sent) {
+    throw new HTTPException(409, { message: "O aviso já está em processamento." });
+  }
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "billing_expiration_reminder_sent",
+    entityType: "license",
+    entityId: String(licenseId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: { provider: result.license.stripe_subscription_id ? "stripe" : "mercadopago", expiresAt: result.license.expires_at },
+  });
+  return c.json({ success: true }, 200);
+});
+
 app.post("/panel-api/licenses/:id/renew", async (c) => {
   const session = await requireAdminSession(c, { mutate: true });
   const body = parseBody(RenewLicenseRequest, await c.req.json());
@@ -2917,7 +2946,9 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
     planTier: planTierSchema.optional(),
   }), await c.req.json());
   const license = await getLicense(c, session.session.license_id);
-  if (!isEligibleForExpiredPixRenewal(license)) {
+  const expiredRenewal = isEligibleForExpiredPixRenewal(license);
+  const earlyRenewal = isEligibleForEarlyPixRenewal(license);
+  if (!expiredRenewal && !earlyRenewal) {
     throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix." });
   }
   const result = await createPublicPixOrder(c, {
@@ -2925,12 +2956,15 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
     contact: license.contact,
     recoveryPin: "",
     acceptedRecoveryNotice: true,
-    // An expired Pix license may choose its next recurring plan. Active Pix
-    // access never reaches this endpoint, so this cannot alter a live term.
+    // A Pix renewal may choose its next recurring plan. When it is paid while
+    // access is still active, the selected plan is stored separately and only
+    // takes effect after the current paid period ends.
     planType: body.planType || (license.access_type === "annual_subscription" ? "annual" : "monthly"),
     planTier: body.planTier || normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
     mercadoPagoDeviceId: body.mercadoPagoDeviceId,
-  }, { reactivationLicenseId: license.id });
+  }, expiredRenewal
+    ? { reactivationLicenseId: license.id }
+    : { scheduledRenewalLicenseId: license.id });
   return c.json({ success: true, ...result }, 201);
 });
 
@@ -3666,7 +3700,8 @@ export default {
     }
     if (scheduledAt.getUTCHours() === 12) await runBillingNotificationCron(env);
     {
-      await Promise.all([runCatalogAvailabilitySync(env), refreshConfirmedDenuvo(env)]);
+      const cronContext = { env, executionCtx: _ctx } as AppContext;
+      await Promise.all([runCatalogAvailabilitySync(env), refreshConfirmedDenuvo(env), applyDuePixScheduledRenewals(cronContext)]);
     }
   },
 };
