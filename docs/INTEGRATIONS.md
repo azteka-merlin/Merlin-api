@@ -39,6 +39,11 @@ Short map of external systems touched by the API. Do not add real credentials, p
   installation and can fall back to the other configured sources.
 - Calls must keep upstream failures isolated so other manifest sources/fallbacks can still be tried.
 
+## ContraryCDN
+
+- Used for manifest downloads when `CONTRARY_CDN_API_KEY` is configured.
+- The admin can select it as the primary source; otherwise it remains after the configured DepotBox/Ryuu order.
+
 ## Ryuu
 
 - Used as a manifest source when both `RYU_API_URL` and `RYUU_AUTH_CODE` are configured.
@@ -51,7 +56,10 @@ Short map of external systems touched by the API. Do not add real credentials, p
 - Used as a manifest fallback.
 - Requires `HUBCAP_TOKEN`.
 
-## Steam Store
+## Steam Store and SteamRaw
+
+- Steam Store is the source of truth for DRM and catalog categorization.
+- SteamRaw is a release-date-only fallback when Steam does not expose an old or removed app. It must never determine DRM or overwrite the Steam category.
 
 - Used to enrich game metadata and cover information.
 - This is public metadata; do not treat it as a license or activation source.

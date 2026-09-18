@@ -694,9 +694,9 @@ export async function readAdminSessionByToken(c: AppContext, token: string, opti
   const now = new Date();
   const expiresAt = parseDate(session.expires_at);
   const absoluteExpiresAt = parseDate(session.absolute_expires_at);
+  const ipChanged = session.ip_hash !== ipHash;
 
   if (
-    session.ip_hash !== ipHash ||
     session.user_agent_hash !== userAgentHash ||
     session.status === "disabled" ||
     !expiresAt ||
@@ -734,16 +734,29 @@ export async function readAdminSessionByToken(c: AppContext, token: string, opti
       .prepare(
         `
           UPDATE admin_sessions
-          SET token_hash = ?, expires_at = ?, last_seen_at = ?
+          SET token_hash = ?, ip_hash = ?, expires_at = ?, last_seen_at = ?
           WHERE id = ?
         `,
       )
-      .bind(nextTokenHash, boundedExpires.toISOString(), now.toISOString(), session.id)
+      .bind(nextTokenHash, ipHash, boundedExpires.toISOString(), now.toISOString(), session.id)
       .run();
 
     session.token_hash = nextTokenHash;
+    session.ip_hash = ipHash;
     session.expires_at = boundedExpires.toISOString();
     session.last_seen_at = now.toISOString();
+
+    if (ipChanged) {
+      await writeAdminAuditLog(c, {
+        adminUserId: session.admin_user_id,
+        action: "admin_session_ip_changed",
+        entityType: "admin_session",
+        entityId: session.id,
+        ipHash,
+        userAgentHash,
+        metadata: { sessionId: session.id },
+      });
+    }
   }
 
   return {

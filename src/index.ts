@@ -72,6 +72,8 @@ import {
   revokePublicAccessSession,
 } from "./lib/public-access-session";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
+import { isEligibleForExpiredCardRenewal, isEligibleForExpiredPixRenewal } from "./lib/expired-card-renewal";
+import { normalizeStoredPlanTier } from "./lib/plan-tiers";
 import {
   cancelScheduledSubscriptionPlanChange,
   createSubscriptionPlanChange,
@@ -88,6 +90,7 @@ import {
   mercadoPagoDeviceIdSchema,
   parseAndVerifyMercadoPagoWebhook,
   processMercadoPagoWebhookEvent,
+  reconcileMercadoPagoCheckout,
 } from "./lib/mercadopago-pix";
 import {
   getPublicCheckoutStatus,
@@ -97,7 +100,7 @@ import {
   reconcileStripeCheckoutSession,
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
-import { requireLauncherLicense } from "./lib/launcher-auth";
+import { requireLauncherLicense, requireLauncherSearchLicense } from "./lib/launcher-auth";
 import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest, UpdateBronzePremiumActivationCycleRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
@@ -117,6 +120,7 @@ import {
   listPremiumCatalog,
   listPremiumGameEarlyAccess,
   listPremiumGames,
+  requireReadablePremiumLicense,
   requireAuthenticatedPremiumLicense,
   reservePremiumActivation,
   revokePremiumGameEarlyAccess,
@@ -211,7 +215,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
+const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -339,11 +343,36 @@ const publicAccessMeSchema = z.object({
   email: z.string().trim().email(),
   recoveryPin: recoverySecretSchema,
 });
+
+async function createExpiredCardRenewalCheckout(c: any, license: Awaited<ReturnType<typeof getLicense>>) {
+  if (!isEligibleForExpiredCardRenewal(license)) {
+    throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao por cartao." });
+  }
+
+  return createPublicStripeCheckout(c, {
+    name: license.name,
+    contact: license.contact,
+    recoveryPin: "",
+    acceptedRecoveryNotice: true,
+    planType: license.access_type === "annual_subscription" ? "annual" : "monthly",
+    planTier: normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
+  }, { reactivationLicenseId: license.id });
+}
 const manifestSourceSettingsSchema = z.object({
   primarySource: z.enum(MANIFEST_PRIMARY_SOURCES),
 });
 const launcherUpdatePolicySettingsSchema = z.object({
   automaticUpdatesEnabled: z.boolean(),
+});
+const catalogEnrichmentQueueSettingsSchema = z.object({
+  paused: z.boolean(),
+});
+const catalogEnrichmentJobActionSchema = z.object({
+  action: z.enum(["pause", "resume", "reprocess", "delete"]),
+});
+const catalogEnrichmentBulkActionSchema = z.object({
+  action: z.enum(["pause", "resume", "reprocess", "delete"]),
+  appIds: z.array(z.string().regex(/^\d+$/)).min(1).max(500),
 });
 const publicAccessSessionSchema = publicAccessMeSchema.extend({
   rememberDevice: z.boolean().optional().default(false),
@@ -2088,6 +2117,207 @@ app.put("/panel-api/manifest-source-settings", async (c) => {
   return c.json({ success: true, settings }, 200);
 });
 
+app.get("/panel-api/catalog-enrichment-status", async (c) => {
+  await requireAdminSession(c);
+  const [catalog, jobs, settings] = await Promise.all([
+    c.env.merlin_db.prepare(`
+      SELECT COUNT(*) AS total_games,
+        SUM(CASE WHEN release_date IS NULL OR trim(release_date) = '' THEN 1 ELSE 0 END) AS without_release_date,
+        MAX(checked_at) AS last_checked_at
+      FROM catalog_game_metadata
+    `).first<{ total_games: number; without_release_date: number; last_checked_at: string | null }>(),
+    c.env.merlin_db.prepare(`
+      SELECT status, COUNT(*) AS total, MAX(updated_at) AS last_updated_at
+      FROM catalog_enrichment_jobs
+      GROUP BY status
+    `).all<{ status: string; total: number; last_updated_at: string | null }>(),
+    c.env.merlin_db.prepare("SELECT paused, updated_at FROM catalog_enrichment_settings WHERE id = 1")
+      .first<{ paused: number; updated_at: string | null }>(),
+  ]);
+  const jobsByStatus = new Map((jobs.results || []).map((job) => [job.status, job]));
+
+  return c.json({
+    success: true,
+    status: {
+      totalGames: Number(catalog?.total_games || 0),
+      withoutReleaseDate: Number(catalog?.without_release_date || 0),
+      withReleaseDate: Math.max(0, Number(catalog?.total_games || 0) - Number(catalog?.without_release_date || 0)),
+      pending: Number(jobsByStatus.get("pending")?.total || 0),
+      processing: Number(jobsByStatus.get("processing")?.total || 0),
+      retry: Number(jobsByStatus.get("retry")?.total || 0),
+      paused: Number(jobsByStatus.get("paused")?.total || 0),
+      failed: Number(jobsByStatus.get("failed")?.total || 0),
+      queuePaused: Number(settings?.paused || 0) === 1,
+      lastActivityAt: jobsByStatus.get("processing")?.last_updated_at || jobsByStatus.get("retry")?.last_updated_at || catalog?.last_checked_at || null,
+    },
+  }, 200);
+});
+
+app.get("/panel-api/catalog-enrichment-queue", async (c) => {
+  await requireAdminSession(c);
+  const requestedStatus = String(c.req.query("status") || "missing").trim();
+  const status = ["missing", "processing", "pending", "retry", "paused", "failed"].includes(requestedStatus) ? requestedStatus : "missing";
+  const page = Math.max(1, Math.min(10_000, Math.trunc(Number(c.req.query("page")) || 1)));
+  const requestedLimit = Math.trunc(Number(c.req.query("limit")) || 50);
+  const limit = [10, 50, 100, 500].includes(requestedLimit) ? requestedLimit : 50;
+  const filters = ["(m.release_date IS NULL OR trim(m.release_date) = '')"];
+  const values: Array<string | number> = [];
+  if (status !== "missing") {
+    filters.push("j.status = ?");
+    values.push(status);
+  }
+  const where = filters.join(" AND ");
+  const [count, rows] = await Promise.all([
+    c.env.merlin_db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM catalog_enrichment_jobs j
+      JOIN catalog_game_metadata m ON m.app_id = j.app_id
+      WHERE ${where}
+    `).bind(...values).first<{ total: number }>(),
+    c.env.merlin_db.prepare(`
+      SELECT g.app_id, g.name, m.category, j.status, j.attempts,
+        j.next_attempt_at, j.locked_until, j.updated_at
+      FROM catalog_enrichment_jobs j
+      JOIN catalog_games g ON g.app_id = j.app_id
+      JOIN catalog_game_metadata m ON m.app_id = j.app_id
+      WHERE ${where}
+      ORDER BY CASE j.status WHEN 'processing' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+        j.updated_at DESC, g.name COLLATE NOCASE ASC
+      LIMIT ? OFFSET ?
+    `).bind(...values, limit, (page - 1) * limit).all<{
+      app_id: string; name: string; category: string; status: string;
+      attempts: number; next_attempt_at: string; locked_until: string | null; updated_at: string;
+    }>(),
+  ]);
+
+  return c.json({
+    success: true,
+    queue: {
+      status,
+      page,
+      limit,
+      total: Number(count?.total || 0),
+      items: (rows.results || []).map((row) => ({
+        appId: row.app_id,
+        name: row.name,
+        category: row.category,
+        status: row.status,
+        attempts: Number(row.attempts || 0),
+        nextAttemptAt: row.next_attempt_at,
+        lockedUntil: row.locked_until,
+        updatedAt: row.updated_at,
+      })),
+    },
+  }, 200);
+});
+
+app.put("/panel-api/catalog-enrichment-settings", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = parseBody(catalogEnrichmentQueueSettingsSchema, await c.req.json());
+  const updatedAt = new Date().toISOString();
+  await c.env.merlin_db.prepare(`
+    INSERT INTO catalog_enrichment_settings (id, paused, updated_at)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET paused = excluded.paused, updated_at = excluded.updated_at
+  `).bind(Number(body.paused), updatedAt).run();
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: body.paused ? "catalog_enrichment_queue_paused" : "catalog_enrichment_queue_resumed",
+    entityType: "catalog_enrichment_queue",
+    entityId: "global",
+    metadata: { paused: body.paused },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true, settings: { paused: body.paused, updatedAt } }, 200);
+});
+
+app.post("/panel-api/catalog-enrichment-queue/:appId/action", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const appId = String(c.req.param("appId") || "").trim();
+  if (!/^\d+$/.test(appId)) throw new HTTPException(400, { message: "Invalid appId" });
+  const body = parseBody(catalogEnrichmentJobActionSchema, await c.req.json());
+  const now = new Date().toISOString();
+
+  let result;
+  if (body.action === "delete") {
+    result = await c.env.merlin_db.prepare("DELETE FROM catalog_enrichment_jobs WHERE app_id = ?").bind(appId).run();
+  } else if (body.action === "pause") {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'paused', locked_until = NULL, updated_at = ?
+      WHERE app_id = ? AND status NOT IN ('completed', 'failed')
+    `).bind(now, appId).run();
+  } else if (body.action === "resume") {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'pending', next_attempt_at = ?, locked_until = NULL, updated_at = ?
+      WHERE app_id = ? AND status = 'paused'
+    `).bind(now, now, appId).run();
+  } else {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'pending', attempts = 0, next_attempt_at = ?, locked_until = NULL, updated_at = ?
+      WHERE app_id = ? AND status = 'failed'
+    `).bind(now, now, appId).run();
+  }
+  if (!result.meta.changes) throw new HTTPException(404, { message: "Catalog job not found or cannot be changed" });
+
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: `catalog_enrichment_job_${body.action}`,
+    entityType: "catalog_enrichment_job",
+    entityId: appId,
+    metadata: { action: body.action },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true, appId, action: body.action }, 200);
+});
+
+app.post("/panel-api/catalog-enrichment-queue/actions", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = parseBody(catalogEnrichmentBulkActionSchema, await c.req.json());
+  const appIds = [...new Set(body.appIds)];
+  const appIdsJson = JSON.stringify(appIds);
+  const now = new Date().toISOString();
+  const selectedJobs = "app_id IN (SELECT value FROM json_each(?))";
+  let result;
+  if (body.action === "delete") {
+    result = await c.env.merlin_db.prepare(`DELETE FROM catalog_enrichment_jobs WHERE ${selectedJobs}`).bind(appIdsJson).run();
+  } else if (body.action === "pause") {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'paused', locked_until = NULL, updated_at = ?
+      WHERE ${selectedJobs} AND status NOT IN ('completed', 'failed')
+    `).bind(now, appIdsJson).run();
+  } else if (body.action === "resume") {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'pending', next_attempt_at = ?, locked_until = NULL, updated_at = ?
+      WHERE ${selectedJobs} AND status = 'paused'
+    `).bind(now, now, appIdsJson).run();
+  } else {
+    result = await c.env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'pending', attempts = 0, next_attempt_at = ?, locked_until = NULL, updated_at = ?
+      WHERE ${selectedJobs} AND status = 'failed'
+    `).bind(now, now, appIdsJson).run();
+  }
+  const changed = Number(result.meta.changes || 0);
+
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: `catalog_enrichment_jobs_${body.action}`,
+    entityType: "catalog_enrichment_job",
+    entityId: "bulk",
+    metadata: { action: body.action, requested: appIds.length, changed, sampleAppIds: appIds.slice(0, 20) },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true, action: body.action, changed }, 200);
+});
+
 app.get("/panel-api/launcher-update-policy-settings", async (c) => {
   await requireAdminSession(c);
   return c.json({ success: true, settings: await getLauncherUpdatePolicySettings(c) }, 200);
@@ -2597,7 +2827,10 @@ app.post("/api/public/access/identify", async (c) => {
 });
 
 app.post("/api/public/access/launcher-handoff", async (c) => {
-  const license = await requireLauncherLicense(c);
+  // The handoff only establishes the public account session. It must also work
+  // for an expired license so the launcher opens the matching billing account;
+  // revoked licenses and every privileged launcher operation stay blocked.
+  const license = await requireLauncherSearchLicense(c);
   await enforcePublicAccessKeyRateLimit(c, `launcher-handoff:${license.id}`);
   const handoff = await createLauncherAccessHandoff(c, license.id);
   return c.json({ success: true, ...handoff }, 201);
@@ -2660,6 +2893,61 @@ app.post("/api/public/access/session/billing-portal", async (c) => {
   return c.json({ success: true, ...portal }, 200);
 });
 
+app.post("/panel-api/payments/checkouts/:sessionId/sync-mercadopago", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const sessionId = c.req.param("sessionId");
+  const result = await reconcileMercadoPagoCheckout(c, sessionId);
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "payment_checkout_synced",
+    entityType: "checkout",
+    entityId: sessionId,
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+    metadata: { provider: "mercadopago", sessionId, ...result },
+  });
+  return c.json({ success: true, result }, 200);
+});
+
+app.post("/api/public/access/session/renewal/pix", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const body = parseBody(z.object({
+    mercadoPagoDeviceId: mercadoPagoDeviceIdSchema.optional(),
+    planType: z.enum(["monthly", "annual"]).optional(),
+    planTier: planTierSchema.optional(),
+  }), await c.req.json());
+  const license = await getLicense(c, session.session.license_id);
+  if (!isEligibleForExpiredPixRenewal(license)) {
+    throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix." });
+  }
+  const result = await createPublicPixOrder(c, {
+    name: license.name,
+    contact: license.contact,
+    recoveryPin: "",
+    acceptedRecoveryNotice: true,
+    // An expired Pix license may choose its next recurring plan. Active Pix
+    // access never reaches this endpoint, so this cannot alter a live term.
+    planType: body.planType || (license.access_type === "annual_subscription" ? "annual" : "monthly"),
+    planTier: body.planTier || normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
+    mercadoPagoDeviceId: body.mercadoPagoDeviceId,
+  }, { reactivationLicenseId: license.id });
+  return c.json({ success: true, ...result }, 201);
+});
+
+app.post("/api/public/access/session/renewal/card", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const license = await getLicense(c, session.session.license_id);
+  const result = await createExpiredCardRenewalCheckout(c, license);
+  return c.json({ success: true, ...result }, 201);
+});
+
+app.post("/api/public/access/renewal/card", async (c) => {
+  const body = parseBody(publicAccessMeSchema, await c.req.json());
+  const { license } = await validatePublicAccessCredentials(c, body);
+  const result = await createExpiredCardRenewalCheckout(c, license);
+  return c.json({ success: true, ...result }, 201);
+});
+
 app.post("/api/public/access/plan-change/preview", async (c) => {
   const body = parseBody(publicAccessMeSchema.merge(subscriptionPlanChangeSchema), await c.req.json());
   const planChange = await previewPublicAccessPlanChange(c, body);
@@ -2695,7 +2983,7 @@ app.post("/panel-api/licenses/:id/plan-change/cancel", async (c) => {
 });
 
 app.get("/api/premium/catalog", async (c) => {
-  const license = await requireAuthenticatedPremiumLicense(c);
+  const license = await requireReadablePremiumLicense(c);
   const games = await listPremiumCatalog(c, license.id);
 
   return c.json({

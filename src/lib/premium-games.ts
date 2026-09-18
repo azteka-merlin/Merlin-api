@@ -1,6 +1,6 @@
 import { HTTPException } from "hono/http-exception";
 import { assertPremiumActivationLimit } from "./license-activation-limits";
-import { requireLauncherLicense } from "./launcher-auth";
+import { requireLauncherLicense, requireLauncherSearchLicense } from "./launcher-auth";
 import {
   PLAN_RULES,
   PLAN_TIERS,
@@ -882,6 +882,13 @@ export async function cleanupPremiumActivations(c: AppContext, now = new Date())
 
 export async function requireAuthenticatedPremiumLicense(c: AppContext): Promise<AuthenticatedPremiumLicense> {
   return requireLauncherLicense(c);
+}
+
+// Browsing the premium catalog is read-only. Keep it available to an expired
+// license so the launcher can show what access will be restored after renewal.
+// Reservations, downloads and activations continue using the strict helper.
+export async function requireReadablePremiumLicense(c: AppContext): Promise<AuthenticatedPremiumLicense> {
+  return requireLauncherSearchLicense(c);
 }
 
 export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {

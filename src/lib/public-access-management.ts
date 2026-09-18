@@ -267,11 +267,14 @@ async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, 
     && planEnabled
     && Boolean(price?.active)
     && Boolean(priceId);
+  const pixOnlyRenewal = !license.stripe_customer_id
+    && !license.stripe_subscription_id
+    && String(license.source || "").toLowerCase().includes("mercadopago");
 
   return {
     available,
-    card: available,
-    pix: available && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled,
+    card: available && !pixOnlyRenewal,
+    pix: available && pixOnlyRenewal && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled,
     price: available ? mapPrice(price) : null,
   };
 }
@@ -327,6 +330,10 @@ function mapAccessPayload(
         status: subscription?.status || license.billing_status || "active",
         currentPeriodEnd: toDateOnly(currentPeriodEnd),
         cancelAtPeriodEnd,
+        // Payment origin must remain stable after expiration. `canManage` is
+        // intentionally false for expired access, but that does not turn a
+        // Stripe subscription into a Pix purchase in the client UI.
+        paymentMethod: license.stripe_customer_id && license.stripe_subscription_id ? "card" : "pix",
         canManage: current && Boolean(license.stripe_customer_id && license.stripe_subscription_id),
       } : null,
       upgrade,

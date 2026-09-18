@@ -1,6 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
-import { requireLauncherLicense } from "../lib/launcher-auth";
+import { requireLauncherSearchLicense } from "../lib/launcher-auth";
 import { type AppContext, GameSearchRequest, GameSearchResponse } from "../types";
 
 type GameSearchEnv = {
@@ -736,7 +736,7 @@ export class GamesSearchRoute extends OpenAPIRoute {
 				},
 			},
 			"401": {
-				description: "Missing, invalid or expired access token",
+				description: "Missing, invalid or revoked access token",
 			},
 			"502": {
 				description: "Could not load search results from any source",
@@ -745,8 +745,8 @@ export class GamesSearchRoute extends OpenAPIRoute {
 	};
 
 	async handle(c: AppContext) {
-		await requireLauncherLicense(c);
 		const data = await this.getValidatedData<typeof this.schema>();
+		await requireLauncherSearchLicense(c);
 		const searchTerm = data.body.searchTerm.trim();
 		const limit = data.body.limit;
 		const env = c.env as Env & GameSearchEnv;

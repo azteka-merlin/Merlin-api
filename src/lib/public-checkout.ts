@@ -380,9 +380,10 @@ async function createStripeCheckoutSession(
     email: string;
   planType: BillingPlanType;
   planTier: PlanTier | null;
-  priceId: string;
+    priceId: string;
     idempotencyKey: string;
     trialDays?: number | null;
+    returnToMyAccess?: boolean;
   },
 ) {
   const origin = getPublicAppOrigin(c);
@@ -397,8 +398,18 @@ async function createStripeCheckoutSession(
   if (isStagingAdaptivePricingEnabled(c)) {
     params.set("adaptive_pricing[enabled]", "true");
   }
-  params.set("success_url", `${origin}/download?checkout=success&session_id={CHECKOUT_SESSION_ID}`);
-  params.set("cancel_url", `${origin}/download?checkout=cancel`);
+  params.set(
+    "success_url",
+    input.returnToMyAccess
+      ? `${origin}/meu-acesso?access=renewal-return&session_id={CHECKOUT_SESSION_ID}`
+      : `${origin}/download?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+  );
+  params.set(
+    "cancel_url",
+    input.returnToMyAccess
+      ? `${origin}/meu-acesso?access=renewal-cancel`
+      : `${origin}/download?checkout=cancel`,
+  );
   params.set("expires_at", String(Math.floor(Date.now() / 1000) + CHECKOUT_SESSION_TTL_SECONDS));
   params.set("metadata[merlin_customer_id]", String(input.customerId));
   params.set("metadata[plan_type]", input.planType);
@@ -444,7 +455,11 @@ function buildCheckoutIdempotencyKey(input: {
   ].join(":");
 }
 
-export async function createPublicStripeCheckout(c: AppContext, input: PublicCheckoutInput) {
+type TrustedRenewalOptions = {
+  reactivationLicenseId: number;
+};
+
+export async function createPublicStripeCheckout(c: AppContext, input: PublicCheckoutInput, trustedRenewal?: TrustedRenewalOptions) {
   const billing = await getBillingSettings(c);
   if (!billing.publicSignupEnabled) {
     throw new HTTPException(403, { message: "Cadastro publico esta desativado." });
@@ -466,6 +481,9 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
 
   const email = normalizeEmail(input.contact);
   const existingLicense = await findLicenseByEmailContact(c, email);
+  if (trustedRenewal && existingLicense?.id !== trustedRenewal.reactivationLicenseId) {
+    throw new HTTPException(403, { message: "Acesso de renovacao invalido." });
+  }
   const reactivationLicenseId = existingLicense && canPayAgain(existingLicense) ? existingLicense.id : null;
   if (existingLicense && !reactivationLicenseId) {
     if (isActiveSubscriptionCancelingAtPeriodEnd(existingLicense)) {
@@ -478,7 +496,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   }
 
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
-  if (!recoveryPin) {
+  if (!trustedRenewal && !recoveryPin) {
     throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
 
@@ -503,7 +521,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     throw new HTTPException(400, { message: "Plano indisponivel." });
   }
 
-  const verificationId = await assertRecentPublicEmailVerification(c, email);
+  const verificationId = trustedRenewal ? null : await assertRecentPublicEmailVerification(c, email);
   const price = await getStripePriceSnapshot(c, priceId, { forceRefresh: true, allowStaleOnError: false });
   assertBillingPlanPrice(input.planType, price);
   if (!price) {
@@ -517,7 +535,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const pendingCheckout = await findPendingCheckout(c, customer.id);
   const checkoutPlanTier = billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null;
   if (pendingCheckout && isReusableCheckout(pendingCheckout, input.planType, checkoutPlanTier, reactivationLicenseId) && pendingCheckout.provider_session_url) {
-    await consumePublicEmailVerification(c, verificationId);
+    if (verificationId) await consumePublicEmailVerification(c, verificationId);
     return {
       checkoutUrl: pendingCheckout.provider_session_url,
       checkoutSessionId: pendingCheckout.provider_session_id,
@@ -544,7 +562,10 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     reactivationLicenseId,
   });
   const licenseKey = reactivationLicenseId ? existingLicense?.license_key || "" : generateLicenseKey();
-  const recoveryPinHash = await hashRecoveryPin(c, { licenseKey, recoveryPin });
+  const recoveryPinHash = trustedRenewal
+    ? existingLicense?.recovery_pin_hash || null
+    : await hashRecoveryPin(c, { licenseKey, recoveryPin: recoveryPin || "" });
+  if (!recoveryPinHash) throw new HTTPException(409, { message: "Esta licenca nao possui um PIN de recuperacao." });
   const cardTrialDays = input.planType === "monthly" && !reactivationLicenseId && billing.monthlyCardTrialEnabled
     ? billing.monthlyCardTrialDays
     : null;
@@ -557,6 +578,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     priceId,
     idempotencyKey,
     trialDays: cardTrialDays,
+    returnToMyAccess: Boolean(trustedRenewal),
   });
   const expiresAt = stripeTimestampToIso(session.expires_at);
   const checkoutIp = getClientIp(c);
@@ -637,7 +659,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     if (!existingCheckout?.provider_session_url) {
       throw error;
     }
-    await consumePublicEmailVerification(c, verificationId);
+    if (verificationId) await consumePublicEmailVerification(c, verificationId);
     return {
       checkoutUrl: existingCheckout.provider_session_url,
       checkoutSessionId: existingCheckout.provider_session_id,
@@ -645,7 +667,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     };
   }
 
-  await consumePublicEmailVerification(c, verificationId);
+  if (verificationId) await consumePublicEmailVerification(c, verificationId);
 
   return {
     checkoutUrl: session.url,

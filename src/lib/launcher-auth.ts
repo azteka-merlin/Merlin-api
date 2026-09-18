@@ -16,7 +16,7 @@ type LicenseLookup = {
 	name: string;
 	hwid: string | null;
 	expires_at: string;
-	status: "active" | "revoked";
+	status: "active" | "revoked" | "expired";
 };
 
 export function parseBearerToken(request: Request): string | null {
@@ -57,16 +57,15 @@ export async function requireLauncherLicense(c: AppContext): Promise<LauncherLic
 	if (!license) {
 		throw new HTTPException(401, { message: "License not found" });
 	}
+	const expiresAt = new Date(license.expires_at);
+	if (license.status === "expired" || Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
+		throw new HTTPException(401, { message: "License expired" });
+	}
 	if (license.status !== "active") {
 		throw new HTTPException(401, { message: "License is not active" });
 	}
 	if (!license.hwid || license.hwid !== payload.hwid) {
 		throw new HTTPException(401, { message: "HWID mismatch" });
-	}
-
-	const expiresAt = new Date(license.expires_at);
-	if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-		throw new HTTPException(401, { message: "License expired" });
 	}
 
 	return {
@@ -76,4 +75,31 @@ export async function requireLauncherLicense(c: AppContext): Promise<LauncherLic
 		hwid: license.hwid,
 		expiresAt: license.expires_at,
 	};
+}
+
+// Read-only launcher/account actions may identify an expired license, but every
+// activation, manifest and download continues to use requireLauncherLicense.
+export async function requireLauncherSearchLicense(c: AppContext): Promise<LauncherLicense> {
+	const accessToken = parseBearerToken(c.req.raw);
+	if (!accessToken) throw new HTTPException(401, { message: "Missing access token" });
+	if (!c.env.JWT_SECRET) throw new HTTPException(500, { message: "JWT secret is not configured" });
+
+	const payload = await verifyAccessToken(accessToken, c.env.JWT_SECRET);
+	if (payload.exp <= Math.floor(Date.now() / 1000)) {
+		throw new HTTPException(401, { message: "Access token expired" });
+	}
+
+	const license = await c.env.merlin_db
+		.prepare("SELECT id, license_key, name, hwid, expires_at, status FROM licenses WHERE id = ? LIMIT 1")
+		.bind(payload.sub)
+		.first<LicenseLookup>();
+	if (!license) throw new HTTPException(401, { message: "License not found" });
+	if (license.status !== "active" && license.status !== "expired") {
+		throw new HTTPException(401, { message: "License is not active" });
+	}
+	if (!license.hwid || license.hwid !== payload.hwid) {
+		throw new HTTPException(401, { message: "HWID mismatch" });
+	}
+
+	return { id: license.id, licenseKey: license.license_key, name: license.name, hwid: license.hwid, expiresAt: license.expires_at };
 }

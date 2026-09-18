@@ -1,6 +1,6 @@
 import type { AppContext } from "../types";
 
-export const MANIFEST_PRIMARY_SOURCES = ["depotbox", "ryuu"] as const;
+export const MANIFEST_PRIMARY_SOURCES = ["depotbox", "ryuu", "contrary"] as const;
 
 export type ManifestPrimarySource = (typeof MANIFEST_PRIMARY_SOURCES)[number];
 
@@ -12,12 +12,14 @@ type ManifestSourceSettingsRow = {
 };
 
 function normalizePrimarySource(value: unknown): ManifestPrimarySource {
-  return value === "ryuu" ? "ryuu" : DEFAULT_MANIFEST_PRIMARY_SOURCE;
+	return MANIFEST_PRIMARY_SOURCES.includes(value as ManifestPrimarySource)
+		? value as ManifestPrimarySource
+		: DEFAULT_MANIFEST_PRIMARY_SOURCE;
 }
 
 export function manifestPrimarySourceOrder(value: unknown): ManifestPrimarySource[] {
-  const primarySource = normalizePrimarySource(value);
-  return primarySource === "ryuu" ? ["ryuu", "depotbox"] : ["depotbox", "ryuu"];
+	const primarySource = normalizePrimarySource(value);
+	return [primarySource, ...MANIFEST_PRIMARY_SOURCES.filter((source) => source !== primarySource)];
 }
 
 export async function getManifestSourceSettings(c: AppContext) {

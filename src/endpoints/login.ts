@@ -118,13 +118,10 @@ export class LoginRoute extends OpenAPIRoute {
 			throw new HTTPException(401, { message: "Invalid license key" });
 		}
 
-		if (license.status !== "active") {
-			throw new HTTPException(401, { message: "License is not active" });
-		}
-
 		const expiresAt = new Date(license.expires_at);
-		if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < now.getTime()) {
-			throw new HTTPException(401, { message: "License expired" });
+		const expired = license.status === "expired" || Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < now.getTime();
+		if (license.status !== "active" && !expired) {
+			throw new HTTPException(401, { message: "License is not active" });
 		}
 
 		let effectiveHwid = license.hwid;
@@ -188,7 +185,7 @@ export class LoginRoute extends OpenAPIRoute {
 				license: {
 					name: license.name,
 					expiresAt: toDateOnly(license.expires_at),
-					status: license.status,
+					status: expired ? "expired" : license.status,
 					planTier: license.plan_tier || "ouro",
 					billing: {
 						accessType: license.access_type || "free",

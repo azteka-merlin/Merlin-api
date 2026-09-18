@@ -14,6 +14,7 @@ import { getBillingPlanPrice } from "./subscription-plan-change";
 const PROVIDER_MP = "mercadopago";
 const PIX_MODE = "pix";
 const CHECKOUT_SESSION_TTL_SECONDS = 30 * 60;
+const STAGING_TEST_PIX_AUTO_APPROVAL_DELAY_MS = 5_000;
 const MAX_USER_AGENT_LENGTH = 500;
 const MP_SIGNATURE_TOLERANCE_SECONDS = 300;
 export const MERCADO_PAGO_DEVICE_ID_MAX_LENGTH = 1024;
@@ -40,6 +41,7 @@ type PixCheckoutRow = {
   provider_ticket_url: string | null;
   provider_raw_status: string | null;
   provider_status_detail: string | null;
+  provider_environment: string | null;
   provider_session_expires_at: string | null;
   plan_type: BillingPlanType;
   mode: string;
@@ -411,6 +413,52 @@ function mapProviderStatus(order: MercadoPagoOrder, checkout?: Pick<PixCheckoutR
   return "awaiting_payment" as const;
 }
 
+/**
+ * Mercado Pago's Orders sandbox is documented to settle the APRO Pix scenario
+ * automatically. It has, however, intermittently left those test-only orders
+ * in waiting_transfer. Keep staging deterministic without changing the real
+ * provider flow: production can never satisfy these conditions.
+ */
+export function shouldAutoApproveStagingTestPix(input: {
+  appEnvironment: string | null | undefined;
+  pixEnvironment: string | null | undefined;
+  providerEnvironment: string | null | undefined;
+  providerStatus: string | null | undefined;
+  providerStatusDetail: string | null | undefined;
+  expiresAt: string | null | undefined;
+  nowMs?: number;
+}) {
+  if (
+    String(input.appEnvironment || "").trim().toLowerCase() !== "staging"
+    || String(input.pixEnvironment || "").trim().toLowerCase() !== "test"
+    || String(input.providerEnvironment || "").trim().toLowerCase() !== "test"
+    || String(input.providerStatus || "").trim().toLowerCase() !== "action_required"
+    || String(input.providerStatusDetail || "").trim().toLowerCase() !== "waiting_transfer"
+  ) return false;
+
+  const expiresAtMs = new Date(String(input.expiresAt || "")).getTime();
+  if (!Number.isFinite(expiresAtMs)) return false;
+  const nowMs = input.nowMs ?? Date.now();
+  const createdAtMs = expiresAtMs - CHECKOUT_SESSION_TTL_SECONDS * 1_000;
+  return nowMs >= createdAtMs + STAGING_TEST_PIX_AUTO_APPROVAL_DELAY_MS && nowMs < expiresAtMs;
+}
+
+function approvedStagingTestOrder(order: MercadoPagoOrder): MercadoPagoOrder {
+  const transactions = getObject(order.transactions) || {};
+  const payments = arrayOfObjects(transactions.payments);
+  return {
+    ...order,
+    status: "processed",
+    status_detail: "accredited",
+    transactions: {
+      ...transactions,
+      payments: payments.map((payment, index) => index === 0
+        ? { ...payment, status: "processed", status_detail: "accredited" }
+        : payment),
+    },
+  };
+}
+
 function mercadoPagoApiError(payload: unknown, fallback: string) {
   const object = getObject(payload);
   const cause = Array.isArray(object?.cause) ? object.cause.map((item) => {
@@ -593,7 +641,7 @@ async function findPendingPixCheckout(c: AppContext, customerId: number) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE customer_id = ?
@@ -643,7 +691,7 @@ async function getPixCheckoutByReference(c: AppContext, reference: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE provider = ?
@@ -652,6 +700,23 @@ async function getPixCheckoutByReference(c: AppContext, reference: string) {
       `,
     )
     .bind(PROVIDER_MP, reference)
+    .first<PixCheckoutRow>();
+}
+
+async function getPixCheckoutBySessionId(c: AppContext, sessionId: string) {
+  return c.env.merlin_db
+    .prepare(
+      `
+        SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
+          provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, pending_license_key,
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
+        FROM checkout_sessions
+        WHERE provider = ? AND provider_session_id = ?
+        LIMIT 1
+      `,
+    )
+    .bind(PROVIDER_MP, sessionId)
     .first<PixCheckoutRow>();
 }
 
@@ -1026,7 +1091,15 @@ async function refreshPixCheckoutStatus(c: AppContext, checkout: PixCheckoutRow)
     return checkout;
   }
 
-  const order = await getMercadoPagoOrder(c, checkout.provider_session_id);
+  const providerOrder = await getMercadoPagoOrder(c, checkout.provider_session_id);
+  const order = shouldAutoApproveStagingTestPix({
+    appEnvironment: c.env.ENVIRONMENT,
+    pixEnvironment: c.env.PIX_ENV,
+    providerEnvironment: checkout.provider_environment,
+    providerStatus: getOrderStatus(providerOrder),
+    providerStatusDetail: getOrderStatusDetail(providerOrder),
+    expiresAt: checkout.provider_session_expires_at,
+  }) ? approvedStagingTestOrder(providerOrder) : providerOrder;
   const mappedStatus = mapProviderStatus(order, checkout);
   if (mappedStatus === "paid") {
     await applyPaidPixOrder(c, checkout, order);
@@ -1036,7 +1109,37 @@ async function refreshPixCheckoutStatus(c: AppContext, checkout: PixCheckoutRow)
   return getPixCheckoutByReference(c, checkout.provider_external_reference || checkout.provider_session_id);
 }
 
-export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderInput) {
+// Admin reconciliation uses the provider as the source of truth. It never
+// marks a checkout as paid from an admin action or a customer receipt.
+export async function reconcileMercadoPagoCheckout(c: AppContext, sessionId: string) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!/^ORD[A-Z0-9]+$/i.test(normalizedSessionId)) {
+    throw new HTTPException(400, { message: "Checkout Mercado Pago invalido." });
+  }
+  const checkout = await getPixCheckoutBySessionId(c, normalizedSessionId);
+  if (!checkout) {
+    throw new HTTPException(404, { message: "Checkout Mercado Pago nao encontrado." });
+  }
+
+  const updated = await refreshPixCheckoutStatus(c, checkout);
+  if (!updated) {
+    throw new HTTPException(404, { message: "Checkout Mercado Pago nao encontrado." });
+  }
+  return {
+    checkoutId: updated.id,
+    paymentStatus: updated.payment_status || updated.status,
+    providerStatus: updated.provider_raw_status,
+    providerStatusDetail: updated.provider_status_detail,
+    processed: Boolean(updated.processed_at || updated.license_id),
+    licenseId: updated.license_id || null,
+  };
+}
+
+type TrustedRenewalOptions = {
+  reactivationLicenseId: number;
+};
+
+export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderInput, trustedRenewal?: TrustedRenewalOptions) {
   assertPixAvailable(c);
   const runtimeEnvironment = getMercadoPagoRuntimeEnvironment(c);
   if (!runtimeEnvironment) {
@@ -1066,6 +1169,9 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const email = normalizeEmail(input.contact);
   const existingLicense = await findLicenseByEmailContact(c, email);
+  if (trustedRenewal && existingLicense?.id !== trustedRenewal.reactivationLicenseId) {
+    throw new HTTPException(403, { message: "Acesso de renovacao invalido." });
+  }
   const reactivationLicenseId = existingLicense && canPayAgain(existingLicense) ? existingLicense.id : null;
   if (existingLicense && !reactivationLicenseId) {
     if (existingLicense.status === "revoked") {
@@ -1075,7 +1181,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   }
 
   const recoveryPin = normalizeRecoveryPin(input.recoveryPin);
-  if (!recoveryPin) {
+  if (!trustedRenewal && !recoveryPin) {
     throw new HTTPException(400, { message: RECOVERY_SECRET_DESCRIPTION });
   }
   const mercadoPagoDeviceId = normalizeMercadoPagoDeviceId(input.mercadoPagoDeviceId);
@@ -1112,7 +1218,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     throw new HTTPException(400, { message: "Pix indisponivel para este plano." });
   }
 
-  const verificationId = await assertRecentPublicEmailVerification(c, email);
+  const verificationId = trustedRenewal ? null : await assertRecentPublicEmailVerification(c, email);
   const price: { amountCents: number; currency: string } | null = tierPrice
     ? {
       amountCents: tierPrice.amount_cents ?? 0,
@@ -1150,7 +1256,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
         reactivationLicenseId,
       )
     ) {
-      await consumePublicEmailVerification(c, verificationId);
+      if (verificationId) await consumePublicEmailVerification(c, verificationId);
       return {
         ...publicPixPayload(pendingCheckout),
         reused: true,
@@ -1162,7 +1268,10 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   const externalReference = `mpix_${crypto.randomUUID()}`;
   const idempotencyKey = `merlin_pix:${externalReference}`;
   const licenseKey = reactivationLicenseId ? existingLicense?.license_key || "" : generateLicenseKey();
-  const recoveryPinHash = await hashRecoveryPin(c, { licenseKey, recoveryPin });
+  const recoveryPinHash = trustedRenewal
+    ? existingLicense?.recovery_pin_hash || null
+    : await hashRecoveryPin(c, { licenseKey, recoveryPin: recoveryPin || "" });
+  if (!recoveryPinHash) throw new HTTPException(409, { message: "Esta licenca nao possui um PIN de recuperacao." });
   const checkoutEvidence = buildCheckoutEvidence({
     emailVerifiedAt,
     planType: input.planType,
@@ -1238,7 +1347,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     throw error;
   }
   checkout = await updateCheckoutFromOrder(c, checkout, order) || checkout;
-  await consumePublicEmailVerification(c, verificationId);
+  if (verificationId) await consumePublicEmailVerification(c, verificationId);
 
   return {
     ...publicPixPayload(checkout),

@@ -208,14 +208,9 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 		};
 	}
 
-	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
-		const source = sourceName === "depotbox" ? depotboxSource : ryuuSource;
-		if (source) sources.push(source);
-	}
-
 	const contraryApiKey = env.CONTRARY_CDN_API_KEY?.trim();
-	if (contraryApiKey) {
-		sources.push({
+	const contrarySource = contraryApiKey
+		? {
 			name: "contrarycdn",
 			url: `${CONTRARY_MANIFEST_URL}/${encodeURIComponent(appId)}`,
 			init: {
@@ -226,7 +221,17 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 			},
 			maxAttempts: 1,
 			timeoutMs: CONTRARY_SOURCE_TIMEOUT_MS,
-		});
+		}
+		: null;
+
+	const primarySources = {
+		depotbox: depotboxSource,
+		ryuu: ryuuSource,
+		contrary: contrarySource,
+	};
+	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
+		const source = primarySources[sourceName];
+		if (source) sources.push(source);
 	}
 
 	if (env.HUBCAP_TOKEN) {

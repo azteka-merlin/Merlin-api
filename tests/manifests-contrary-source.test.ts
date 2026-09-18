@@ -35,4 +35,15 @@ describe("ContraryCDN manifest source", () => {
     const sources = createSources("271590", {}, "depotbox");
     expect(sources.some((source) => source.name === "contrarycdn")).toBe(false);
   });
+
+  test("puts Contrary first when it is selected in settings", () => {
+    const sources = createSources("271590", {
+      CONTRARY_CDN_API_KEY: "test-contrary-key",
+      DEPOTBOX_API_KEY: "test-depotbox-key",
+      RYU_API_URL: "https://generator.example.test/manifest",
+      RYUU_AUTH_CODE: "test-ryuu-code",
+    }, "contrary");
+
+    expect(sources.slice(0, 3).map((source) => source.name)).toEqual(["contrarycdn", "depotbox", "ryu"]);
+  });
 });

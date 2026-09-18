@@ -21,7 +21,7 @@ if (!/^https:\/\/staging\./.test(TEST_BASE_URL) && !/^https:\/\/localhost[:/]/.t
 function usage() {
   console.error([
     "Usage:",
-    "  STRIPE_SECRET_KEY=sk_test_... node scripts/stripe-test-clock-renewal.mjs prepare",
+    "  STRIPE_SECRET_KEY=sk_test_... STRIPE_TEST_PAYMENT_METHOD=pm_... node scripts/stripe-test-clock-renewal.mjs prepare",
     "  STRIPE_SECRET_KEY=sk_test_... node scripts/stripe-test-clock-renewal.mjs status <email>",
     "  STRIPE_SECRET_KEY=sk_test_... node scripts/stripe-test-clock-renewal.mjs advance <email>",
     "  STRIPE_SECRET_KEY=sk_test_... node scripts/stripe-test-clock-renewal.mjs tick <email> <hours>",
@@ -38,6 +38,15 @@ function requireStripeSecret() {
     exit(1);
   }
   return secret;
+}
+
+function requireTestPaymentMethod() {
+  const paymentMethod = String(env.STRIPE_TEST_PAYMENT_METHOD || "").trim();
+  if (!/^pm_[A-Za-z0-9_]+$/.test(paymentMethod)) {
+    console.error("STRIPE_TEST_PAYMENT_METHOD must be an existing Stripe test PaymentMethod ID.");
+    exit(1);
+  }
+  return paymentMethod;
 }
 
 function encodeBasicAuth(secret) {
@@ -123,13 +132,13 @@ async function createClock() {
   return stripeRequest("POST", "/test_helpers/test_clocks", params);
 }
 
-async function createClockCustomer(clock, email) {
+async function createClockCustomer(clock, email, paymentMethod) {
   const params = new URLSearchParams();
   params.set("email", email);
   params.set("name", "Merlin Renewal Test");
   params.set("test_clock", clock.id);
-  params.set("payment_method", "pm_card_visa");
-  params.set("invoice_settings[default_payment_method]", "pm_card_visa");
+  params.set("payment_method", paymentMethod);
+  params.set("invoice_settings[default_payment_method]", paymentMethod);
   params.set("metadata[merlin_test]", "renewal");
   params.set("metadata[merlin_environment]", TEST_ENV);
   return stripeRequest("POST", "/customers", params);
@@ -259,7 +268,7 @@ async function waitForClockReady(clockId) {
 async function prepare() {
   const email = `renewal-test-${Date.now()}@merlin.test`;
   const clock = await createClock();
-  const stripeCustomer = await createClockCustomer(clock, email);
+  const stripeCustomer = await createClockCustomer(clock, email, requireTestPaymentMethod());
   const customer = upsertStageCustomer(email, stripeCustomer.id);
   const checkout = await createCheckout(email);
   console.log(JSON.stringify({
@@ -269,7 +278,7 @@ async function prepare() {
     internalCustomerId: customer.id,
     checkoutSessionId: checkout.checkoutSessionId,
     checkoutUrl: checkout.checkoutUrl,
-    next: "Pague o checkout em stage com 4242 4242 4242 4242, validade futura e CVC qualquer. Depois rode status e advance.",
+    next: "Conclua o checkout de staging com um método de pagamento de teste configurado no Stripe. Depois rode status e advance.",
   }, null, 2));
 }
 

@@ -45,14 +45,28 @@ export class PublicCatalogConsultRoute extends OpenAPIRoute {
       const resolution = steam.get(body.appId);
       if (!resolution) throw new Error("No DRM result from configured sources");
 
+      const releaseDateRetryAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+
       await c.env.merlin_db.batch([
-        c.env.merlin_db.prepare("UPDATE catalog_game_metadata SET category = ?, denuvo = ?, drm_notice = ?, drm_source = ?, checked_at = ?, expires_at = ? WHERE app_id = ?")
-          .bind(resolution.category, resolution.denuvo, resolution.drmNotice, "steam", now, new Date(Date.now() + (resolution.denuvo ? 60 * 60_000 : 30 * 86_400_000)).toISOString(), body.appId),
-        c.env.merlin_db.prepare("UPDATE catalog_enrichment_jobs SET status = 'completed', locked_until = NULL, updated_at = ? WHERE app_id = ?").bind(now, body.appId),
+        c.env.merlin_db.prepare("UPDATE catalog_game_metadata SET category = ?, denuvo = ?, drm_notice = ?, drm_source = ?, release_date = ?, checked_at = ?, expires_at = ? WHERE app_id = ?")
+          .bind(resolution.category, resolution.denuvo, resolution.drmNotice, "steam", resolution.releaseDate, now, new Date(Date.now() + (resolution.denuvo ? 60 * 60_000 : 30 * 86_400_000)).toISOString(), body.appId),
+        c.env.merlin_db.prepare(`
+          UPDATE catalog_enrichment_jobs
+          SET status = CASE
+              WHEN ? IS NOT NULL THEN 'completed'
+              WHEN attempts + 1 >= 10 THEN 'failed'
+              ELSE 'retry'
+            END,
+            attempts = CASE WHEN ? IS NULL THEN attempts + 1 ELSE attempts END,
+            next_attempt_at = CASE WHEN ? IS NULL THEN ? ELSE next_attempt_at END,
+            locked_until = NULL,
+            updated_at = ?
+          WHERE app_id = ?
+        `).bind(resolution.releaseDate, resolution.releaseDate, resolution.releaseDate, releaseDateRetryAt, now, body.appId),
       ]);
       return c.json({ success: true, category: resolution.category, updated: true }, 200);
     } catch {
-      await c.env.merlin_db.prepare("UPDATE catalog_enrichment_jobs SET status = 'retry', attempts = attempts + 1, next_attempt_at = ?, locked_until = NULL, updated_at = ? WHERE app_id = ?")
+      await c.env.merlin_db.prepare("UPDATE catalog_enrichment_jobs SET status = CASE WHEN attempts + 1 >= 10 THEN 'failed' ELSE 'retry' END, attempts = attempts + 1, next_attempt_at = ?, locked_until = NULL, updated_at = ? WHERE app_id = ?")
         .bind(new Date(Date.now() + 15 * 60_000).toISOString(), now, body.appId).run();
       return c.json({ success: false, category: "reviewing", updated: false, error: "Could not confirm DRM from Steam" }, 503);
     }

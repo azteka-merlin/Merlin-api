@@ -8,6 +8,11 @@ type SteamAppDetails = {
     release_date?: { coming_soon?: boolean; date?: string };
   };
 };
+type SteamRawAppDetails = {
+  release_date?: number | string | null;
+  coming_soon?: boolean | 0 | 1;
+};
+
 export type DenuvoResolution = {
   appId: string;
   category: "premium" | "standard";
@@ -17,12 +22,18 @@ export type DenuvoResolution = {
 };
 
 const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
-const JOB_BATCH_SIZE = 25;
-const STEAM_REQUEST_INTERVAL_MS = 1_000;
-const DENUVO_REFRESH_LIMIT = 30;
-const RETRY_DELAY_MS = 15 * 60_000;
+const STEAMRAW_APP_URL = "https://steamraw.com/api/app";
+// Steam is deliberately queried at a conservative pace.  Scheduled Workers
+// can run in parallel with an on-demand catalog consultation, so keeping the
+// cron workload small prevents the shared egress IP from being rate-limited.
+const JOB_BATCH_SIZE = 8;
+const STEAM_REQUEST_INTERVAL_MS = 3_500;
+const DENUVO_REFRESH_LIMIT = 8;
+const RETRY_DELAY_MS = 30 * 60_000;
 const RELEASE_DATE_RETRY_DELAY_MS = 24 * 60 * 60_000;
+const MAX_JOB_ATTEMPTS = 10;
 let nextSteamRequestAt = 0;
+let nextSteamRawRequestAt = 0;
 
 function nowIso() {
   return new Date().toISOString();
@@ -34,6 +45,13 @@ function steamReleaseDate(value: unknown, comingSoon: unknown): string | null {
   // does not consistently accept until the presentation comma is removed.
   const timestamp = Date.parse(value.replace(/,/g, ""));
   return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function steamRawReleaseDate(value: unknown, comingSoon: unknown): string | null {
+  if (comingSoon === true || comingSoon === 1 || value === null || value === undefined || value === "") return null;
+  const timestamp = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+  return new Date(timestamp * 1_000).toISOString().slice(0, 10);
 }
 
 async function fetchSteamApp(appId: string): Promise<DenuvoResolution | null> {
@@ -63,6 +81,21 @@ async function fetchSteamApp(appId: string): Promise<DenuvoResolution | null> {
   };
 }
 
+async function fetchSteamRawReleaseDate(appId: string): Promise<string | null> {
+  const waitMs = Math.max(0, nextSteamRawRequestAt - Date.now());
+  nextSteamRawRequestAt = Math.max(nextSteamRawRequestAt, Date.now()) + STEAM_REQUEST_INTERVAL_MS;
+  if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+  const response = await fetch(`${STEAMRAW_APP_URL}/${encodeURIComponent(appId)}`, {
+    headers: { Accept: "application/json", "User-Agent": "Merlin/2.0" },
+  });
+  // A 404 means this old or removed app is not indexed by SteamRaw either.
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`steamraw returned HTTP ${response.status}`);
+  const details = await response.json() as SteamRawAppDetails;
+  return steamRawReleaseDate(details.release_date, details.coming_soon);
+}
+
 async function saveResolutions(env: Pick<AppBindings, "merlin_db">, resolutions: DenuvoResolution[], completeJobs: boolean) {
   if (!resolutions.length) return;
   const now = nowIso();
@@ -88,14 +121,36 @@ async function saveResolutions(env: Pick<AppBindings, "merlin_db">, resolutions:
     ...(completeJobs ? [
       env.merlin_db.prepare(`
         UPDATE catalog_enrichment_jobs
-        SET status = CASE WHEN ? IS NULL THEN 'retry' ELSE 'completed' END,
+        SET status = CASE
+            WHEN ? IS NOT NULL THEN 'completed'
+            WHEN attempts + 1 >= ? THEN 'failed'
+            ELSE 'retry'
+          END,
           attempts = CASE WHEN ? IS NULL THEN attempts + 1 ELSE attempts END,
           next_attempt_at = CASE WHEN ? IS NULL THEN ? ELSE next_attempt_at END,
           locked_until = NULL,
           updated_at = ?
         WHERE app_id = ?
-      `).bind(result.releaseDate, result.releaseDate, result.releaseDate, releaseDateRetryAt, now, result.appId),
+        `).bind(result.releaseDate, MAX_JOB_ATTEMPTS, result.releaseDate, result.releaseDate, releaseDateRetryAt, now, result.appId),
     ] : []),
+  ]));
+}
+
+async function saveSteamRawReleaseDates(env: Pick<AppBindings, "merlin_db">, releases: Map<string, string>) {
+  if (!releases.size) return;
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 30 * 86_400_000).toISOString();
+  await env.merlin_db.batch([...releases.entries()].flatMap(([appId, releaseDate]) => [
+    env.merlin_db.prepare(`
+      UPDATE catalog_game_metadata
+      SET release_date = ?, checked_at = ?, expires_at = ?
+      WHERE app_id = ? AND (release_date IS NULL OR trim(release_date) = '')
+    `).bind(releaseDate, now, expiresAt, appId),
+    env.merlin_db.prepare(`
+      UPDATE catalog_enrichment_jobs
+      SET status = 'completed', locked_until = NULL, updated_at = ?
+      WHERE app_id = ?
+    `).bind(now, appId),
   ]));
 }
 
@@ -105,9 +160,10 @@ async function retryJobs(env: Pick<AppBindings, "merlin_db">, jobs: Job[]) {
   const retryAt = new Date(Date.now() + RETRY_DELAY_MS).toISOString();
   await env.merlin_db.batch(jobs.map((job) => env.merlin_db.prepare(`
     UPDATE catalog_enrichment_jobs
-    SET status = 'retry', attempts = ?, next_attempt_at = ?, locked_until = NULL, updated_at = ?
+    SET status = CASE WHEN ? >= ? THEN 'failed' ELSE 'retry' END,
+      attempts = ?, next_attempt_at = ?, locked_until = NULL, updated_at = ?
     WHERE app_id = ?
-  `).bind(job.attempts + 1, retryAt, now, job.app_id)));
+  `).bind(job.attempts + 1, MAX_JOB_ATTEMPTS, job.attempts + 1, retryAt, now, job.app_id)));
 }
 
 export async function resolveDenuvoFromSteam(appIds: string[]): Promise<Map<string, DenuvoResolution>> {
@@ -124,7 +180,26 @@ export async function resolveDenuvoFromSteam(appIds: string[]): Promise<Map<stri
   return results;
 }
 
+async function resolveReleaseDatesFromSteamRaw(appIds: string[]): Promise<Map<string, string>> {
+  const uniqueIds = [...new Set(appIds.filter((appId) => /^\d+$/.test(appId)))];
+  const results = new Map<string, string>();
+  for (const appId of uniqueIds) {
+    try {
+      const releaseDate = await fetchSteamRawReleaseDate(appId);
+      if (releaseDate) results.set(appId, releaseDate);
+    } catch (error) {
+      console.warn("[catalog-enrichment] SteamRaw release date fallback failed:", error instanceof Error ? error.message : "unknown error");
+    }
+  }
+  return results;
+}
+
 export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">): Promise<void> {
+  const queueSettings = await env.merlin_db
+    .prepare("SELECT paused FROM catalog_enrichment_settings WHERE id = 1")
+    .first<{ paused: number }>();
+  if (Number(queueSettings?.paused || 0) === 1) return;
+
   const now = nowIso();
   const candidates = await env.merlin_db.prepare(`
     SELECT j.app_id, j.attempts FROM catalog_enrichment_jobs j
@@ -132,7 +207,7 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
     LEFT JOIN catalog_game_metadata m ON m.app_id = j.app_id
     LEFT JOIN premium_games p ON p.app_id = j.app_id AND p.enabled = 1
     WHERE (
-      (j.status IN ('pending', 'retry') AND j.next_attempt_at <= ?)
+      (j.status IN ('pending', 'retry') AND j.attempts < ? AND j.next_attempt_at <= ?)
       OR (j.status = 'processing' AND (j.locked_until IS NULL OR j.locked_until <= ?))
     )
     ORDER BY CASE
@@ -141,7 +216,7 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
       ELSE 2
     END,
       COALESCE(a.available_in_merlin, 0) DESC, p.updated_at DESC, j.next_attempt_at LIMIT ?
-  `).bind(now, now, JOB_BATCH_SIZE).all<Job>();
+  `).bind(MAX_JOB_ATTEMPTS, now, now, JOB_BATCH_SIZE).all<Job>();
 
   const lockUntil = new Date(Date.now() + 10 * 60_000).toISOString();
   const locked: Job[] = [];
@@ -154,8 +229,22 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
   }
 
   const resolutions = await resolveDenuvoFromSteam(locked.map((job) => job.app_id));
+  const fallbackCandidates = locked
+    .map((job) => job.app_id)
+    .filter((appId) => !resolutions.get(appId)?.releaseDate);
+  const fallbackReleaseDates = await resolveReleaseDatesFromSteamRaw(fallbackCandidates);
+  const steamRawOnlyReleases = new Map<string, string>();
+  for (const [appId, releaseDate] of fallbackReleaseDates) {
+    const steamResolution = resolutions.get(appId);
+    if (steamResolution) {
+      resolutions.set(appId, { ...steamResolution, releaseDate });
+    } else {
+      steamRawOnlyReleases.set(appId, releaseDate);
+    }
+  }
   await saveResolutions(env, [...resolutions.values()], true);
-  await retryJobs(env, locked.filter((job) => !resolutions.has(job.app_id)));
+  await saveSteamRawReleaseDates(env, steamRawOnlyReleases);
+  await retryJobs(env, locked.filter((job) => !resolutions.has(job.app_id) && !steamRawOnlyReleases.has(job.app_id)));
 }
 
 export async function refreshConfirmedDenuvo(env: Pick<AppBindings, "merlin_db">): Promise<void> {
