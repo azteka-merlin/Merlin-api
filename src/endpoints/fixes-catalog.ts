@@ -149,6 +149,11 @@ function isCurrentDenuvo(item: CorrectionCatalogEntry) {
   return item.hasDrm && (isCurrentYear(item.releaseDate) || isCurrentYear(item.manualAddedAt));
 }
 
+function voteCount(item: CorrectionCatalogEntry) {
+  const fix = item.fixes[0];
+  return Math.max(0, Number(fix?.upvotes || 0)) + Math.max(0, Number(fix?.downvotes || 0));
+}
+
 export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
   return [...items].sort((left, right) => {
     const groupDelta = correctionPriorityGroup(left) - correctionPriorityGroup(right);
@@ -163,6 +168,10 @@ export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
     const rightFix = right.fixes[0];
     const scoreDelta = Number(rightFix?.score || 0) - Number(leftFix?.score || 0);
     const upvotesDelta = Number(rightFix?.upvotes || 0) - Number(leftFix?.upvotes || 0);
+    if (correctionPriorityGroup(left) === 1) {
+      const voteCountDelta = voteCount(right) - voteCount(left);
+      if (voteCountDelta !== 0) return voteCountDelta;
+    }
     const leftRelease = releaseTimestamp(left.releaseDate);
     const rightRelease = releaseTimestamp(right.releaseDate);
     if (leftRelease !== rightRelease) return rightRelease - leftRelease;
