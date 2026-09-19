@@ -37,6 +37,7 @@ type CorrectionCatalogEntry = {
   appid: string;
   name: string;
   releaseDate: string | null;
+  manualAddedAt: string | null;
   hasDrm: boolean;
   fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string; upvotes?: number; downvotes?: number; score?: number; viewerVote?: "up" | "down" }>;
 };
@@ -134,13 +135,25 @@ function releaseTimestamp(value: string | null | undefined) {
   return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
 }
 
+function isCurrentYear(value: string | null | undefined) {
+  return String(value || "").slice(0, 4) === String(new Date().getUTCFullYear());
+}
+
+function correctionPriorityGroup(item: CorrectionCatalogEntry) {
+  if (isCurrentYear(item.releaseDate) || isCurrentYear(item.manualAddedAt)) return 0;
+  if (item.hasDrm) return 1;
+  return 2;
+}
+
 export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
   return [...items].sort((left, right) => {
+    const groupDelta = correctionPriorityGroup(left) - correctionPriorityGroup(right);
+    if (groupDelta !== 0) return groupDelta;
+    const drmDelta = Number(right.hasDrm) - Number(left.hasDrm);
+    if (drmDelta !== 0) return drmDelta;
     const leftRelease = releaseTimestamp(left.releaseDate);
     const rightRelease = releaseTimestamp(right.releaseDate);
     if (leftRelease !== rightRelease) return rightRelease - leftRelease;
-    const drmDelta = Number(right.hasDrm) - Number(left.hasDrm);
-    if (drmDelta !== 0) return drmDelta;
     const leftFix = left.fixes[0];
     const rightFix = right.fixes[0];
     const scoreDelta = Number(rightFix?.score || 0) - Number(leftFix?.score || 0);
@@ -222,7 +235,12 @@ export class FixesCatalogRoute extends OpenAPIRoute {
     }
 
     const overrides = await readOverrides(c.env);
-    const byAppId = new Map(remoteEntries.map((entry) => [entry.appid, entry]));
+    const byAppId = new Map<string, CorrectionCatalogEntry>(remoteEntries.map((entry) => [entry.appid, {
+      ...entry,
+      releaseDate: null,
+      manualAddedAt: null,
+      hasDrm: false,
+    }]));
     const depotboxApiKey = typeof c.env.DEPOTBOX_API_KEY === "string" ? c.env.DEPOTBOX_API_KEY.trim() : "";
     const ryuuAuthCode = typeof c.env.RYUU_AUTH_CODE === "string" ? c.env.RYUU_AUTH_CODE.trim() : "";
 
@@ -265,6 +283,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
           byAppId.set(appId, {
             ...existing,
             name: overrideName || existing.name,
+            manualAddedAt: entry.addedAt || existing.manualAddedAt,
             fixes: [nextFix],
           });
           continue;
@@ -278,6 +297,9 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         byAppId.set(appId, {
           appid: appId,
           name: overrideName,
+          releaseDate: null,
+          manualAddedAt: entry.addedAt || null,
+          hasDrm: false,
           fixes: [nextFix],
         });
         continue;
@@ -288,6 +310,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
       byAppId.set(appId, {
         ...existing,
         name: overrideName || existing.name,
+        manualAddedAt: entry.addedAt || existing.manualAddedAt,
         fixes: existing.fixes.map((fix) => ({
           ...fix,
           adminNote: overrideAdminNote || fix.adminNote,
@@ -312,6 +335,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         return {
           ...entry,
           releaseDate: metadata?.release_date || null,
+          manualAddedAt: entry.manualAddedAt || null,
           hasDrm: Boolean(Number(metadata?.denuvo || 0)) || Boolean(metadata?.drm_notice?.trim()),
           fixes: entry.fixes.map((fix) => ({
             ...fix,

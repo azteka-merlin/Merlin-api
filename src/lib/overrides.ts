@@ -14,6 +14,7 @@ export type FixOverrideConfig = {
 };
 
 export type OverrideEntry = {
+	addedAt?: string;
 	name?: string;
 	adminNote?: string;
 	hidden?: boolean;
@@ -110,6 +111,11 @@ function normalizeOverrideName(entry: OverrideEntry): string | undefined {
 	return rawName || undefined;
 }
 
+function normalizeAddedAt(value: unknown): string | undefined {
+	if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+	return Number.isNaN(new Date(`${value}T00:00:00.000Z`).getTime()) ? undefined : value;
+}
+
 function validateEntry(
 	appId: string,
 	entry: OverrideEntry,
@@ -124,6 +130,7 @@ function validateEntry(
 			: undefined;
 	const normalizedAdminNote =
 		typeof entry.adminNote === "string" && entry.adminNote.trim() ? entry.adminNote.trim() : legacyAdminNote;
+	const addedAt = normalizeAddedAt(entry.addedAt);
 
 	if (!normalizedName && !options.allowLegacyNameMissing) {
 		throw new HTTPException(400, { message: "Override name is required" });
@@ -131,6 +138,9 @@ function validateEntry(
 
 	if (normalizedName) {
 		nextEntry.name = normalizedName;
+	}
+	if (addedAt) {
+		nextEntry.addedAt = addedAt;
 	}
 
 	if (normalizedAdminNote) {
@@ -230,6 +240,7 @@ export async function upsertOverride(
 	const normalizedAppId = normalizeAppId(appId);
 	const overrides = await readOverrides(env);
 	const nextEntry = validateEntry(normalizedAppId, entry);
+	nextEntry.addedAt = nextEntry.addedAt || overrides[normalizedAppId]?.addedAt || new Date().toISOString().slice(0, 10);
 	overrides[normalizedAppId] = nextEntry;
 	await writeOverrides(env, overrides);
 	return nextEntry;
