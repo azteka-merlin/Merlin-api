@@ -41,7 +41,6 @@ const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
-const CONTRARY_SOURCE_TIMEOUT_MS = 300_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
 const CONTRARY_MANIFEST_URL = "https://contrarycdnapi.duckdns.org/api/v1/contrary/manifest";
 
@@ -220,7 +219,7 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 				},
 			},
 			maxAttempts: 1,
-			timeoutMs: CONTRARY_SOURCE_TIMEOUT_MS,
+			timeoutMs: SOURCE_TIMEOUT_MS,
 		}
 		: null;
 

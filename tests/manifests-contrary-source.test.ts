@@ -26,7 +26,7 @@ describe("ContraryCDN manifest source", () => {
     expect(contrary).toMatchObject({
       url: "https://contrarycdnapi.duckdns.org/api/v1/contrary/manifest/271590",
       maxAttempts: 1,
-      timeoutMs: 300_000,
+      timeoutMs: 10_000,
     });
     expect(new Headers(contrary?.init.headers).get("authorization")).toBe("Bearer test-contrary-key");
   });
