@@ -26,6 +26,21 @@ type ViewerLicenseLookup = {
   status: "active" | "revoked";
 };
 
+type CatalogMetadataRow = {
+  app_id: string;
+  release_date: string | null;
+  denuvo: number | null;
+  drm_notice: string | null;
+};
+
+type CorrectionCatalogEntry = {
+  appid: string;
+  name: string;
+  releaseDate: string | null;
+  hasDrm: boolean;
+  fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string; upvotes?: number; downvotes?: number; score?: number; viewerVote?: "up" | "down" }>;
+};
+
 function parseBearerToken(request: Request): string | null {
   const header = request.headers.get("authorization");
   if (!header) return null;
@@ -97,6 +112,43 @@ function isDepotboxCorrectionHref(href: string): boolean {
   } catch {
     return false;
   }
+}
+
+async function listCatalogMetadata(c: AppContext, appIds: string[]) {
+  const metadata = new Map<string, CatalogMetadataRow>();
+  for (let offset = 0; offset < appIds.length; offset += 100) {
+    const chunk = appIds.slice(offset, offset + 100);
+    if (!chunk.length) continue;
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = await c.env.merlin_db
+      .prepare(`SELECT app_id, release_date, denuvo, drm_notice FROM catalog_game_metadata WHERE app_id IN (${placeholders})`)
+      .bind(...chunk)
+      .all<CatalogMetadataRow>();
+    for (const row of rows.results || []) metadata.set(row.app_id, row);
+  }
+  return metadata;
+}
+
+function releaseTimestamp(value: string | null | undefined) {
+  const timestamp = Date.parse(String(value || ""));
+  return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
+}
+
+export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
+  return [...items].sort((left, right) => {
+    const leftRelease = releaseTimestamp(left.releaseDate);
+    const rightRelease = releaseTimestamp(right.releaseDate);
+    if (leftRelease !== rightRelease) return rightRelease - leftRelease;
+    const drmDelta = Number(right.hasDrm) - Number(left.hasDrm);
+    if (drmDelta !== 0) return drmDelta;
+    const leftFix = left.fixes[0];
+    const rightFix = right.fixes[0];
+    const scoreDelta = Number(rightFix?.score || 0) - Number(leftFix?.score || 0);
+    if (scoreDelta !== 0) return scoreDelta;
+    const upvotesDelta = Number(rightFix?.upvotes || 0) - Number(leftFix?.upvotes || 0);
+    if (upvotesDelta !== 0) return upvotesDelta;
+    return left.name.localeCompare(right.name);
+  });
 }
 
 function isRyuuCorrectionHref(href: string): boolean {
@@ -243,20 +295,24 @@ export class FixesCatalogRoute extends OpenAPIRoute {
       });
     }
     const appIds = [...byAppId.keys()];
-    const [voteTotals, viewerLicenseId] = await Promise.all([
+    const [voteTotals, viewerLicenseId, metadataByAppId] = await Promise.all([
       listCorrectionVoteTotals(c.env, appIds),
       getViewerLicenseId(c),
+      listCatalogMetadata(c, appIds),
     ]);
     const viewerVotes = viewerLicenseId
       ? await listViewerVotes(c.env, viewerLicenseId, appIds)
       : new Map<string, "up" | "down">();
 
-    const items = [...byAppId.values()]
+    const items = sortCorrectionCatalog([...byAppId.values()]
       .map((entry) => {
         const totals = voteTotals.get(entry.appid) || { upvotes: 0, downvotes: 0, score: 0 };
         const viewerVote = viewerVotes.get(entry.appid) || undefined;
+        const metadata = metadataByAppId.get(entry.appid);
         return {
           ...entry,
+          releaseDate: metadata?.release_date || null,
+          hasDrm: Boolean(Number(metadata?.denuvo || 0)) || Boolean(metadata?.drm_notice?.trim()),
           fixes: entry.fixes.map((fix) => ({
             ...fix,
             upvotes: totals.upvotes,
@@ -265,16 +321,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
             viewerVote,
           })),
         };
-      })
-      .sort((left, right) => {
-        const leftFix = left.fixes[0];
-        const rightFix = right.fixes[0];
-        const scoreDelta = Number(rightFix?.score || 0) - Number(leftFix?.score || 0);
-        if (scoreDelta !== 0) return scoreDelta;
-        const upvotesDelta = Number(rightFix?.upvotes || 0) - Number(leftFix?.upvotes || 0);
-        if (upvotesDelta !== 0) return upvotesDelta;
-        return left.name.localeCompare(right.name);
-      });
+      }));
 
     if (!items.length && !remoteResponse.ok) {
       return c.json({ error: "Could not load the fixes catalog" }, 502);
