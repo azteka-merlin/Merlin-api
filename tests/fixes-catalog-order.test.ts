@@ -1,9 +1,15 @@
 import { describe, expect, test } from "vitest";
-import { sortCorrectionCatalog } from "../src/endpoints/fixes-catalog";
+import { isDenuvoMetadata, sortCorrectionCatalog } from "../src/endpoints/fixes-catalog";
 
 const fix = { href: "https://example.test/fix.zip", filename: "fix.zip" };
 
 describe("corrections catalog ordering", () => {
+  test("only classifies explicit Denuvo metadata as Denuvo", () => {
+    expect(isDenuvoMetadata({ denuvo: 1 })).toBe(true);
+    expect(isDenuvoMetadata({ denuvo: 0 })).toBe(false);
+    expect(isDenuvoMetadata(null)).toBe(false);
+  });
+
   test("prioritizes all DRM, then voted games by vote count with release date as a tiebreaker", () => {
     const ordered = sortCorrectionCatalog([
       { appid: "1", name: "Older DRM", releaseDate: "2025-12-01", manualAddedAt: null, hasDrm: true, fixes: [{ ...fix, score: 99 }] },

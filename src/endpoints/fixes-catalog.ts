@@ -42,6 +42,10 @@ type CorrectionCatalogEntry = {
   fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string; upvotes?: number; downvotes?: number; score?: number; viewerVote?: "up" | "down" }>;
 };
 
+export function isDenuvoMetadata(metadata: Pick<CatalogMetadata, "denuvo"> | null | undefined) {
+  return Boolean(Number(metadata?.denuvo || 0));
+}
+
 function parseBearerToken(request: Request): string | null {
   const header = request.headers.get("authorization");
   if (!header) return null;
@@ -353,7 +357,9 @@ export class FixesCatalogRoute extends OpenAPIRoute {
           ...entry,
           releaseDate: metadata?.release_date || null,
           manualAddedAt: entry.manualAddedAt || null,
-          hasDrm: Boolean(Number(metadata?.denuvo || 0)) || Boolean(metadata?.drm_notice?.trim()),
+          // `drm_notice` can refer to BattlEye, Easy Anti-Cheat, or other DRM.
+          // The corrections priority is specifically for Denuvo titles.
+          hasDrm: isDenuvoMetadata(metadata),
           fixes: entry.fixes.map((fix) => ({
             ...fix,
             upvotes: totals.upvotes,
