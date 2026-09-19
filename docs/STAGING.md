@@ -73,7 +73,7 @@ Public signup lives in this API. A staging API therefore also stages:
 
 For launcher development, prefer pointing the launcher to the staging HTTPS API instead of a local HTTP API when flows need real external integrations, license checks, downloads, or activation behavior.
 
-Use this command in `Merlin-luncher`:
+Use this command in `Merlin-launcher`:
 
 ```powershell
 npm run start:stage
