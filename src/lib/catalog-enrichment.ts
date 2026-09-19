@@ -1,6 +1,7 @@
 import type { AppBindings } from "../types";
 
 type Job = { app_id: string; attempts: number };
+type ExistingMetadata = { app_id: string; denuvo: number | null; release_date: string | null };
 type SteamAppDetails = {
   success?: boolean;
   data?: {
@@ -34,6 +35,10 @@ const RELEASE_DATE_RETRY_DELAY_MS = 24 * 60 * 60_000;
 const MAX_JOB_ATTEMPTS = 10;
 let nextSteamRequestAt = 0;
 let nextSteamRawRequestAt = 0;
+
+export function needsSteamDenuvoResolution(metadata: Pick<ExistingMetadata, "denuvo"> | null | undefined) {
+  return metadata?.denuvo === null || metadata?.denuvo === undefined;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -166,6 +171,31 @@ async function retryJobs(env: Pick<AppBindings, "merlin_db">, jobs: Job[]) {
   `).bind(job.attempts + 1, MAX_JOB_ATTEMPTS, job.attempts + 1, retryAt, now, job.app_id)));
 }
 
+async function listExistingMetadata(env: Pick<AppBindings, "merlin_db">, appIds: string[]) {
+  const metadata = new Map<string, ExistingMetadata>();
+  for (let offset = 0; offset < appIds.length; offset += 100) {
+    const chunk = appIds.slice(offset, offset + 100);
+    if (!chunk.length) continue;
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = await env.merlin_db
+      .prepare(`SELECT app_id, denuvo, release_date FROM catalog_game_metadata WHERE app_id IN (${placeholders})`)
+      .bind(...chunk)
+      .all<ExistingMetadata>();
+    for (const row of rows.results || []) metadata.set(row.app_id, row);
+  }
+  return metadata;
+}
+
+async function completeJobs(env: Pick<AppBindings, "merlin_db">, appIds: string[]) {
+  if (!appIds.length) return;
+  const now = nowIso();
+  await env.merlin_db.batch(appIds.map((appId) => env.merlin_db.prepare(`
+    UPDATE catalog_enrichment_jobs
+    SET status = 'completed', locked_until = NULL, updated_at = ?
+    WHERE app_id = ?
+  `).bind(now, appId)));
+}
+
 export async function resolveDenuvoFromSteam(appIds: string[]): Promise<Map<string, DenuvoResolution>> {
   const uniqueIds = [...new Set(appIds.filter((appId) => /^\d+$/.test(appId)))];
   const results = new Map<string, DenuvoResolution>();
@@ -228,9 +258,19 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
     if (result.meta.changes) locked.push(job);
   }
 
-  const resolutions = await resolveDenuvoFromSteam(locked.map((job) => job.app_id));
+  const lockedAppIds = locked.map((job) => job.app_id);
+  const existingMetadata = await listExistingMetadata(env, lockedAppIds);
+  const alreadyCompleteAppIds = lockedAppIds.filter((appId) => {
+    const metadata = existingMetadata.get(appId);
+    return !needsSteamDenuvoResolution(metadata) && Boolean(metadata?.release_date);
+  });
+  const unresolvedAppIds = lockedAppIds.filter((appId) => !alreadyCompleteAppIds.includes(appId));
+  const steamDenuvoAppIds = unresolvedAppIds.filter((appId) => needsSteamDenuvoResolution(existingMetadata.get(appId)));
+  const resolutions = await resolveDenuvoFromSteam(steamDenuvoAppIds);
   const fallbackCandidates = locked
     .map((job) => job.app_id)
+    .filter((appId) => unresolvedAppIds.includes(appId))
+    .filter((appId) => !existingMetadata.get(appId)?.release_date)
     .filter((appId) => !resolutions.get(appId)?.releaseDate);
   const fallbackReleaseDates = await resolveReleaseDatesFromSteamRaw(fallbackCandidates);
   const steamRawOnlyReleases = new Map<string, string>();
@@ -244,7 +284,8 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
   }
   await saveResolutions(env, [...resolutions.values()], true);
   await saveSteamRawReleaseDates(env, steamRawOnlyReleases);
-  await retryJobs(env, locked.filter((job) => !resolutions.has(job.app_id) && !steamRawOnlyReleases.has(job.app_id)));
+  await completeJobs(env, alreadyCompleteAppIds);
+  await retryJobs(env, locked.filter((job) => unresolvedAppIds.includes(job.app_id) && !resolutions.has(job.app_id) && !steamRawOnlyReleases.has(job.app_id)));
 }
 
 export async function refreshConfirmedDenuvo(env: Pick<AppBindings, "merlin_db">): Promise<void> {
