@@ -140,23 +140,29 @@ function isCurrentYear(value: string | null | undefined) {
 }
 
 function correctionPriorityGroup(item: CorrectionCatalogEntry) {
-  if (isCurrentYear(item.releaseDate) || isCurrentYear(item.manualAddedAt)) return 0;
-  if (item.hasDrm) return 1;
-  return 2;
+  if (item.hasDrm) return 0;
+  const fix = item.fixes[0];
+  return Number(fix?.upvotes || 0) > 0 || Number(fix?.downvotes || 0) > 0 ? 1 : 2;
+}
+
+function isCurrentDenuvo(item: CorrectionCatalogEntry) {
+  return item.hasDrm && (isCurrentYear(item.releaseDate) || isCurrentYear(item.manualAddedAt));
 }
 
 export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
   return [...items].sort((left, right) => {
     const groupDelta = correctionPriorityGroup(left) - correctionPriorityGroup(right);
     if (groupDelta !== 0) return groupDelta;
+    if (correctionPriorityGroup(left) === 0) {
+      const currentDenuvoDelta = Number(isCurrentDenuvo(right)) - Number(isCurrentDenuvo(left));
+      if (currentDenuvoDelta !== 0) return currentDenuvoDelta;
+    }
     const drmDelta = Number(right.hasDrm) - Number(left.hasDrm);
     if (drmDelta !== 0) return drmDelta;
     const leftFix = left.fixes[0];
     const rightFix = right.fixes[0];
     const scoreDelta = Number(rightFix?.score || 0) - Number(leftFix?.score || 0);
-    if (correctionPriorityGroup(left) === 2 && scoreDelta !== 0) return scoreDelta;
     const upvotesDelta = Number(rightFix?.upvotes || 0) - Number(leftFix?.upvotes || 0);
-    if (correctionPriorityGroup(left) === 2 && upvotesDelta !== 0) return upvotesDelta;
     const leftRelease = releaseTimestamp(left.releaseDate);
     const rightRelease = releaseTimestamp(right.releaseDate);
     if (leftRelease !== rightRelease) return rightRelease - leftRelease;
