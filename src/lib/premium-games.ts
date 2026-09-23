@@ -67,6 +67,8 @@ export type PremiumGameRecord = {
   access_bronze_enabled?: number | null;
   access_prata_enabled?: number | null;
   access_ouro_enabled?: number | null;
+  featured?: number | null;
+  featured_at?: string | null;
   enabled: number;
   early_access_count?: number | null;
   created_at: string;
@@ -87,6 +89,8 @@ export type PremiumGame = {
   accessBronzeEnabled: boolean;
   accessPrataEnabled: boolean;
   accessOuroEnabled: boolean;
+  featured: boolean;
+  featuredAt: string | null;
   enabled: boolean;
   earlyAccessCount: number;
   createdAt: string;
@@ -200,6 +204,7 @@ export type PremiumGameCreateInput = {
   accessBronzeEnabled?: boolean | null;
   accessPrataEnabled?: boolean | null;
   accessOuroEnabled?: boolean | null;
+  featured?: boolean | null;
   enabled?: boolean | null;
 };
 
@@ -215,6 +220,7 @@ export type PremiumGameUpdateInput = {
   accessBronzeEnabled?: boolean | null;
   accessPrataEnabled?: boolean | null;
   accessOuroEnabled?: boolean | null;
+  featured?: boolean | null;
   enabled?: boolean | null;
 };
 
@@ -352,6 +358,8 @@ function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
     accessBronzeEnabled: row.access_bronze_enabled === 1,
     accessPrataEnabled: row.access_prata_enabled === 1,
     accessOuroEnabled: row.access_ouro_enabled !== 0,
+    featured: row.featured === 1,
+    featuredAt: row.featured_at || null,
     enabled: Boolean(row.enabled),
     earlyAccessCount: Number(row.early_access_count || 0),
     createdAt: row.created_at,
@@ -903,11 +911,15 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
         COALESCE(premium_games.access_bronze_enabled, 0) AS access_bronze_enabled,
         COALESCE(premium_games.access_prata_enabled, 0) AS access_prata_enabled,
         COALESCE(premium_games.access_ouro_enabled, 1) AS access_ouro_enabled,
+        COALESCE(premium_games.featured, 0) AS featured,
+        premium_games.featured_at,
         (SELECT COUNT(*) FROM premium_game_early_access pea WHERE pea.app_id = premium_games.app_id) AS early_access_count
       FROM premium_games
       LEFT JOIN catalog_game_metadata metadata ON metadata.app_id = premium_games.app_id
       ORDER BY
         premium_games.enabled DESC,
+        COALESCE(premium_games.featured, 0) DESC,
+        premium_games.featured_at DESC,
         metadata.release_date IS NULL ASC,
         metadata.release_date DESC,
         premium_games.app_id ASC
@@ -1176,6 +1188,8 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
         COALESCE(access_bronze_enabled, 0) AS access_bronze_enabled,
         COALESCE(access_prata_enabled, 0) AS access_prata_enabled,
         COALESCE(access_ouro_enabled, 1) AS access_ouro_enabled,
+        COALESCE(featured, 0) AS featured,
+        featured_at,
         (SELECT COUNT(*) FROM premium_game_early_access pea WHERE pea.app_id = premium_games.app_id) AS early_access_count
       FROM premium_games
       WHERE app_id = ?
@@ -1552,6 +1566,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
   const accessBronzeEnabled = Boolean(input.accessBronzeEnabled);
   const accessPrataEnabled = Boolean(input.accessPrataEnabled);
   const accessOuroEnabled = input.accessOuroEnabled !== false;
+  const featured = Boolean(input.featured);
   const enabled = Boolean(input.enabled);
   const now = new Date().toISOString();
   const metadata = await resolvePremiumGameMetadata(appId);
@@ -1574,11 +1589,13 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
           access_bronze_enabled,
           access_prata_enabled,
           access_ouro_enabled,
+          featured,
+          featured_at,
           enabled,
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         appId,
@@ -1593,6 +1610,8 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
         accessBronzeEnabled ? 1 : 0,
         accessPrataEnabled ? 1 : 0,
         accessOuroEnabled ? 1 : 0,
+        featured ? 1 : 0,
+        featured ? now : null,
         enabled ? 1 : 0,
         now,
         now,
@@ -1656,6 +1675,12 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
   const nextAccessOuroEnabled = input.accessOuroEnabled !== undefined
     ? Boolean(input.accessOuroEnabled)
     : existing.accessOuroEnabled;
+  const nextFeatured = input.featured !== undefined
+    ? Boolean(input.featured)
+    : existing.featured;
+  const nextFeaturedAt = nextFeatured
+    ? (existing.featured && existing.featuredAt ? existing.featuredAt : new Date().toISOString())
+    : null;
   const nextEnabled = input.enabled !== undefined
     ? Boolean(input.enabled)
     : existing.enabled;
@@ -1676,6 +1701,8 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
         access_bronze_enabled = ?,
         access_prata_enabled = ?,
         access_ouro_enabled = ?,
+        featured = ?,
+        featured_at = ?,
         enabled = ?,
         updated_at = ?
       WHERE app_id = ?
@@ -1692,6 +1719,8 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
       nextAccessBronzeEnabled ? 1 : 0,
       nextAccessPrataEnabled ? 1 : 0,
       nextAccessOuroEnabled ? 1 : 0,
+      nextFeatured ? 1 : 0,
+      nextFeaturedAt,
       nextEnabled ? 1 : 0,
       now,
       existing.appId,

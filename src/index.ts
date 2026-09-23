@@ -449,6 +449,7 @@ const premiumGameCreateSchema = z.object({
   accessBronzeEnabled: z.boolean().optional(),
   accessPrataEnabled: z.boolean().optional(),
   accessOuroEnabled: z.boolean().optional(),
+  featured: z.boolean().optional(),
   enabled: z.boolean().optional(),
 });
 const premiumGameUpdateSchema = z.object({
@@ -463,6 +464,7 @@ const premiumGameUpdateSchema = z.object({
   accessBronzeEnabled: z.boolean().optional(),
   accessPrataEnabled: z.boolean().optional(),
   accessOuroEnabled: z.boolean().optional(),
+  featured: z.boolean().optional(),
   enabled: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: "At least one premium game field must be provided",
