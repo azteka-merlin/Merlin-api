@@ -9,7 +9,7 @@ import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { GamesSearchRoute } from "./endpoints/games-search";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
-import { PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
+import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
@@ -2266,6 +2266,10 @@ app.post("/panel-api/catalog-enrichment-queue/:appId/action", async (c) => {
   }
   if (!result.meta.changes) throw new HTTPException(404, { message: "Catalog job not found or cannot be changed" });
 
+  // A manual reprocess is an explicit request to run now; do not wait for the
+  // next minute-based cron invocation.
+  if (body.action === "reprocess") await runCatalogEnrichment(c.env, [appId], true);
+
   await writeAdminAuditLog(c, {
     adminUserId: session.session.admin_user_id,
     action: `catalog_enrichment_job_${body.action}`,
@@ -2308,6 +2312,10 @@ app.post("/panel-api/catalog-enrichment-queue/actions", async (c) => {
     `).bind(now, now, appIdsJson).run();
   }
   const changed = Number(result.meta.changes || 0);
+
+  // Keep the same immediate behavior for the bulk action, while restricting
+  // this invocation to the jobs the admin just selected.
+  if (body.action === "reprocess" && changed) await runCatalogEnrichment(c.env, appIds, true);
 
   await writeAdminAuditLog(c, {
     adminUserId: session.session.admin_user_id,
@@ -3558,6 +3566,7 @@ openapi.get("/api/health", HealthRoute);
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
 openapi.get("/api/public/catalog", PublicCatalogRoute);
+openapi.get("/api/public/catalog/:appId/cover", PublicCatalogCoverRoute);
 openapi.post("/api/public/catalog/consult", PublicCatalogConsultRoute);
 app.get("/api/manifests/status", async (c) => {
   await requireLauncherLicense(c);

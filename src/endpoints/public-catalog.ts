@@ -9,6 +9,7 @@ const CatalogQuery = z.object({
   category: z.enum(["premium", "standard"]).optional(),
   page: z.coerce.number().int().min(1).max(10000).optional().default(1),
 });
+const CatalogCoverParams = z.object({ appId: z.string().regex(/^\d+$/) });
 
 type CatalogRow = {
   app_id: string;
@@ -35,12 +36,14 @@ type ExistingCatalogSourceGame = {
 
 type RemoteFix = { href?: string; filename?: string; badges?: unknown[] };
 type RemoteCorrection = { appid?: string | number; name?: string; fixes?: RemoteFix[] };
+type SteamAppDetails = { success?: boolean; data?: { capsule_image?: string; header_image?: string } };
 
 const FIXES_CATALOG_URL = "https://generator.ryuu.lol/files/fixes.json";
 const AVAILABILITY_SYNC_TTL_MS = 5 * 60 * 1000;
 const AVAILABILITY_SYNC_STATE_KEY = "availability_sources";
 const SEARCH_CANDIDATE_LIMIT = 12;
 const NON_CATALOG_GAME_NAME_PATTERN = /\b(?:demo|playtest|beta|test server)\b/i;
+const STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
 let availabilitySyncedAt = 0;
 let availabilitySync: Promise<void> | null = null;
 
@@ -220,6 +223,40 @@ async function upsertCatalogGames(c: AppContext, games: Array<{ appId: string; n
   ]));
 }
 
+async function resolveCurrentSteamCover(appId: string): Promise<string | null> {
+  const url = new URL(STEAM_APPDETAILS_URL);
+  url.searchParams.set("appids", appId);
+  url.searchParams.set("l", "english");
+  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "Merlin/2.0" } });
+  if (!response.ok) return null;
+  const payload = await response.json() as Record<string, SteamAppDetails>;
+  const data = payload[appId]?.data;
+  const capsule = String(data?.capsule_image || "").trim();
+  const header = String(data?.header_image || "").trim();
+  return capsule || header || null;
+}
+
+export class PublicCatalogCoverRoute extends OpenAPIRoute {
+  schema = {
+    tags: ["Public"],
+    summary: "Resolve a current Steam cover for a catalog game",
+    request: { params: CatalogCoverParams },
+  };
+
+  async handle(c: AppContext) {
+    const { params } = await this.getValidatedData<typeof this.schema>();
+    const coverUrl = await resolveCurrentSteamCover(params.appId);
+    if (!coverUrl) return c.text("Steam cover not found", 404);
+
+    // Persist the canonical asset path so subsequent catalog responses do not
+    // have to resolve the same stale legacy URL again.
+    await c.env.merlin_db.prepare(`
+      UPDATE catalog_games SET cover_url = ?, last_seen_at = ? WHERE app_id = ?
+    `).bind(coverUrl, new Date().toISOString(), params.appId).run();
+    return c.redirect(coverUrl, 302);
+  }
+}
+
 export class PublicCatalogRoute extends OpenAPIRoute {
   schema = {
     tags: ["Public"],
@@ -301,6 +338,7 @@ export class PublicCatalogRoute extends OpenAPIRoute {
         fallbackCoverUrls: [
           `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${encodeURIComponent(game.app_id)}/header.jpg`,
           `https://generator.ryuu.lol/files/images/${encodeURIComponent(game.app_id)}.jpg`,
+          `/api/public/catalog/${encodeURIComponent(game.app_id)}/cover`,
         ].filter((url, index, urls) => urls.indexOf(url) === index && url !== game.cover_url),
         category: game.category,
         availableInMerlin: game.category === "standard" || Boolean(game.available_in_merlin),

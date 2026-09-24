@@ -44,16 +44,16 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function steamReleaseDate(value: unknown, comingSoon: unknown): string | null {
-  if (comingSoon === true || typeof value !== "string" || !value.trim()) return null;
+export function steamReleaseDate(value: unknown, _comingSoon: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
   // Steam's English payload uses values such as "3 Sep, 2026", which Date.parse
   // does not consistently accept until the presentation comma is removed.
   const timestamp = Date.parse(value.replace(/,/g, ""));
   return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString().slice(0, 10);
 }
 
-function steamRawReleaseDate(value: unknown, comingSoon: unknown): string | null {
-  if (comingSoon === true || comingSoon === 1 || value === null || value === undefined || value === "") return null;
+export function steamRawReleaseDate(value: unknown, _comingSoon: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
   const timestamp = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
   return new Date(timestamp * 1_000).toISOString().slice(0, 10);
@@ -224,13 +224,20 @@ async function resolveReleaseDatesFromSteamRaw(appIds: string[]): Promise<Map<st
   return results;
 }
 
-export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">): Promise<void> {
+export async function runCatalogEnrichment(
+  env: Pick<AppBindings, "merlin_db">,
+  requestedAppIds?: string[],
+  ignoreQueuePause = false,
+): Promise<void> {
   const queueSettings = await env.merlin_db
     .prepare("SELECT paused FROM catalog_enrichment_settings WHERE id = 1")
     .first<{ paused: number }>();
-  if (Number(queueSettings?.paused || 0) === 1) return;
+  if (!ignoreQueuePause && Number(queueSettings?.paused || 0) === 1) return;
 
   const now = nowIso();
+  const appIds = [...new Set((requestedAppIds || []).filter((appId) => /^\d+$/.test(appId)))];
+  if (requestedAppIds && !appIds.length) return;
+  const requestedJobsFilter = appIds.length ? ` AND j.app_id IN (${appIds.map(() => "?").join(", ")})` : "";
   const candidates = await env.merlin_db.prepare(`
     SELECT j.app_id, j.attempts FROM catalog_enrichment_jobs j
     LEFT JOIN catalog_availability a ON a.app_id = j.app_id
@@ -240,13 +247,14 @@ export async function runCatalogEnrichment(env: Pick<AppBindings, "merlin_db">):
       (j.status IN ('pending', 'retry') AND j.attempts < ? AND j.next_attempt_at <= ?)
       OR (j.status = 'processing' AND (j.locked_until IS NULL OR j.locked_until <= ?))
     )
+    ${requestedJobsFilter}
     ORDER BY CASE
       WHEN j.status = 'processing' THEN 0
       WHEN m.category IN ('premium', 'standard') AND m.release_date IS NULL THEN 1
       ELSE 2
     END,
       COALESCE(a.available_in_merlin, 0) DESC, p.updated_at DESC, j.next_attempt_at LIMIT ?
-  `).bind(MAX_JOB_ATTEMPTS, now, now, JOB_BATCH_SIZE).all<Job>();
+  `).bind(MAX_JOB_ATTEMPTS, now, now, ...appIds, JOB_BATCH_SIZE).all<Job>();
 
   const lockUntil = new Date(Date.now() + 10 * 60_000).toISOString();
   const locked: Job[] = [];
