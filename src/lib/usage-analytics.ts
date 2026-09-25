@@ -53,6 +53,7 @@ function mapRow(row: UsageRow) {
     expiresAt: row.expires_at,
     status: row.status,
     cycleStartedAt: row.billing_current_period_start || null,
+    cycleTracked: Boolean(row.billing_current_period_start),
     usage: {
       allTime: { total: allTime, normal: count(row.normal_all_time), premium: count(row.premium_all_time) },
       week: { total: week, normal: count(row.normal_week), premium: count(row.premium_week) },
@@ -86,8 +87,8 @@ export async function getUsageAnalytics(
       SUM(CASE WHEN u.action = 'premium_activation_success' AND u.created_at >= ? THEN 1 ELSE 0 END) AS premium_week,
       SUM(CASE WHEN u.action = 'game_activation_success' AND u.created_at >= ? THEN 1 ELSE 0 END) AS normal_month,
       SUM(CASE WHEN u.action = 'premium_activation_success' AND u.created_at >= ? THEN 1 ELSE 0 END) AS premium_month,
-      SUM(CASE WHEN u.action = 'game_activation_success' AND u.created_at >= COALESCE(l.billing_current_period_start, l.activation_usage_reset_at, l.created_at) THEN 1 ELSE 0 END) AS normal_cycle,
-      SUM(CASE WHEN u.action = 'premium_activation_success' AND u.created_at >= COALESCE(l.billing_current_period_start, l.activation_usage_reset_at, l.created_at) THEN 1 ELSE 0 END) AS premium_cycle,
+      SUM(CASE WHEN l.billing_current_period_start IS NOT NULL AND u.action = 'game_activation_success' AND u.created_at >= l.billing_current_period_start THEN 1 ELSE 0 END) AS normal_cycle,
+      SUM(CASE WHEN l.billing_current_period_start IS NOT NULL AND u.action = 'premium_activation_success' AND u.created_at >= l.billing_current_period_start THEN 1 ELSE 0 END) AS premium_cycle,
       SUM(CASE WHEN u.action = 'user_login_success' THEN 1 ELSE 0 END) AS login_all_time
     FROM licenses l
     LEFT JOIN user_activity_logs u
@@ -116,6 +117,7 @@ export async function getUsageAnalytics(
     summary: {
       licenses: users.length,
       usersWithRealUsage: users.filter((user) => user.usage.allTime.total > 0).length,
+      cycleTrackedLicenses: users.filter((user) => user.cycleTracked).length,
       week: { total: sum("week", "total"), normal: sum("week", "normal"), premium: sum("week", "premium") },
       month: { total: sum("month", "total"), normal: sum("month", "normal"), premium: sum("month", "premium") },
       cycle: { total: sum("cycle", "total"), normal: sum("cycle", "normal"), premium: sum("cycle", "premium") },

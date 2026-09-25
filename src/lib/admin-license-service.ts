@@ -457,8 +457,8 @@ export async function renewLicense(c: AppContext, id: number, expiresAt: string,
   const now = new Date().toISOString();
   if (shouldSyncManualPixBillingPeriod(current)) {
     await c.env.merlin_db
-      .prepare(`UPDATE licenses SET expires_at = ?, status = ?, billing_current_period_end = ?, updated_at = ? WHERE id = ?`)
-      .bind(nextExpiresAt, nextStatus, nextExpiresAt, now, id)
+      .prepare(`UPDATE licenses SET expires_at = ?, status = ?, billing_current_period_start = ?, billing_current_period_end = ?, updated_at = ? WHERE id = ?`)
+      .bind(nextExpiresAt, nextStatus, now, nextExpiresAt, now, id)
       .run();
   } else {
     await c.env.merlin_db
