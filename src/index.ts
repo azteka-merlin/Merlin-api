@@ -140,6 +140,7 @@ import {
 } from "./lib/polls";
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
+import { getUsageAnalytics } from "./lib/usage-analytics";
 import { enforceLoginRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
@@ -216,7 +217,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
+const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -1300,6 +1301,12 @@ app.get("/panel-api/user-activity", async (c) => {
   const search = c.req.query("search")?.trim() || undefined;
   const logs = await listUserActivityLogs(c, { limit, action, status, search });
   return c.json({ logs }, 200);
+});
+app.get("/panel-api/usage-analytics", async (c) => {
+  await requireAdminSession(c);
+  const expiryDays = Number(c.req.query("expiryDays") || "30");
+  const includeAutoRenewing = c.req.query("includeAutoRenewing") === "true";
+  return c.json(await getUsageAnalytics(c, { expiryDays, includeAutoRenewing }), 200);
 });
 app.get("/panel-api/audit-logs", async (c) => {
   await requireAdminSession(c);
