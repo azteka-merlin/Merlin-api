@@ -191,6 +191,24 @@ export type PremiumActivationCompletion = {
   cooldownUntil: string;
 };
 
+export type AdminPremiumActivation = {
+  id: number;
+  licenseId: number;
+  licenseKey: string;
+  userName: string;
+  hwid: string | null;
+  appId: string;
+  gameName: string | null;
+  status: PremiumActivationStatus;
+  reservedAt: string | null;
+  activatedAt: string | null;
+  cooldownUntil: string | null;
+  failureStage: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type PremiumGameCreateInput = {
   appId: string;
   name?: string | null;
@@ -886,6 +904,83 @@ export async function cleanupPremiumActivations(c: AppContext, now = new Date())
       `)
       .bind(nowIso, expiredReservationBefore),
   ]);
+}
+
+/** Lists the operational history used by the admin panel. */
+export async function listAdminPremiumActivations(c: AppContext): Promise<AdminPremiumActivation[]> {
+  await cleanupPremiumActivations(c);
+
+  const result = await c.env.merlin_db.prepare(`
+    SELECT
+      pa.id,
+      pa.license_id,
+      l.license_key,
+      l.name AS user_name,
+      l.hwid,
+      pa.app_id,
+      pg.name AS game_name,
+      pa.status,
+      pa.reserved_at,
+      pa.activated_at,
+      pa.cooldown_until,
+      pa.failure_stage,
+      pa.failure_reason,
+      pa.created_at,
+      pa.updated_at
+    FROM premium_activations pa
+    INNER JOIN licenses l ON l.id = pa.license_id
+    LEFT JOIN premium_games pg ON pg.app_id = pa.app_id
+    ORDER BY pa.id DESC
+  `).all<{
+    id: number;
+    license_id: number;
+    license_key: string;
+    user_name: string;
+    hwid: string | null;
+    app_id: string;
+    game_name: string | null;
+    status: PremiumActivationStatus;
+    reserved_at: string | null;
+    activated_at: string | null;
+    cooldown_until: string | null;
+    failure_stage: string | null;
+    failure_reason: string | null;
+    created_at: string;
+    updated_at: string;
+  }>();
+
+  return (result.results || []).map((row) => ({
+    id: row.id,
+    licenseId: row.license_id,
+    licenseKey: row.license_key,
+    userName: row.user_name,
+    hwid: row.hwid,
+    appId: row.app_id,
+    gameName: row.game_name,
+    status: row.status,
+    reservedAt: row.reserved_at,
+    activatedAt: row.activated_at,
+    cooldownUntil: row.cooldown_until,
+    failureStage: row.failure_stage,
+    failureReason: row.failure_reason,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+/**
+ * Ends an active cooldown without removing the historical activation. Keeping
+ * activated_at means quotas and Bronze cycle accounting are not rolled back.
+ */
+export async function releasePremiumActivationCooldown(c: AppContext, activationId: number): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await c.env.merlin_db.prepare(`
+    UPDATE premium_activations
+    SET status = 'expired', cooldown_until = ?, updated_at = ?
+    WHERE id = ? AND status = 'active'
+  `).bind(now, now, activationId).run();
+
+  return (result.meta.changes || 0) > 0;
 }
 
 export async function requireAuthenticatedPremiumLicense(c: AppContext): Promise<AuthenticatedPremiumLicense> {

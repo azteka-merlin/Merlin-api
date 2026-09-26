@@ -119,11 +119,13 @@ import {
   getBronzePremiumActivationCycleSummary,
   grantPremiumGameEarlyAccess,
   listPremiumCatalog,
+  listAdminPremiumActivations,
   listPremiumGameEarlyAccess,
   listPremiumGames,
   requireReadablePremiumLicense,
   requireAuthenticatedPremiumLicense,
   reservePremiumActivation,
+  releasePremiumActivationCooldown,
   revokePremiumGameEarlyAccess,
   setBronzePremiumActivationCredits,
   updatePremiumGame,
@@ -217,7 +219,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
+const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -1350,6 +1352,35 @@ app.get("/panel-api/premium/games", async (c) => {
   await requireAdminSession(c);
   const games = await listPremiumGames(c);
   return c.json({ games }, 200);
+});
+
+app.get("/panel-api/premium/activations", async (c) => {
+  await requireAdminSession(c);
+  const activations = await listAdminPremiumActivations(c);
+  return c.json({ activations }, 200);
+});
+
+app.post("/panel-api/premium/activations/:id/release", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const activationId = Number(c.req.param("id"));
+  if (!Number.isInteger(activationId) || activationId <= 0) {
+    throw new HTTPException(400, { message: "Invalid premium activation id" });
+  }
+
+  const released = await releasePremiumActivationCooldown(c, activationId);
+  if (!released) {
+    throw new HTTPException(409, { message: "Premium activation is no longer active" });
+  }
+
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "premium_activation_cooldown_released",
+    entityType: "premium_activation",
+    entityId: String(activationId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true }, 200);
 });
 
 app.get("/panel-api/premium/games/:appId", async (c) => {
