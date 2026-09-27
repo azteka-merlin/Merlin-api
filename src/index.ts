@@ -189,6 +189,15 @@ import {
   type HomeContentInput,
 } from "./lib/home-content";
 import {
+  createReleaseNote,
+  deleteReleaseNote,
+  getReleaseNoteHero,
+  listAdminReleaseNotes,
+  listPublishedReleaseNotes,
+  updateReleaseNote,
+  type ReleaseNoteInput,
+} from "./lib/release-notes";
+import {
   createPublicPartner,
   deletePublicPartner,
   getPublicPartnerImageObject,
@@ -235,7 +244,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners", "/home"] as const;
+const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -1012,6 +1021,26 @@ function parseHomeContentForm(formData: FormData): HomeContentInput {
     secondaryAction: nullable("secondaryAction"),
     enabled: String(formData.get("enabled") || "true") === "true",
     removeImage: String(formData.get("removeImage") || "false") === "true",
+  };
+}
+
+function parseReleaseNoteForm(formData: FormData): ReleaseNoteInput {
+  let localizations: unknown = [];
+  try {
+    localizations = JSON.parse(String(formData.get("localizations") || "[]"));
+  } catch {
+    throw new HTTPException(400, { message: "Conteúdo multilíngue inválido." });
+  }
+  if (!Array.isArray(localizations)) {
+    throw new HTTPException(400, { message: "Conteúdo multilíngue inválido." });
+  }
+  return {
+    version: String(formData.get("version") || ""),
+    type: String(formData.get("type") || "standard"),
+    published: formBoolean(formData.get("published")),
+    publishedAt: formNullableString(formData.get("publishedAt")),
+    removeHeroAsset: formBoolean(formData.get("removeHeroAsset")),
+    localizations,
   };
 }
 
@@ -2542,6 +2571,42 @@ app.delete("/panel-api/home/:id", async (c) => {
   return c.json(result, 200);
 });
 
+app.get("/panel-api/release-notes", async (c) => {
+  await requireAdminSession(c);
+  const releases = await listAdminReleaseNotes(c);
+  return c.json({ success: true, releases }, 200);
+});
+
+app.post("/panel-api/release-notes", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const release = await createReleaseNote(c, parseReleaseNoteForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, release }, 201);
+});
+
+app.put("/panel-api/release-notes/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const release = await updateReleaseNote(c, c.req.param("id"), parseReleaseNoteForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, release }, 200);
+});
+
+app.delete("/panel-api/release-notes/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  return c.json(await deleteReleaseNote(c, c.req.param("id")), 200);
+});
+
+app.get("/panel-api/release-notes/:id/hero", async (c) => {
+  await requireAdminSession(c);
+  const object = await getReleaseNoteHero(c, c.req.param("id"));
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
+  return new Response(object.body, { status: 200, headers });
+});
+
 app.get("/panel-api/announcements", async (c) => {
   await requireAdminSession(c);
   const announcements = await listAnnouncements(c);
@@ -3585,6 +3650,20 @@ app.get("/api/home/items/:id/image", async (c) => {
   headers.set("Content-Type", image.response.headers.get("content-type") || "image/jpeg");
   headers.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
   return new Response(image.response.body, { status: 200, headers });
+});
+
+app.get("/api/release-notes", async (c) => {
+  await requireLauncherLicense(c);
+  const releases = await listPublishedReleaseNotes(c, c.req.query("locale"), c.req.query("version"));
+  return c.json({ success: true, releases }, 200);
+});
+
+app.get("/api/release-notes/:id/hero", async (c) => {
+  const object = await getReleaseNoteHero(c, c.req.param("id"));
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
+  return new Response(object.body, { status: 200, headers });
 });
 
 app.get("/api/announcements/eligible", async (c) => {
