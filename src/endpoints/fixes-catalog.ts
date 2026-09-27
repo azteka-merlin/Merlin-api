@@ -46,7 +46,7 @@ type CorrectionCatalogEntry = {
   fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string; upvotes?: number; downvotes?: number; score?: number; viewerVote?: "up" | "down" }>;
 };
 
-export function isDenuvoMetadata(metadata: Pick<CatalogMetadata, "denuvo"> | null | undefined) {
+export function isDenuvoMetadata(metadata: Pick<CatalogMetadataRow, "denuvo"> | null | undefined) {
   return Boolean(Number(metadata?.denuvo || 0));
 }
 

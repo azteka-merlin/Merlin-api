@@ -50,6 +50,8 @@ Main public routes:
 - `GET /api/premium/download`
 - `GET /api/polls/active`
 - `POST /api/polls/:id/vote`
+- `GET /api/release-notes`
+- `GET /api/release-notes/:id/hero`
 - `GET /api/updates/latest`
 - `GET /api/updates/download`
 - `POST /api/public/access-keys/register`
@@ -73,6 +75,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Manifest/fix overrides.
 - Premium games, activation archives, and individual early-access grants.
 - Polls.
+- Launcher release notes and localized hero assets.
 - Public signup configuration.
 - Launcher update upload/publishing.
 
@@ -86,6 +89,7 @@ Admin routes use `/panel-api/*` and require an admin session:
 - `src/lib/overrides.ts`: override rules and R2 paths.
 - `src/lib/premium-games.ts`: premium catalog, activations, and downloads.
 - `src/lib/polls.ts`: polls.
+- `src/lib/release-notes.ts`: release-note validation, persistence, localization, and hero assets.
 - `src/lib/email-verification.ts` and `src/lib/access-key-emails.ts`: public email flows through Resend.
 - `migrations/`: D1 schema history.
 

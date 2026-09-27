@@ -12,6 +12,7 @@ Use this file as the docs router. Do not open every `.md` by default; pick the s
 6. `PLANO_TIERS_OPERACAO.md` — current plan, Pix, catalog-cutoff, activation, and individual early-access rules.
 7. `SPECIAL_CORRECTION.md` — contract for the AppID `4407750` license-token correction across API, Admin, and Launcher.
 8. `CONTEXT.md` — architecture, routes, modules, and behavior notes for code changes.
+9. `RELEASE_NOTES.md` — launcher changelog, its D1 records, R2 assets, and the Admin/Launcher contract.
 
 ## Quick rule
 
@@ -20,5 +21,6 @@ Use this file as the docs router. Do not open every `.md` by default; pick the s
 - For behavior/code changes, open `CONTEXT.md` before editing.
 - For staging scripts or staging deploy, open `STAGING.md` first.
 - For the `license_token` correction, open `SPECIAL_CORRECTION.md`; do not infer Premium behavior from it.
+- For launcher changelog behavior, open `RELEASE_NOTES.md`.
 
 Open-source rule: never document real credentials, provider account details, personal paths, Cloudflare ids, private emails, or production-only values.
