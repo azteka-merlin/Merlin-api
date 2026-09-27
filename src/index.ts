@@ -179,6 +179,16 @@ import {
   updateAnnouncement,
 } from "./lib/announcements";
 import {
+  createHomeContent,
+  deleteHomeContent,
+  getHomeContentImage,
+  listHomeContent,
+  reorderHomeContent,
+  resolveHomeSteamGame,
+  updateHomeContent,
+  type HomeContentInput,
+} from "./lib/home-content";
+import {
   createPublicPartner,
   deletePublicPartner,
   getPublicPartnerImageObject,
@@ -225,7 +235,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners"] as const;
+const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/partners", "/home"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -983,6 +993,26 @@ function parseAnnouncementForm(formData: FormData) {
     imageCropWidth: formNullableString(formData.get("imageCropWidth")),
     imageCropHeight: formNullableString(formData.get("imageCropHeight")),
   });
+}
+
+function parseHomeContentForm(formData: FormData): HomeContentInput {
+  const nullable = (key: string) => formNullableString(formData.get(key));
+  return {
+    slotType: nullable("slotType"),
+    position: nullable("position"),
+    appId: nullable("appId"),
+    title: nullable("title"),
+    description: nullable("description"),
+    secondaryText: nullable("secondaryText"),
+    displayLabel: nullable("displayLabel"),
+    imageMode: nullable("imageMode"),
+    imagePositionX: nullable("imagePositionX"),
+    imagePositionY: nullable("imagePositionY"),
+    primaryAction: nullable("primaryAction"),
+    secondaryAction: nullable("secondaryAction"),
+    enabled: String(formData.get("enabled") || "true") === "true",
+    removeImage: String(formData.get("removeImage") || "false") === "true",
+  };
 }
 
 function parsePublicPartnerForm(formData: FormData) {
@@ -2471,6 +2501,47 @@ app.delete("/panel-api/partners/:id", async (c) => {
   return c.json(result, 200);
 });
 
+app.get("/panel-api/home", async (c) => {
+  await requireAdminSession(c);
+  const home = await listHomeContent(c, true);
+  return c.json({ success: true, home }, 200);
+});
+
+app.get("/panel-api/home/steam/:appId", async (c) => {
+  await requireAdminSession(c);
+  const game = await resolveHomeSteamGame(c, c.req.param("appId"));
+  return c.json({ success: true, game }, 200);
+});
+
+app.post("/panel-api/home", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const item = await createHomeContent(c, parseHomeContentForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, item }, 201);
+});
+
+app.put("/panel-api/home/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const formData = await c.req.formData();
+  const file = formData.get("file");
+  const item = await updateHomeContent(c, c.req.param("id"), parseHomeContentForm(formData), file instanceof File ? file : null);
+  return c.json({ success: true, item }, 200);
+});
+
+app.put("/panel-api/home-order/:slotType", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const body = parseBody(z.object({ itemIds: z.array(z.number().int().positive()).min(1).max(30) }), await c.req.json());
+  const home = await reorderHomeContent(c, c.req.param("slotType"), body.itemIds);
+  return c.json({ success: true, home }, 200);
+});
+
+app.delete("/panel-api/home/:id", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const result = await deleteHomeContent(c, c.req.param("id"));
+  return c.json(result, 200);
+});
+
 app.get("/panel-api/announcements", async (c) => {
   await requireAdminSession(c);
   const announcements = await listAnnouncements(c);
@@ -3494,6 +3565,26 @@ app.post("/api/polls/:id/vote", async (c) => {
   const body = parseBody(pollVoteSchema, await c.req.json());
   const poll = await votePoll(c, c.req.param("id"), license.id, body);
   return c.json({ success: true, poll }, 200);
+});
+
+app.get("/api/home", async (c) => {
+  await requireLauncherLicense(c);
+  const home = await listHomeContent(c, false);
+  return c.json({ success: true, home }, 200);
+});
+
+app.get("/api/home/items/:id/image", async (c) => {
+  const image = await getHomeContentImage(c, c.req.param("id"));
+  if (image.kind === "r2") {
+    const headers = new Headers();
+    image.object.writeHttpMetadata(headers);
+    headers.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
+    return new Response(image.object.body, { status: 200, headers });
+  }
+  const headers = new Headers();
+  headers.set("Content-Type", image.response.headers.get("content-type") || "image/jpeg");
+  headers.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
+  return new Response(image.response.body, { status: 200, headers });
 });
 
 app.get("/api/announcements/eligible", async (c) => {
