@@ -27,6 +27,7 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
   MERLIN_WORKER_TOKEN?: string;
+  LICENSE_FILE_AES_KEY_BASE64?: string;
   STEAM_ACCOUNT_ID?: string;
 }
 
@@ -242,6 +243,7 @@ export const FixOverrideConfig = z.object({
 
 export const OverrideEntry = z.object({
 	name: z.string().min(1).optional(),
+	coverUrl: z.string().url().max(2048).optional(),
 	adminNote: z.string().min(1).optional(),
 	hidden: z.boolean().optional(),
 	manifestOverride: ManifestOverrideConfig.optional(),
@@ -260,12 +262,13 @@ export const OverrideUpsertRequest = z
 	.object({
 		appId: z.string().regex(/^\d+$/),
 		name: z.string().min(1),
+		coverUrl: z.string().url().max(2048).optional(),
 		adminNote: z.string().min(1).optional(),
 		hidden: z.boolean().optional(),
 		manifestOverride: ManifestOverrideConfig.optional(),
 		fixOverride: FixOverrideConfig.optional(),
 	})
-	.refine((value) => Boolean(value.adminNote || value.hidden === true || value.manifestOverride || value.fixOverride), {
+	.refine((value) => Boolean(value.adminNote || value.coverUrl || value.hidden === true || value.manifestOverride || value.fixOverride), {
 		message: "At least one override detail must be provided",
 		path: ["appId"],
 	});

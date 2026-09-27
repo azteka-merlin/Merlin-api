@@ -3,6 +3,7 @@ import { verifyAccessToken } from "../lib/auth";
 import { listCorrectionVoteTotals, listViewerVotes } from "../lib/correction-votes";
 import { readOverrides } from "../lib/overrides";
 import type { AppContext } from "../types";
+import { specialCorrectionMetadata } from "../lib/special-correction";
 
 const DEFAULT_FIXES_URL = "https://generator.ryuu.lol/files/fixes.json";
 
@@ -36,9 +37,12 @@ type CatalogMetadataRow = {
 type CorrectionCatalogEntry = {
   appid: string;
   name: string;
+  imageUrl?: string;
   releaseDate: string | null;
   manualAddedAt: string | null;
   hasDrm: boolean;
+  activationType?: string;
+  minimumLauncherVersion?: string;
   fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string; upvotes?: number; downvotes?: number; score?: number; viewerVote?: "up" | "down" }>;
 };
 
@@ -289,6 +293,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
 
       const fixOverride = entry.fixOverride;
       const overrideName = entry.name || fixOverride?.gameName || undefined;
+      const overrideCoverUrl = entry.coverUrl || undefined;
       const overrideAdminNote = entry.adminNote || undefined;
       const existing = byAppId.get(appId);
 
@@ -304,6 +309,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
           byAppId.set(appId, {
             ...existing,
             name: overrideName || existing.name,
+            imageUrl: overrideCoverUrl || existing.imageUrl,
             manualAddedAt: entry.addedAt || existing.manualAddedAt,
             fixes: [nextFix],
           });
@@ -318,6 +324,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         byAppId.set(appId, {
           appid: appId,
           name: overrideName,
+          imageUrl: overrideCoverUrl,
           releaseDate: null,
           manualAddedAt: entry.addedAt || null,
           hasDrm: false,
@@ -326,11 +333,12 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         continue;
       }
 
-      if (!existing || (!overrideName && !overrideAdminNote)) continue;
+      if (!existing || (!overrideName && !overrideCoverUrl && !overrideAdminNote)) continue;
 
       byAppId.set(appId, {
         ...existing,
         name: overrideName || existing.name,
+        imageUrl: overrideCoverUrl || existing.imageUrl,
         manualAddedAt: entry.addedAt || existing.manualAddedAt,
         fixes: existing.fixes.map((fix) => ({
           ...fix,
@@ -355,6 +363,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         const metadata = metadataByAppId.get(entry.appid);
         return {
           ...entry,
+          ...specialCorrectionMetadata(entry.appid),
           releaseDate: metadata?.release_date || null,
           manualAddedAt: entry.manualAddedAt || null,
           // `drm_notice` can refer to BattlEye, Easy Anti-Cheat, or other DRM.

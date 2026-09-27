@@ -16,6 +16,7 @@ export type FixOverrideConfig = {
 export type OverrideEntry = {
 	addedAt?: string;
 	name?: string;
+	coverUrl?: string;
 	adminNote?: string;
 	hidden?: boolean;
 	manifestOverride?: ManifestOverrideConfig;
@@ -116,6 +117,17 @@ function normalizeAddedAt(value: unknown): string | undefined {
 	return Number.isNaN(new Date(`${value}T00:00:00.000Z`).getTime()) ? undefined : value;
 }
 
+function normalizeCoverUrl(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	try {
+		const url = new URL(value.trim());
+		if (url.protocol !== "https:") throw new Error("unsupported protocol");
+		return url.toString();
+	} catch {
+		throw new HTTPException(400, { message: "Override cover URL is invalid" });
+	}
+}
+
 function validateEntry(
 	appId: string,
 	entry: OverrideEntry,
@@ -131,6 +143,7 @@ function validateEntry(
 	const normalizedAdminNote =
 		typeof entry.adminNote === "string" && entry.adminNote.trim() ? entry.adminNote.trim() : legacyAdminNote;
 	const addedAt = normalizeAddedAt(entry.addedAt);
+	const coverUrl = normalizeCoverUrl(entry.coverUrl);
 
 	if (!normalizedName && !options.allowLegacyNameMissing) {
 		throw new HTTPException(400, { message: "Override name is required" });
@@ -138,6 +151,9 @@ function validateEntry(
 
 	if (normalizedName) {
 		nextEntry.name = normalizedName;
+	}
+	if (coverUrl) {
+		nextEntry.coverUrl = coverUrl;
 	}
 	if (addedAt) {
 		nextEntry.addedAt = addedAt;
@@ -170,7 +186,7 @@ function validateEntry(
 		};
 	}
 
-	if (!nextEntry.manifestOverride && !nextEntry.fixOverride && !nextEntry.adminNote && nextEntry.hidden !== true) {
+	if (!nextEntry.manifestOverride && !nextEntry.fixOverride && !nextEntry.adminNote && !nextEntry.coverUrl && nextEntry.hidden !== true) {
 		throw new HTTPException(400, { message: "At least one override detail must be provided" });
 	}
 

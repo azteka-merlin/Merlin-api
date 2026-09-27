@@ -1,6 +1,7 @@
 DEPOTBOX_API_KEY=api_key_here_change_me
 RYUU_AUTH_CODE=api_key_here_change_me
 JWT_SECRET=merlin-local-jwt-secret-change-me
+LICENSE_FILE_AES_KEY_BASE64=base64_encoded_aes_key_here
 HUBCAP_TOKEN=api_key_here_change_me
 SESSION_HASH_SECRET=merlin-local-session-hash-secret-change-me
 RESEND_API_KEY=re_xxxxxxxxx

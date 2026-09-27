@@ -18,6 +18,7 @@ These values are required for the production Worker declared in `wrangler.jsonc`
 | `RYUU_AUTH_CODE` | manifests, fixes | Enables Ryuu manifest source when `RYU_API_URL` is configured and lets the API proxy Ryuu fix downloads without exposing the auth code to the launcher. |
 | `HUBCAP_TOKEN` | manifests | Enables Hubcap manifest fallback. |
 | `JWT_SECRET` | launcher auth | Signs launcher API bearer tokens. |
+| `LICENSE_FILE_AES_KEY_BASE64` | special correction activation | Decrypts the bounded license file sent by an authenticated launcher. It must decode to 16, 24, or 32 bytes and must never be committed. |
 | `SESSION_HASH_SECRET` | admin panel | Hashes/admin session security material. |
 | `RESEND_API_KEY` | public signup/email flows | Sends verification and recovery emails. |
 
@@ -60,3 +61,12 @@ Recommended shape for staging:
 - secrets may reuse the same external-provider credentials if desired.
 - keep D1 separate to avoid test licenses, admins, sessions, access keys, polls, and audit data touching production data.
 - after any binding change, run type generation before deploying.
+
+## Special correction contract
+
+- AppID `4407750` is marked in `/api/fixes/catalog` with activation type `license_token` and minimum launcher version `1.6.8`.
+- `/api/fixes/download` requires `X-Merlin-Version` for that AppID; version `1.6.7` or older and missing/invalid versions receive `launcher_update_required`.
+- `POST /api/fixes/license-token?appid=4407750` requires launcher authentication, the same version header, an enabled fix override, and a raw license file of at most 1 MB.
+- The API returns only the extracted token. It does not download, extract, modify, or recompress the correction ZIP.
+- Never log or persist the uploaded license contents or returned token.
+- A fix override may optionally define an HTTPS `coverUrl`. The launcher receives it as `imageUrl` in the corrections catalog; it is presentation metadata only.

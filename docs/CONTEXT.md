@@ -42,6 +42,7 @@ Main public routes:
 - `GET /api/fixes/catalog`
 - `GET /api/fixes/download`
 - `POST /api/fixes/vote`
+- `POST /api/fixes/license-token` (authenticated special-correction token extraction)
 - `GET /api/premium/catalog`
 - `POST /api/premium/activate`
 - `POST /api/premium/activate-third-party`

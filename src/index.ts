@@ -102,6 +102,12 @@ import {
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
 import { requireLauncherLicense, requireLauncherSearchLicense } from "./lib/launcher-auth";
+import { extractTokenFromLicenseFile, LicenseTokenError, MAX_LICENSE_FILE_BYTES } from "./lib/license-token";
+import {
+  SPECIAL_CORRECTION_APP_ID,
+  SPECIAL_CORRECTION_MINIMUM_VERSION,
+  supportsSpecialCorrection,
+} from "./lib/special-correction";
 import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest, UpdateBronzePremiumActivationCycleRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
@@ -143,7 +149,7 @@ import {
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
 import { getUsageAnalytics } from "./lib/usage-analytics";
-import { enforceLoginRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { enforceLoginRateLimit, enforceManifestsRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
@@ -1663,6 +1669,7 @@ app.post("/panel-api/overrides", async (c) => {
   const body = parseBody(OverrideUpsertRequest, await c.req.json());
   const override = await upsertOverride(c.env, body.appId, {
     name: body.name,
+    coverUrl: body.coverUrl,
     adminNote: body.adminNote,
     hidden: body.hidden,
     manifestOverride: body.manifestOverride,
@@ -3678,6 +3685,61 @@ app.post("/api/auth/reset-hwid", async (c) => {
   return c.json({ success: true, reset: true }, 200);
 });
 
+app.post("/api/fixes/license-token", async (c) => {
+  const appId = String(c.req.query("appid") || "").trim();
+  if (appId !== SPECIAL_CORRECTION_APP_ID) {
+    throw new HTTPException(404, { message: "Correction not found" });
+  }
+
+  if (!supportsSpecialCorrection(c.req.header("x-merlin-version"))) {
+    const error = new HTTPException(426, { message: "Update Merlin to use this correction" }) as HTTPException & {
+      code?: string;
+      minimumVersion?: string;
+    };
+    error.code = "launcher_update_required";
+    error.minimumVersion = SPECIAL_CORRECTION_MINIMUM_VERSION;
+    throw error;
+  }
+
+  const license = await requireLauncherLicense(c);
+  await enforceManifestsRateLimit(c, license.id);
+
+  const overrides = await readOverrides(c.env);
+  if (!overrides[appId]?.fixOverride?.enabled) {
+    throw new HTTPException(404, { message: "Correction not found" });
+  }
+
+  const configuredKey = c.env.LICENSE_FILE_AES_KEY_BASE64?.trim();
+  if (!configuredKey) {
+    throw new HTTPException(500, { message: "License file processing is not configured" });
+  }
+
+  const declaredLength = Number(c.req.header("content-length") || "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_LICENSE_FILE_BYTES) {
+    const error = new HTTPException(400, { message: "Could not process license file" }) as HTTPException & { code?: string };
+    error.code = "license_file_too_large";
+    throw error;
+  }
+
+  const licenseBytes = new Uint8Array(await c.req.arrayBuffer());
+  try {
+    const token = await extractTokenFromLicenseFile(licenseBytes, configuredKey);
+    c.header("Cache-Control", "no-store");
+    return c.json({ success: true, token }, 200);
+  } catch (cause) {
+    if (cause instanceof LicenseTokenError) {
+      const status = cause.code === "invalid_decryption_key" ? 500 : 400;
+      const message = status === 500
+        ? "License file processing is not configured"
+        : "Could not process license file";
+      const error = new HTTPException(status, { message }) as HTTPException & { code?: string };
+      error.code = cause.code;
+      throw error;
+    }
+    throw cause;
+  }
+});
+
 openapi.get("/api/manifests", ManifestsRoute);
 openapi.get("/api/fixes/catalog", FixesCatalogRoute);
 openapi.get("/api/fixes/download", FixesDownloadRoute);
@@ -3702,7 +3764,7 @@ app.onError((error, c) => {
     } else {
       console.warn("[merlin-api:client-error]", logPayload);
     }
-    const codedError = error as unknown as { code?: unknown };
+    const codedError = error as unknown as { code?: unknown; minimumVersion?: unknown };
     const code = typeof codedError.code === "string"
       ? codedError.code
       : undefined;
@@ -3710,7 +3772,10 @@ app.onError((error, c) => {
       success: false,
       error: message,
       ...(code ? { code } : {}),
-    }, errorStatus as 400 | 401 | 403 | 404 | 409 | 429 | 500 | 502 | 503);
+      ...(typeof codedError.minimumVersion === "string"
+        ? { minimumVersion: codedError.minimumVersion }
+        : {}),
+    }, errorStatus as 400 | 401 | 403 | 404 | 409 | 426 | 429 | 500 | 502 | 503);
   }
 
   console.error("[merlin-api:error]", error);

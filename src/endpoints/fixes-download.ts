@@ -4,6 +4,11 @@ import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getFixOverrideFile, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { FixDownloadQuery, type AppContext } from "../types";
+import {
+	SPECIAL_CORRECTION_APP_ID,
+	SPECIAL_CORRECTION_MINIMUM_VERSION,
+	supportsSpecialCorrection,
+} from "../lib/special-correction";
 
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
 const RYUU_FIXES_CATALOG_URL = "https://generator.ryuu.lol/files/fixes.json";
@@ -181,6 +186,9 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 			"429": {
 				description: "Too many correction download requests",
 			},
+			"426": {
+				description: "The launcher must be updated before downloading this correction",
+			},
 			"502": {
 				description: "Could not load the correction file",
 			},
@@ -195,6 +203,15 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 			: "override";
 		if (!appId) {
 			throw new HTTPException(400, { message: "Missing appid" });
+		}
+		if (appId === SPECIAL_CORRECTION_APP_ID && !supportsSpecialCorrection(c.req.header("x-merlin-version"))) {
+			const error = new HTTPException(426, { message: "Update Merlin to use this correction" }) as HTTPException & {
+				code?: string;
+				minimumVersion?: string;
+			};
+			error.code = "launcher_update_required";
+			error.minimumVersion = SPECIAL_CORRECTION_MINIMUM_VERSION;
+			throw error;
 		}
 
 		const license = await requireLauncherLicense(c);
