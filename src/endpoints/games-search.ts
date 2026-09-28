@@ -124,6 +124,70 @@ async function fetchWithTimeout(
 	}
 }
 
+export async function resolveSteamGameByAppId(value: string): Promise<SearchItem | null> {
+	const appId = String(value || "").trim();
+	if (!/^\d+$/.test(appId)) return null;
+
+	const now = Date.now();
+	const cached = steamDetailsCache.get(appId);
+	if (cached && cached.expiresAt > now) {
+		return cached.type === "game" && cached.name && cached.coverUrl
+			? {
+				appId,
+				name: cached.name,
+				coverUrl: cached.coverUrl,
+				coverSource: cached.coverSource,
+			}
+			: null;
+	}
+
+	try {
+		const url = new URL(STEAM_APPDETAILS_URL);
+		url.searchParams.set("appids", appId);
+		const response = await fetchWithTimeout(url.toString(), {
+			headers: {
+				Accept: "application/json",
+				"User-Agent": USER_AGENT,
+			},
+		}, STEAM_SEARCH_TIMEOUT_MS);
+
+		if (!response.ok) {
+			await response.body?.cancel();
+			return null;
+		}
+
+		const payload = await response.json() as Record<string, SteamBasicAppDetails>;
+		const details = payload?.[appId];
+		const data = details?.success === true ? details.data : null;
+		const type = typeof data?.type === "string" ? data.type.trim().toLocaleLowerCase() : null;
+		const name = typeof data?.name === "string" ? data.name.trim() : null;
+		const capsuleImage = typeof data?.capsule_image === "string" ? data.capsule_image.trim() : "";
+		const headerImage = typeof data?.header_image === "string" ? data.header_image.trim() : "";
+		const coverUrl = capsuleImage || headerImage || null;
+		const coverSource = capsuleImage
+			? "steam_capsule_image"
+			: headerImage
+				? "steam_header_image"
+				: null;
+
+		steamDetailsCache.set(appId, {
+			expiresAt: now + (coverUrl ? GAMES_CATALOG_CACHE_TTL_MS : STEAM_NO_IMAGE_CACHE_TTL_MS),
+			type,
+			name,
+			shortDescription: typeof data?.short_description === "string" ? data.short_description.trim() : null,
+			coverUrl,
+			coverSource,
+		});
+
+		return type === "game" && name && coverUrl
+			? { appId, name, coverUrl, coverSource }
+			: null;
+	} catch (error) {
+		console.warn("[games-search] direct Steam lookup failed:", error instanceof Error ? error.message : "unknown error");
+		return null;
+	}
+}
+
 function normalizeSearchKey(searchTerm: string, limit: number, includeUnavailable: boolean): string {
 	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}::${includeUnavailable ? "all" : "available"}`;
 }

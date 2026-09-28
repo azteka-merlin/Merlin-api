@@ -1,5 +1,5 @@
 import { HTTPException } from "hono/http-exception";
-import { searchGamesForCatalog } from "../endpoints/games-search";
+import { resolveSteamGameByAppId, searchGamesForCatalog } from "../endpoints/games-search";
 import type { AppContext } from "../types";
 
 const HOME_IMAGE_PREFIX = "home";
@@ -28,6 +28,7 @@ type HomeContentRow = {
   image_size_bytes: number;
   image_position_x: number;
   image_position_y: number;
+  image_zoom: number;
   primary_action: HomeAction;
   secondary_action: HomeAction;
   enabled: number;
@@ -46,6 +47,7 @@ export type HomeContentInput = {
   imageMode?: string | null;
   imagePositionX?: number | string | null;
   imagePositionY?: number | string | null;
+  imageZoom?: number | string | null;
   primaryAction?: string | null;
   secondaryAction?: string | null;
   enabled?: boolean | null;
@@ -84,6 +86,12 @@ function normalizePercent(value: unknown) {
   return Math.min(100, Math.max(0, Number(numberValue.toFixed(2))));
 }
 
+function normalizeZoom(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  return Math.min(4, Math.max(1, Number(number.toFixed(2))));
+}
+
 function normalizeAction(value: unknown): HomeAction {
   return value === "premium" || value === "add_game" ? value : "none";
 }
@@ -116,6 +124,7 @@ function normalizeInput(input: HomeContentInput, forcedSlotType?: HomeSlotType) 
     imageMode: normalizeImageMode(input.imageMode),
     imagePositionX: normalizePercent(input.imagePositionX),
     imagePositionY: normalizePercent(input.imagePositionY),
+    imageZoom: normalizeZoom(input.imageZoom),
     primaryAction: slotType === "hero" ? normalizeAction(input.primaryAction) : "none" as HomeAction,
     secondaryAction: slotType === "hero" ? normalizeAction(input.secondaryAction) : "none" as HomeAction,
     enabled: input.enabled !== false,
@@ -144,6 +153,7 @@ function mapRow(row: HomeContentRow) {
     imageFilename: row.image_filename,
     imagePositionX: Number(row.image_position_x),
     imagePositionY: Number(row.image_position_y),
+    imageZoom: normalizeZoom(row.image_zoom),
     primaryAction: row.primary_action,
     secondaryAction: row.secondary_action,
     enabled: row.enabled === 1,
@@ -165,12 +175,25 @@ export async function listHomeContent(c: AppContext, includeDisabled = false) {
     ORDER BY CASE slot_type WHEN 'hero' THEN 1 WHEN 'side' THEN 2 ELSE 3 END, position, id
   `).all<HomeContentRow>();
   const items = (result.results || []).map(mapRow);
+  const updatedAt = items.reduce((latest, item) => item.updatedAt > latest ? item.updatedAt : latest, "");
   return {
     hero: items.filter((item) => item.slotType === "hero"),
     side: items.filter((item) => item.slotType === "side").slice(0, 2),
     showcase: items.filter((item) => item.slotType === "showcase").slice(0, 4),
-    updatedAt: items.reduce((latest, item) => item.updatedAt > latest ? item.updatedAt : latest, ""),
+    updatedAt,
+    revision: `${items.length}:${updatedAt}`,
   };
+}
+
+export async function getHomeContentRevision(c: AppContext) {
+  const row = await c.env.merlin_db.prepare(`
+    SELECT COUNT(*) AS item_count, MAX(updated_at) AS updated_at
+    FROM home_content_items
+    WHERE enabled = 1
+  `).first<{ item_count: number; updated_at: string | null }>();
+  const itemCount = Math.max(0, Number(row?.item_count || 0));
+  const updatedAt = typeof row?.updated_at === "string" ? row.updated_at : "";
+  return { updatedAt, revision: `${itemCount}:${updatedAt}` };
 }
 
 export async function resolveHomeSteamGame(c: AppContext, appIdValue: string) {
@@ -180,8 +203,11 @@ export async function resolveHomeSteamGame(c: AppContext, appIdValue: string) {
   if (existing?.cover_url) return { appId, name: existing.name, coverUrl: existing.cover_url, coverSource: existing.cover_source };
   const matches = await searchGamesForCatalog(c, appId, 1);
   const match = matches.find((entry) => entry.appId === appId);
-  if (!match?.coverUrl) throw new HTTPException(404, { message: "Nao foi possivel localizar uma imagem para este App ID." });
-  return match;
+  if (match?.coverUrl) return match;
+
+  const steamGame = await resolveSteamGameByAppId(appId);
+  if (!steamGame) throw new HTTPException(404, { message: "Nao foi possivel localizar uma imagem para este App ID." });
+  return steamGame;
 }
 
 async function prepareImage(c: AppContext, normalized: ReturnType<typeof normalizeInput>, file: File | null | undefined, existing?: HomeContentRow) {
@@ -231,13 +257,13 @@ export async function createHomeContent(c: AppContext, input: HomeContentInput, 
       INSERT INTO home_content_items (
         slot_type, position, app_id, title, description, secondary_text, display_label,
         image_mode, image_url, image_key, image_filename, image_content_type, image_size_bytes,
-        image_position_x, image_position_y, primary_action, secondary_action, enabled, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        image_position_x, image_position_y, image_zoom, primary_action, secondary_action, enabled, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       normalized.slotType, normalized.position, normalized.appId, normalized.title, normalized.description,
       normalized.secondaryText, normalized.displayLabel, normalized.imageMode, image.imageUrl, image.imageKey,
       image.imageFilename, image.imageContentType, image.imageSizeBytes, normalized.imagePositionX,
-      normalized.imagePositionY, normalized.primaryAction, normalized.secondaryAction, normalized.enabled ? 1 : 0, now, now
+      normalized.imagePositionY, normalized.imageZoom, normalized.primaryAction, normalized.secondaryAction, normalized.enabled ? 1 : 0, now, now
     ).run();
     return mapRow(await getRow(c, Number(result.meta.last_row_id)));
   } catch (error) {
@@ -255,12 +281,12 @@ export async function updateHomeContent(c: AppContext, value: string | number, i
     await c.env.merlin_db.prepare(`
       UPDATE home_content_items SET position = ?, app_id = ?, title = ?, description = ?, secondary_text = ?, display_label = ?,
         image_mode = ?, image_url = ?, image_key = ?, image_filename = ?, image_content_type = ?, image_size_bytes = ?,
-        image_position_x = ?, image_position_y = ?, primary_action = ?, secondary_action = ?, enabled = ?, updated_at = ?
+        image_position_x = ?, image_position_y = ?, image_zoom = ?, primary_action = ?, secondary_action = ?, enabled = ?, updated_at = ?
       WHERE id = ?
     `).bind(
       normalized.position, normalized.appId, normalized.title, normalized.description, normalized.secondaryText,
       normalized.displayLabel, normalized.imageMode, image.imageUrl, image.imageKey, image.imageFilename,
-      image.imageContentType, image.imageSizeBytes, normalized.imagePositionX, normalized.imagePositionY,
+      image.imageContentType, image.imageSizeBytes, normalized.imagePositionX, normalized.imagePositionY, normalized.imageZoom,
       normalized.primaryAction, normalized.secondaryAction, normalized.enabled ? 1 : 0, new Date().toISOString(), existing.id
     ).run();
   } catch (error) {

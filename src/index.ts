@@ -182,6 +182,7 @@ import {
   createHomeContent,
   deleteHomeContent,
   getHomeContentImage,
+  getHomeContentRevision,
   listHomeContent,
   reorderHomeContent,
   resolveHomeSteamGame,
@@ -1017,6 +1018,7 @@ function parseHomeContentForm(formData: FormData): HomeContentInput {
     imageMode: nullable("imageMode"),
     imagePositionX: nullable("imagePositionX"),
     imagePositionY: nullable("imagePositionY"),
+    imageZoom: nullable("imageZoom"),
     primaryAction: nullable("primaryAction"),
     secondaryAction: nullable("secondaryAction"),
     enabled: String(formData.get("enabled") || "true") === "true",
@@ -2542,6 +2544,21 @@ app.get("/panel-api/home/steam/:appId", async (c) => {
   return c.json({ success: true, game }, 200);
 });
 
+app.get("/panel-api/home/steam/:appId/image", async (c) => {
+  await requireAdminSession(c);
+  const game = await resolveHomeSteamGame(c, c.req.param("appId"));
+  if (!game.coverUrl) throw new HTTPException(404, { message: "Imagem remota indisponivel." });
+  const response = await fetch(game.coverUrl, {
+    headers: { Accept: "image/*", "User-Agent": "Merlin/2.0" },
+  });
+  if (!response.ok || !response.body) throw new HTTPException(502, { message: "Imagem remota indisponivel." });
+
+  const headers = new Headers();
+  headers.set("Content-Type", response.headers.get("content-type") || "image/jpeg");
+  headers.set("Cache-Control", "private, max-age=300, stale-while-revalidate=86400");
+  return new Response(response.body, { status: 200, headers });
+});
+
 app.post("/panel-api/home", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const formData = await c.req.formData();
@@ -3636,6 +3653,11 @@ app.get("/api/home", async (c) => {
   await requireLauncherLicense(c);
   const home = await listHomeContent(c, false);
   return c.json({ success: true, home }, 200);
+});
+
+app.get("/api/home/revision", async (c) => {
+  await requireLauncherLicense(c);
+  return c.json({ success: true, ...(await getHomeContentRevision(c)) }, 200);
 });
 
 app.get("/api/home/items/:id/image", async (c) => {
