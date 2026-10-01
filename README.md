@@ -81,6 +81,7 @@ Configure required production or staging secrets with Wrangler:
 
 ```powershell
 npx wrangler secret put DEPOTBOX_API_KEY
+npx wrangler secret put STEAM_API_KEY
 npx wrangler secret put RYUU_AUTH_CODE
 npx wrangler secret put HUBCAP_TOKEN
 npx wrangler secret put JWT_SECRET
@@ -112,6 +113,8 @@ npm run deploy-stage:panel
 npm run d1:migrate:remote
 npm run d1:migrate:stage
 ```
+
+The Steam API manifest source requires `STEAM_API_KEY` as a Worker secret in each deployed environment. Apply migration `0069_manifest_source_steam_api.sql` before deploying the API and panel. The admin can then choose Steam API as the first source; otherwise it is tried after DepotBox and Ryuu.
 
 Before deploying a fresh environment:
 

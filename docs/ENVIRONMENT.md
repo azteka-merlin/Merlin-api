@@ -16,6 +16,7 @@ These values are required for the production Worker declared in `wrangler.jsonc`
 | --- | --- | --- |
 | `DEPOTBOX_API_KEY` | manifests, fixes, game search | Authenticates Depotbox requests. |
 | `RYUU_AUTH_CODE` | manifests, fixes | Enables Ryuu manifest source when `RYU_API_URL` is configured and lets the API proxy Ryuu fix downloads without exposing the auth code to the launcher. |
+| `STEAM_API_KEY` | manifests | Authenticates the Steam API manifest ZIP source with the `x-api-key` header. Configure separately in production and staging Workers; the value may be reused if desired. |
 | `HUBCAP_TOKEN` | manifests | Enables Hubcap manifest fallback. |
 | `JWT_SECRET` | launcher auth | Signs launcher API bearer tokens. |
 | `LICENSE_FILE_AES_KEY_BASE64` | special correction activation | Decrypts the bounded license file sent by an authenticated launcher. It must decode to 16, 24, or 32 bytes and must never be committed. |

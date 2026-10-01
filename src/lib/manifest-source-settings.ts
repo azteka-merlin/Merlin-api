@@ -1,6 +1,6 @@
 import type { AppContext } from "../types";
 
-export const MANIFEST_PRIMARY_SOURCES = ["depotbox", "ryuu", "contrary"] as const;
+export const MANIFEST_PRIMARY_SOURCES = ["depotbox", "ryuu", "steam-api"] as const;
 
 export type ManifestPrimarySource = (typeof MANIFEST_PRIMARY_SOURCES)[number];
 

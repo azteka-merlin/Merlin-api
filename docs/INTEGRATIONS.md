@@ -39,10 +39,11 @@ Short map of external systems touched by the API. Do not add real credentials, p
   installation and can fall back to the other configured sources.
 - Calls must keep upstream failures isolated so other manifest sources/fallbacks can still be tried.
 
-## ContraryCDN
+## Steam API
 
-- Used for manifest downloads when `CONTRARY_CDN_API_KEY` is configured.
-- The admin can select it as the primary source; otherwise it remains after the configured DepotBox/Ryuu order.
+- Uses `GET https://api.steamtools.app/api/manifest/{appid}` for manifest ZIP downloads when `STEAM_API_KEY` is configured.
+- Sends the secret only from the Worker in the `x-api-key` header; never expose it to the admin or launcher.
+- The admin can select it as the primary source; otherwise it remains after the configured DepotBox/Ryuu order. The existing ZIP validation and later fallbacks stay in place.
 
 ## Ryuu
 

@@ -1,4 +1,5 @@
 DEPOTBOX_API_KEY=api_key_here_change_me
+STEAM_API_KEY=api_key_here_change_me
 RYUU_AUTH_CODE=api_key_here_change_me
 JWT_SECRET=merlin-local-jwt-secret-change-me
 LICENSE_FILE_AES_KEY_BASE64=base64_encoded_aes_key_here

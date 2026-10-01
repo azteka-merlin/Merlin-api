@@ -9,7 +9,7 @@ import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, ManifestQuery } from "../types";
 
 type ManifestEnv = {
-	CONTRARY_CDN_API_KEY?: string;
+	STEAM_API_KEY?: string;
 	DEPOTBOX_API_KEY?: string;
 	RYU_API_URL?: string;
 	RYUU_AUTH_CODE?: string;
@@ -42,7 +42,7 @@ const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
-const CONTRARY_MANIFEST_URL = "https://contrarycdnapi.duckdns.org/api/v1/contrary/manifest";
+const STEAMTOOLS_MANIFEST_URL = "https://api.steamtools.app/api/manifest";
 
 function getClientIp(c: AppContext): string | null {
 	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
@@ -207,15 +207,15 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 		};
 	}
 
-	const contraryApiKey = env.CONTRARY_CDN_API_KEY?.trim();
-	const contrarySource = contraryApiKey
+	const steamApiKey = env.STEAM_API_KEY?.trim();
+	const steamApiSource = steamApiKey
 		? {
-			name: "contrarycdn",
-			url: `${CONTRARY_MANIFEST_URL}/${encodeURIComponent(appId)}`,
+			name: "steam-api",
+			url: `${STEAMTOOLS_MANIFEST_URL}/${encodeURIComponent(appId)}`,
 			init: {
 				headers: {
 					...commonHeaders,
-					Authorization: `Bearer ${contraryApiKey}`,
+					"x-api-key": steamApiKey,
 				},
 			},
 			maxAttempts: 1,
@@ -226,7 +226,7 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 	const primarySources = {
 		depotbox: depotboxSource,
 		ryuu: ryuuSource,
-		contrary: contrarySource,
+		"steam-api": steamApiSource,
 	};
 	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
 		const source = primarySources[sourceName];
