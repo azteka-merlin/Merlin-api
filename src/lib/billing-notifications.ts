@@ -551,13 +551,22 @@ async function replacedByLegacyEmail(c: BillingNotificationContext, row: Billing
     .prepare("SELECT sent_at FROM billing_notifications WHERE dedupe_key = ? AND status = 'sent' LIMIT 1")
     .bind(`${prefix}:license:${row.id}:expires:${dateOnly(row.expires_at)}`)
     .first<{ sent_at: string | null }>();
-  if (!legacy?.sent_at) return false;
+  if (!legacy?.sent_at) return null;
   const legacyDays = localDayNumber(new Date(row.expires_at)) - localDayNumber(new Date(legacy.sent_at));
   if (slot.kind === "expired") {
-    return legacyDays === slot.days || (slot.days === -1 && legacyDays === 0);
+    return legacyDays === slot.days || (slot.days === -1 && legacyDays === 0) ? legacy.sent_at : null;
   }
   const previous = slot.days === 1 ? 2 : slot.days === 2 ? 4 : slot.days === 4 ? 7 : 8;
-  return legacyDays >= slot.days && legacyDays < previous;
+  return legacyDays >= slot.days && legacyDays < previous ? legacy.sent_at : null;
+}
+
+function nextBillingSlotAt(scheduledAt: string, slot: ReminderSlot) {
+  const nextDays = slot.days === 7 ? 4 : slot.days === 4 ? 2 : slot.days === 2 ? 1
+    : slot.days === 1 ? -1 : slot.days === -1 ? -2 : null;
+  if (nextDays === null) return null;
+  const nextDate = localDateAtOffset(new Date(scheduledAt), slot.days - nextDays);
+  const nextHour = nextDays === 1 || nextDays === -2 ? 19 : 9;
+  return scheduledAtLocalDate(nextDate, nextHour).toISOString();
 }
 
 async function sendExpirationReminder(c: BillingNotificationContext, row: BillingLicenseRow, origin: string, slot?: ReminderSlot) {
@@ -710,13 +719,14 @@ export async function getBillingNotificationsDashboard(env: AppBindings, date: s
   for (const { row, slot, scheduledAt } of entries) {
     const dedupeKey = `${slot.kind === "reminder" ? "expiration_reminder" : "access_expired"}:license:${row.id}:expires:${dateOnly(row.expires_at)}:${slot.code}`;
     const notification = byKey.get(dedupeKey);
-    const covered = notification ? false : await replacedByLegacyEmail(c, row, slot);
+    const previousSentAt = notification ? null : await replacedByLegacyEmail(c, row, slot);
     schedule.push({
       licenseId: row.id, name: row.name, email: row.contact, licenseKey: row.license_key,
       expiresAt: row.expires_at, provider: row.stripe_subscription_id ? "stripe" : "pix",
       reason: billingReason(slot.kind === "expired" ? "access_expired" : "manual_expiration_reminder", dedupeKey),
-      scheduledAt, status: notification?.status || (covered ? "covered" : scheduledAt > now.toISOString() ? "scheduled" : "missing"),
-      sentAt: notification?.sent_at || null, notificationId: notification?.id || null,
+      scheduledAt, status: notification?.status || (previousSentAt ? "covered" : scheduledAt > now.toISOString() ? "scheduled" : "missing"),
+      sentAt: notification?.sent_at || null, previousSentAt, nextScheduledAt: previousSentAt ? nextBillingSlotAt(scheduledAt, slot) : null,
+      notificationId: notification?.id || null,
     });
   }
   schedule.sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt) || a.name?.localeCompare(b.name || "") || a.licenseId - b.licenseId);

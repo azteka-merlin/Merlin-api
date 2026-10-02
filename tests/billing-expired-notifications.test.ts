@@ -125,6 +125,11 @@ describe("billing reminder cadence", () => {
       "2026-10-04T12:00:00.000Z", "2026-10-04T12:00:00.000Z", "2026-10-04T12:00:00.000Z");
     vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
     expect((await runBillingNotificationCron(env)).expirationSent).toBe(0);
+    expect((await getBillingNotificationsDashboard(env, "2026-10-05")).schedule[0]).toMatchObject({
+      status: "covered",
+      previousSentAt: "2026-10-04T12:00:00.000Z",
+      nextScheduledAt: "2026-10-07T12:00:00.000Z",
+    });
     vi.setSystemTime(new Date("2026-10-07T12:00:00.000Z"));
     expect((await runBillingNotificationCron(env)).expirationSent).toBe(1);
     expect((await getExpirationReminderEligibility({ env }, 1)).eligible).toBe(false);
