@@ -3,7 +3,6 @@ import { HTTPException } from "hono/http-exception";
 import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getManifestSourceSettings, manifestPrimarySourceOrder, type ManifestPrimarySource } from "../lib/manifest-source-settings";
-import { getPicsDepotIds, validateZipDepots } from "../lib/manifest-depot-validation";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { writeUserActivityLog } from "../lib/user-activity-service";
@@ -29,7 +28,7 @@ type ManifestSource = {
 type ManifestSourceOutcome = {
 	name: string;
 	result: "missing" | "unavailable";
-	kind: "http" | "timeout" | "request_failed" | "invalid_zip" | "no_depots" | "invalid_depot_metadata" | "missing_pics_depots";
+	kind: "http" | "timeout" | "request_failed" | "invalid_zip" | "no_depots" | "invalid_depot_metadata";
 	status?: number;
 };
 
@@ -38,21 +37,12 @@ type ManifestFetchResult = {
 	outcome: ManifestSourceOutcome;
 };
 
-type PicsValidationResult = "not_applicable" | "disabled" | "passed" | "unavailable";
-
-function logSelectedManifestSource(appId: string, source: string, picsValidation: PicsValidationResult) {
-	const picsLabel = {
-		not_applicable: "não aplicável",
-		disabled: "desligado",
-		passed: "aprovado",
-		unavailable: "indisponível",
-	}[picsValidation];
+function logSelectedManifestSource(appId: string, source: string) {
 	console.info({
-		message: `Manifest ${appId}: fonte ${source} selecionada (PICS: ${picsLabel})`,
+		message: `Manifest ${appId}: fonte ${source} selecionada`,
 		event: "manifest_source_selected",
 		appId,
 		source,
-		picsValidation,
 	});
 }
 
@@ -423,45 +413,16 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: "r2-override" },
 			});
-			logSelectedManifestSource(appId, "r2-override", "not_applicable");
+			logSelectedManifestSource(appId, "r2-override");
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
 		const sourceSettings = await getManifestSourceSettings(c);
 		const sourceOutcomes: ManifestSourceOutcome[] = [];
-		let picsLookup: Promise<string[]> | null = null;
 		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
 			const { response, outcome } = await fetchSource(source, appId);
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
-			let selectedResponse = response;
-			let picsValidation: PicsValidationResult = "not_applicable";
-			const settingName = source.name === "ryu" ? "ryuu" : source.name;
-			if (settingName === "depotbox" || settingName === "ryuu" || settingName === "steam-api") {
-				picsValidation = sourceSettings.depotValidation[settingName] ? "unavailable" : "disabled";
-				if (sourceSettings.depotValidation[settingName]) {
-					try {
-						picsLookup ||= getPicsDepotIds(env, appId);
-						const expectedDepotIds = await picsLookup;
-						const validation = await validateZipDepots(response, appId, expectedDepotIds);
-						selectedResponse = validation.response;
-						if (validation.missingDepotIds === null) {
-							console.warn("[manifests] PICS ZIP inspection unavailable; serving source", { appId, source: source.name, reason: validation.error || "unknown" });
-						} else if (validation.missingDepotIds.length > 0) {
-							console.warn("[manifests] source skipped: missing PICS depots", { appId, source: source.name, missingDepotIds: validation.missingDepotIds });
-							await selectedResponse.body?.cancel();
-							sourceOutcomes[sourceOutcomes.length - 1] = { name: source.name, result: "unavailable", kind: "missing_pics_depots" };
-							continue;
-						} else {
-							picsValidation = "passed";
-						}
-					} catch (error) {
-						console.warn("[manifests] PICS validation unavailable; serving source", {
-							appId, source: source.name, error: error instanceof Error ? error.message : String(error),
-						});
-					}
-				}
-			}
 
 			await writeUserActivityLog(c, {
 				licenseId: license.id,
@@ -475,9 +436,9 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: source.name },
 			});
-			logSelectedManifestSource(appId, source.name, picsValidation);
+			logSelectedManifestSource(appId, source.name);
 
-			return buildZipResponse(selectedResponse.body!, appId, source.name);
+			return buildZipResponse(response.body, appId, source.name);
 		}
 
 		const allSourcesReportedMissing = sourceOutcomes.length > 0
