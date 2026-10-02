@@ -3774,19 +3774,19 @@ app.get("/api/release-notes/:id/hero", async (c) => {
 });
 
 app.get("/api/announcements/eligible", async (c) => {
-  const license = await requireLauncherLicense(c);
+  const license = await requireLauncherSearchLicense(c);
   const announcement = await getEligibleAnnouncement(c, license.id);
   return c.json({ success: true, announcement }, 200);
 });
 
 app.post("/api/announcements/:id/view", async (c) => {
-  const license = await requireLauncherLicense(c);
+  const license = await requireLauncherSearchLicense(c);
   const result = await recordAnnouncementView(c, c.req.param("id"), license.id);
   return c.json(result, 200);
 });
 
 app.post("/api/announcements/:id/dismiss", async (c) => {
-  const license = await requireLauncherLicense(c);
+  const license = await requireLauncherSearchLicense(c);
   const result = await dismissAnnouncementForever(c, c.req.param("id"), license.id);
   return c.json(result, 200);
 });
