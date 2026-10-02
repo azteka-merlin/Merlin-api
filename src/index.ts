@@ -4067,11 +4067,13 @@ app.onError((error, c) => {
   if (error instanceof HTTPException || status) {
     const errorStatus = status || (error as HTTPException).status;
     const message = error instanceof Error ? error.message : "Request failed";
+    const diagnosticError = error as HTTPException & { licenseId?: unknown };
     const logPayload = {
       method: c.req.method,
       path: new URL(c.req.url).pathname,
       status: errorStatus,
       message,
+      ...(Number.isInteger(diagnosticError.licenseId) ? { licenseId: diagnosticError.licenseId } : {}),
     };
     if (errorStatus >= 500) {
       console.error("[merlin-api:error]", logPayload, error);

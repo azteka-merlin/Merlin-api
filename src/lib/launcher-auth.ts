@@ -59,7 +59,7 @@ export async function requireLauncherLicense(c: AppContext): Promise<LauncherLic
 	}
 	const expiresAt = new Date(license.expires_at);
 	if (license.status === "expired" || Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) {
-		throw new HTTPException(401, { message: "License expired" });
+		throw Object.assign(new HTTPException(401, { message: "License expired" }), { licenseId: license.id });
 	}
 	if (license.status !== "active") {
 		throw new HTTPException(401, { message: "License is not active" });
