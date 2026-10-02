@@ -3833,6 +3833,43 @@ app.post("/api/launcher/billing-portal", async (c) => {
   return c.json({ success: true, ...result }, 200);
 });
 
+app.get("/api/launcher/access-notice", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const identity = await requireLauncherSearchLicense(c);
+  const license = await getLicense(c, identity.id);
+  const recurringPix = !license.stripe_subscription_id
+    && ["monthly_subscription", "annual_subscription", "annual_manual"].includes(license.access_type || "");
+  const paidRenewal = recurringPix ? await c.env.merlin_db
+    .prepare(`
+      SELECT id FROM checkout_sessions
+      WHERE provider = 'mercadopago'
+        AND scheduled_renewal_license_id = ?
+        AND payment_status = 'paid'
+        AND renewal_applied_at IS NULL
+      LIMIT 1
+    `)
+    .bind(license.id)
+    .first<{ id: number }>() : null;
+  const expired = new Date(license.expires_at).getTime() < Date.now();
+  return c.json({
+    success: true,
+    license: {
+      expiresAt: license.expires_at.slice(0, 10),
+      status: expired ? "expired" : license.status,
+      planTier: license.plan_tier || "ouro",
+      billing: {
+        accessType: license.access_type || "free",
+        billingStatus: license.billing_status || "none",
+        entitlementExpiresAt: license.expires_at,
+        currentPeriodEnd: license.billing_current_period_end || null,
+        cancelAtPeriodEnd: license.billing_cancel_at_period_end === 1,
+        canManageSubscription: ["monthly_subscription", "annual_subscription"].includes(license.access_type || "") && Boolean(license.stripe_subscription_id),
+        renewalScheduled: Boolean(paidRenewal),
+      },
+    },
+  }, 200);
+});
+
 app.post("/api/auth/reset-hwid", async (c) => {
   const body = parseBody(launcherHwidResetSchema, await c.req.json());
   await enforceLoginRateLimit(c, body);

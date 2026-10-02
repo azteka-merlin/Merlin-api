@@ -66,6 +66,7 @@ export const LoginResponse = z.object({
 		billing: z.object({
 			accessType: z.string(),
 			billingStatus: z.string(),
+			entitlementExpiresAt: z.string(),
 			currentPeriodEnd: z.string().nullable(),
 			cancelAtPeriodEnd: z.boolean(),
 			canManageSubscription: z.boolean(),

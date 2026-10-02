@@ -44,7 +44,7 @@ export function isEligibleForExpiredPixRenewal(
   return hasExpired && hasRenewableStatus && isPixAccess && isRecurring;
 }
 
-// Pix may be paid ahead of time during the final four days of an access period.
+// Pix may be paid ahead of time during the final seven days of an access period.
 // Reminder e-mails may start later, but renewal cannot become unavailable as the
 // deadline gets closer. Stripe subscriptions remain excluded because they renew
 // through Stripe.
@@ -53,7 +53,7 @@ export function isEligibleForEarlyPixRenewal(
   now = Date.now(),
 ) {
   const expiresAt = new Date(license.expires_at).getTime();
-  const latest = now + 4 * 24 * 60 * 60 * 1000;
+  const latest = now + 7 * 24 * 60 * 60 * 1000;
   const isPixAccess = !license.stripe_customer_id && !license.stripe_subscription_id;
   const isRecurring = isRecurringPixAccess(license.access_type);
 

@@ -45,7 +45,7 @@ describe("expired Stripe renewal route", () => {
     expect(isEligibleForExpiredPixRenewal({ ...base, status: "expired", access_type: "annual_manual" }, now)).toBe(true);
   });
 
-  test("allows manual Pix prepayment throughout the final four days", () => {
+  test("allows manual Pix prepayment throughout the final seven days", () => {
     const now = new Date("2026-09-18T12:00:00.000Z").getTime();
     const base = {
       status: "active",
@@ -54,9 +54,9 @@ describe("expired Stripe renewal route", () => {
       stripe_subscription_id: null,
     };
 
-    expect(isEligibleForEarlyPixRenewal({ ...base, expires_at: "2026-09-21T12:00:00.000Z" }, now)).toBe(true);
+    expect(isEligibleForEarlyPixRenewal({ ...base, expires_at: "2026-09-25T12:00:00.000Z" }, now)).toBe(true);
     expect(isEligibleForEarlyPixRenewal({ ...base, expires_at: "2026-09-19T12:00:00.000Z" }, now)).toBe(true);
-    expect(isEligibleForEarlyPixRenewal({ ...base, expires_at: "2026-09-23T12:00:01.000Z" }, now)).toBe(false);
+    expect(isEligibleForEarlyPixRenewal({ ...base, expires_at: "2026-09-25T12:00:00.001Z" }, now)).toBe(false);
     expect(isEligibleForEarlyPixRenewal({ ...base, stripe_subscription_id: "sub_test", expires_at: "2026-09-21T12:00:00.000Z" }, now)).toBe(false);
     expect(isEligibleForEarlyPixRenewal({ ...base, access_type: "annual_manual", expires_at: "2026-09-21T12:00:00.000Z" }, now)).toBe(true);
   });

@@ -187,6 +187,7 @@ export class LoginRoute extends OpenAPIRoute {
 					billing: {
 						accessType: license.access_type || "free",
 						billingStatus: license.billing_status || "none",
+						entitlementExpiresAt: license.expires_at,
 						currentPeriodEnd: license.billing_current_period_end,
 						cancelAtPeriodEnd: license.billing_cancel_at_period_end === 1,
 						canManageSubscription: ["monthly_subscription", "annual_subscription"].includes(license.access_type || "") && Boolean(license.stripe_subscription_id),
