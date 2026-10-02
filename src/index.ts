@@ -393,8 +393,13 @@ async function createExpiredCardRenewalCheckout(c: any, license: Awaited<ReturnT
   }, { reactivationLicenseId: license.id });
 }
 const manifestSourceSettingsSchema = z.object({
-  primarySource: z.enum(MANIFEST_PRIMARY_SOURCES),
-});
+  primarySource: z.enum(MANIFEST_PRIMARY_SOURCES).optional(),
+  depotValidation: z.object({
+    depotbox: z.boolean().optional(),
+    ryuu: z.boolean().optional(),
+    "steam-api": z.boolean().optional(),
+  }).optional(),
+}).refine((body) => body.primarySource !== undefined || (body.depotValidation && Object.keys(body.depotValidation).length > 0), "No settings to update");
 const launcherUpdatePolicySettingsSchema = z.object({
   automaticUpdatesEnabled: z.boolean(),
 });
@@ -2269,7 +2274,7 @@ app.get("/panel-api/manifest-source-settings", async (c) => {
 app.put("/panel-api/manifest-source-settings", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const body = parseBody(manifestSourceSettingsSchema, await c.req.json());
-  const settings = await updateManifestSourceSettings(c, body.primarySource);
+  const settings = await updateManifestSourceSettings(c, body);
   return c.json({ success: true, settings }, 200);
 });
 

@@ -3,6 +3,7 @@ import { HTTPException } from "hono/http-exception";
 import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getManifestSourceSettings, manifestPrimarySourceOrder, type ManifestPrimarySource } from "../lib/manifest-source-settings";
+import { getPicsDepotIds, validateZipDepots } from "../lib/manifest-depot-validation";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { writeUserActivityLog } from "../lib/user-activity-service";
@@ -28,7 +29,7 @@ type ManifestSource = {
 type ManifestSourceOutcome = {
 	name: string;
 	result: "missing" | "unavailable";
-	kind: "http" | "timeout" | "request_failed" | "invalid_zip" | "no_depots" | "invalid_depot_metadata";
+	kind: "http" | "timeout" | "request_failed" | "invalid_zip" | "no_depots" | "invalid_depot_metadata" | "missing_pics_depots";
 	status?: number;
 };
 
@@ -180,7 +181,7 @@ export async function fetchSource(source: ManifestSource, appId: string): Promis
 			if (response.ok) {
 				const zipResponse = await validatedZipResponse(response);
 				if (zipResponse) {
-					console.info("[manifests] source succeeded", {
+					console.info("[manifests] source ZIP fetched", {
 						appId,
 						source: source.name,
 						attempt,
@@ -415,10 +416,35 @@ export class ManifestsRoute extends OpenAPIRoute {
 
 		const sourceSettings = await getManifestSourceSettings(c);
 		const sourceOutcomes: ManifestSourceOutcome[] = [];
+		let picsLookup: Promise<string[]> | null = null;
 		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
 			const { response, outcome } = await fetchSource(source, appId);
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
+			let selectedResponse = response;
+			const settingName = source.name === "ryu" ? "ryuu" : source.name;
+			if (settingName === "depotbox" || settingName === "ryuu" || settingName === "steam-api") {
+				if (sourceSettings.depotValidation[settingName]) {
+					try {
+						picsLookup ||= getPicsDepotIds(env, appId);
+						const expectedDepotIds = await picsLookup;
+						const validation = await validateZipDepots(response, appId, expectedDepotIds);
+						selectedResponse = validation.response;
+						if (validation.missingDepotIds === null) {
+							console.warn("[manifests] PICS ZIP inspection unavailable; serving source", { appId, source: source.name, reason: validation.error || "unknown" });
+						} else if (validation.missingDepotIds.length > 0) {
+							console.warn("[manifests] source skipped: missing PICS depots", { appId, source: source.name, missingDepotIds: validation.missingDepotIds });
+							await selectedResponse.body?.cancel();
+							sourceOutcomes[sourceOutcomes.length - 1] = { name: source.name, result: "unavailable", kind: "missing_pics_depots" };
+							continue;
+						}
+					} catch (error) {
+						console.warn("[manifests] PICS validation unavailable; serving source", {
+							appId, source: source.name, error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+			}
 
 			await writeUserActivityLog(c, {
 				licenseId: license.id,
@@ -433,7 +459,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				metadata: { source: source.name },
 			});
 
-			return buildZipResponse(response.body, appId, source.name);
+			return buildZipResponse(selectedResponse.body!, appId, source.name);
 		}
 
 		const allSourcesReportedMissing = sourceOutcomes.length > 0

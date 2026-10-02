@@ -8,7 +8,17 @@ export const DEFAULT_MANIFEST_PRIMARY_SOURCE: ManifestPrimarySource = "depotbox"
 
 type ManifestSourceSettingsRow = {
   primary_source: string;
+  validate_depotbox: number;
+  validate_ryuu: number;
+  validate_steam_api: number;
   updated_at: string;
+};
+
+export type DepotValidationSource = ManifestPrimarySource;
+
+export type ManifestSourceSettingsPatch = {
+  primarySource?: ManifestPrimarySource;
+  depotValidation?: Partial<Record<DepotValidationSource, boolean>>;
 };
 
 function normalizePrimarySource(value: unknown): ManifestPrimarySource {
@@ -24,26 +34,45 @@ export function manifestPrimarySourceOrder(value: unknown): ManifestPrimarySourc
 
 export async function getManifestSourceSettings(c: AppContext) {
   const row = await c.env.merlin_db
-    .prepare("SELECT primary_source, updated_at FROM manifest_source_settings WHERE id = 1")
+    .prepare("SELECT primary_source, validate_depotbox, validate_ryuu, validate_steam_api, updated_at FROM manifest_source_settings WHERE id = 1")
     .first<ManifestSourceSettingsRow>();
 
   return {
     primarySource: normalizePrimarySource(row?.primary_source),
+    depotValidation: {
+      depotbox: row?.validate_depotbox === 1,
+      ryuu: row?.validate_ryuu === 1,
+      "steam-api": row?.validate_steam_api === 1,
+    },
     updatedAt: row?.updated_at || null,
   };
 }
 
-export async function updateManifestSourceSettings(c: AppContext, primarySource: ManifestPrimarySource) {
+export async function updateManifestSourceSettings(c: AppContext, patch: ManifestSourceSettingsPatch) {
   const now = new Date().toISOString();
+  const updates: string[] = [];
+  const values: (string | number)[] = [];
+  if (patch.primarySource !== undefined) {
+    updates.push("primary_source = ?");
+    values.push(patch.primarySource);
+  }
+  for (const [source, column] of [
+    ["depotbox", "validate_depotbox"],
+    ["ryuu", "validate_ryuu"],
+    ["steam-api", "validate_steam_api"],
+  ] as const) {
+    const enabled = patch.depotValidation?.[source];
+    if (enabled !== undefined) {
+      updates.push(`${column} = ?`);
+      values.push(enabled ? 1 : 0);
+    }
+  }
+  if (updates.length === 0) return getManifestSourceSettings(c);
+  updates.push("updated_at = ?");
+  values.push(now);
   await c.env.merlin_db
-    .prepare(`
-      INSERT INTO manifest_source_settings (id, primary_source, updated_at)
-      VALUES (1, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        primary_source = excluded.primary_source,
-        updated_at = excluded.updated_at
-    `)
-    .bind(primarySource, now)
+    .prepare(`UPDATE manifest_source_settings SET ${updates.join(", ")} WHERE id = 1`)
+    .bind(...values)
     .run();
 
   return getManifestSourceSettings(c);
