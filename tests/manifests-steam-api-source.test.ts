@@ -1,5 +1,7 @@
-import { describe, expect, test } from "vitest";
-import { createSources } from "../src/endpoints/manifests";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { createSources, fetchSource } from "../src/endpoints/manifests";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("Steam API manifest source", () => {
   test("adds the authenticated ZIP source after DepotBox and Ryuu by default", () => {
@@ -45,5 +47,36 @@ describe("Steam API manifest source", () => {
     }, "steam-api");
 
     expect(sources.slice(0, 3).map((source) => source.name)).toEqual(["steam-api", "depotbox", "ryu"]);
+  });
+
+  test("skips the ZIP when generation reports zero depots", async () => {
+    const source = createSources("5254710", { STEAM_API_KEY: "test-steam-api-key" }, "steam-api")[0]!;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: true, depots: {} }), { status: 200 }),
+    );
+
+    const result = await fetchSource(source, "5254710");
+
+    expect(result.response).toBeNull();
+    expect(result.outcome.kind).toBe("no_depots");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.steamtools.app/api/generate");
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ appid: "5254710" }),
+    });
+  });
+
+  test("downloads the ZIP when generation reports depots", async () => {
+    const source = createSources("500", { STEAM_API_KEY: "test-steam-api-key" }, "steam-api")[0]!;
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, depots: { "501": "key" } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0]), { status: 200 }));
+
+    const result = await fetchSource(source, "500");
+
+    expect(result.response).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://api.steamtools.app/api/manifest/500");
   });
 });

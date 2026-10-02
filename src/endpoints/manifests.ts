@@ -28,7 +28,7 @@ type ManifestSource = {
 type ManifestSourceOutcome = {
 	name: string;
 	result: "missing" | "unavailable";
-	kind: "http" | "timeout" | "request_failed" | "invalid_zip";
+	kind: "http" | "timeout" | "request_failed" | "invalid_zip" | "no_depots" | "invalid_depot_metadata";
 	status?: number;
 };
 
@@ -43,6 +43,7 @@ const SOURCE_TIMEOUT_MS = 10_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
 const STEAMTOOLS_MANIFEST_URL = "https://api.steamtools.app/api/manifest";
+const STEAMTOOLS_GENERATE_URL = "https://api.steamtools.app/api/generate";
 
 function getClientIp(c: AppContext): string | null {
 	return c.req.header("cf-connecting-ip")?.trim() || c.req.header("x-real-ip")?.trim() || c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
@@ -103,14 +104,66 @@ function logManifestSourceFailure(appId: string, source: ManifestSource, attempt
 		appId,
 		source: source.name,
 		attempt,
-		stage: outcome.kind === "invalid_zip" ? "validate_zip" : "fetch",
+		stage: outcome.kind === "invalid_zip" ? "validate_zip"
+			: outcome.kind === "no_depots" || outcome.kind === "invalid_depot_metadata" ? "check_depots" : "fetch",
 		reason: outcome.kind,
 		result: outcome.result,
 		...(outcome.status ? { status: outcome.status } : {}),
 	});
 }
 
-async function fetchSource(source: ManifestSource, appId: string): Promise<ManifestFetchResult> {
+async function checkSteamApiDepots(source: ManifestSource, appId: string): Promise<ManifestSourceOutcome | null> {
+	const controller = new AbortController();
+	const timeoutHandle = setTimeout(() => controller.abort("timeout"), source.timeoutMs || SOURCE_TIMEOUT_MS);
+	try {
+		const headers = new Headers(source.init.headers);
+		headers.set("Accept", "application/json");
+		headers.set("Content-Type", "application/json");
+		const response = await fetch(STEAMTOOLS_GENERATE_URL, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ appid: appId }),
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			await response.body?.cancel();
+			return {
+				name: source.name,
+				result: response.status === 404 ? "missing" : "unavailable",
+				kind: "http",
+				status: response.status,
+			};
+		}
+
+		const data = await response.json() as { success?: unknown; depots?: unknown };
+		if (data.success !== true || !data.depots || typeof data.depots !== "object" || Array.isArray(data.depots)) {
+			return { name: source.name, result: "unavailable", kind: "invalid_depot_metadata" };
+		}
+		const depotCount = Object.keys(data.depots).length;
+		if (depotCount === 0) {
+			return { name: source.name, result: "unavailable", kind: "no_depots" };
+		}
+		console.info("[manifests] Steam API depots found", { appId, depotCount });
+		return null;
+	} catch (error) {
+		return {
+			name: source.name,
+			result: "unavailable",
+			kind: controller.signal.aborted ? "timeout" : error instanceof SyntaxError ? "invalid_depot_metadata" : "request_failed",
+		};
+	} finally {
+		clearTimeout(timeoutHandle);
+	}
+}
+
+export async function fetchSource(source: ManifestSource, appId: string): Promise<ManifestFetchResult> {
+	if (source.name === "steam-api") {
+		const depotOutcome = await checkSteamApiDepots(source, appId);
+		if (depotOutcome) {
+			logManifestSourceFailure(appId, source, 1, depotOutcome);
+			return { response: null, outcome: depotOutcome };
+		}
+	}
 	let lastOutcome: ManifestSourceOutcome = {
 		name: source.name,
 		result: "unavailable",
