@@ -233,6 +233,21 @@ async function markBillingNotification(c: BillingNotificationContext, id: number
     .run();
 }
 
+async function startBillingNotificationAttempt(c: BillingNotificationContext, notificationId: number, source: string) {
+  const result = await c.env.merlin_db
+    .prepare("INSERT INTO billing_notification_attempts (notification_id, source, started_at) VALUES (?, ?, ?)")
+    .bind(notificationId, source, new Date().toISOString())
+    .run();
+  return Number(result.meta.last_row_id);
+}
+
+async function finishBillingNotificationAttempt(c: BillingNotificationContext, attemptId: number, status: "sent" | "failed", errorMessage?: string) {
+  await c.env.merlin_db
+    .prepare("UPDATE billing_notification_attempts SET status = ?, finished_at = ?, error_message = ? WHERE id = ?")
+    .bind(status, new Date().toISOString(), errorMessage ? errorMessage.slice(0, 500) : null, attemptId)
+    .run();
+}
+
 async function sendOnce(
   c: BillingNotificationContext,
   input: {
@@ -249,12 +264,15 @@ async function sendOnce(
     daysSinceExpiry?: number | null;
     invoiceAmount?: string | null;
     licenseKey?: string | null;
+    source?: "cron" | "admin" | "system";
   },
 ) {
   const notificationId = await reserveBillingNotification(c, input);
   if (!notificationId) return false;
 
+  let attemptId: number | null = null;
   try {
+    attemptId = await startBillingNotificationAttempt(c, notificationId, input.source || "system");
     await sendBillingEmail(c, {
       kind: input.notificationType,
       email: input.email,
@@ -267,12 +285,21 @@ async function sendOnce(
       invoiceAmount: input.invoiceAmount,
       licenseKeyMasked: maskLicenseKey(input.licenseKey),
     });
-    await markBillingNotification(c, notificationId, "sent");
-    return true;
   } catch (error) {
-    await markBillingNotification(c, notificationId, "failed", error instanceof Error ? error.message : String(error || ""));
+    const message = error instanceof Error ? error.message : String(error || "");
+    await markBillingNotification(c, notificationId, "failed", message);
+    if (attemptId) await finishBillingNotificationAttempt(c, attemptId, "failed", message);
     throw error;
   }
+  await markBillingNotification(c, notificationId, "sent");
+  if (attemptId) {
+    try {
+      await finishBillingNotificationAttempt(c, attemptId, "sent");
+    } catch (error) {
+      console.warn("[billing-notifications] attempt log update failed", attemptId, error instanceof Error ? error.message : error);
+    }
+  }
+  return true;
 }
 
 async function getInvoiceLicenseBySubscription(c: BillingNotificationContext, subscriptionId: string) {
@@ -548,6 +575,7 @@ async function sendExpirationReminder(c: BillingNotificationContext, row: Billin
       expiresAt: row.expires_at,
       daysUntilExpiry: slot?.days,
       licenseKey: row.license_key,
+      source: slot ? "cron" : "admin",
     });
   }
 
@@ -563,6 +591,7 @@ async function sendExpirationReminder(c: BillingNotificationContext, row: Billin
     expiresAt: row.expires_at,
     daysUntilExpiry: slot?.days,
     licenseKey: row.license_key,
+    source: slot ? "cron" : "admin",
   });
 }
 
@@ -579,6 +608,7 @@ async function sendAccessExpired(c: BillingNotificationContext, row: BillingLice
     expiresAt: row.expires_at,
     daysSinceExpiry: Math.abs(slot.days),
     licenseKey: row.license_key,
+    source: "cron",
   });
 }
 
@@ -618,4 +648,198 @@ export async function runBillingNotificationCron(env: AppBindings, now = new Dat
 
   console.info("[billing-notifications] cron completed", summary);
   return summary;
+}
+
+type DashboardNotificationRow = {
+  id: number;
+  license_id: number | null;
+  notification_type: string;
+  dedupe_key: string;
+  email: string;
+  status: string;
+  sent_at: string | null;
+  updated_at: string;
+};
+
+function billingReason(kind: string, dedupeKey: string) {
+  const stage = dedupeKey.match(/:(d[+-]\d+)$/)?.[1];
+  if (stage?.startsWith("d-")) {
+    const days = Number(stage.slice(2));
+    return `Vence em ${days} ${days === 1 ? "dia" : "dias"}`;
+  }
+  if (stage?.startsWith("d+")) {
+    const days = Number(stage.slice(2));
+    return `Expirou há ${days} ${days === 1 ? "dia" : "dias"}`;
+  }
+  return kind === "access_expired" ? "Acesso expirado" : "Aviso manual de vencimento";
+}
+
+function scheduledAtLocalDate(date: string, hour: 9 | 19) {
+  return new Date(`${date}T${hour === 9 ? "12" : "22"}:00:00.000Z`);
+}
+
+export async function getBillingNotificationsDashboard(env: AppBindings, date: string, now = new Date()) {
+  const c = { env };
+  const planned = new Map<string, { row: BillingLicenseRow; slot: ReminderSlot; scheduledAt: string }>();
+  for (const hour of [9, 19] as const) {
+    const scheduledAt = scheduledAtLocalDate(date, hour);
+    const [reminders, expired] = await Promise.all([
+      listExpirationReminderCandidates(c, scheduledAt),
+      listExpiredAccessCandidates(c, scheduledAt),
+    ]);
+    for (const [kind, rows] of [["reminder", reminders.results], ["expired", expired.results]] as const) {
+      for (const row of rows || []) {
+        const slot = slotForExpiry(scheduledAt, row.expires_at, kind);
+        if (!slot) continue;
+        const key = `${kind}:${row.id}:${slot.code}`;
+        if (!planned.has(key)) planned.set(key, { row, slot, scheduledAt: scheduledAt.toISOString() });
+      }
+    }
+  }
+
+  const entries = [...planned.values()];
+  const dedupeKeys = entries.map(({ row, slot }) =>
+    `${slot.kind === "reminder" ? "expiration_reminder" : "access_expired"}:license:${row.id}:expires:${dateOnly(row.expires_at)}:${slot.code}`);
+  const notificationRows = dedupeKeys.length
+    ? (await env.merlin_db.prepare(`SELECT id, license_id, notification_type, dedupe_key, email, status, sent_at, updated_at
+        FROM billing_notifications WHERE dedupe_key IN (${dedupeKeys.map(() => "?").join(", ")})`)
+      .bind(...dedupeKeys).all<DashboardNotificationRow>()).results || []
+    : [];
+  const byKey = new Map(notificationRows.map((row) => [row.dedupe_key, row]));
+  const schedule = [];
+  for (const { row, slot, scheduledAt } of entries) {
+    const dedupeKey = `${slot.kind === "reminder" ? "expiration_reminder" : "access_expired"}:license:${row.id}:expires:${dateOnly(row.expires_at)}:${slot.code}`;
+    const notification = byKey.get(dedupeKey);
+    const covered = notification ? false : await replacedByLegacyEmail(c, row, slot);
+    schedule.push({
+      licenseId: row.id, name: row.name, email: row.contact, licenseKey: row.license_key,
+      expiresAt: row.expires_at, provider: row.stripe_subscription_id ? "stripe" : "pix",
+      reason: billingReason(slot.kind === "expired" ? "access_expired" : "manual_expiration_reminder", dedupeKey),
+      scheduledAt, status: notification?.status || (covered ? "covered" : scheduledAt > now.toISOString() ? "scheduled" : "missing"),
+      sentAt: notification?.sent_at || null, notificationId: notification?.id || null,
+    });
+  }
+  schedule.sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt) || a.name?.localeCompare(b.name || "") || a.licenseId - b.licenseId);
+
+  const attempts = (await env.merlin_db.prepare(`
+    SELECT a.id AS attempt_id, a.notification_id, a.source, a.status, a.started_at, a.finished_at, a.error_message,
+           bn.status AS current_status, bn.notification_type, bn.dedupe_key, bn.email, bn.license_id,
+           l.name, l.license_key, l.expires_at
+    FROM billing_notification_attempts a
+    JOIN billing_notifications bn ON bn.id = a.notification_id
+    LEFT JOIN licenses l ON l.id = bn.license_id
+    WHERE date(COALESCE(a.finished_at, a.started_at), '-3 hours') = ?
+      AND bn.notification_type IN ('manual_expiration_reminder', 'stripe_cancel_expiration_reminder', 'access_expired')
+    ORDER BY COALESCE(a.finished_at, a.started_at) DESC, a.id DESC
+    LIMIT 300
+  `).bind(date).all<Record<string, unknown>>()).results || [];
+  const legacy = (await env.merlin_db.prepare(`
+    SELECT bn.id AS notification_id, 'legacy' AS source, bn.status, bn.status AS current_status, bn.created_at AS started_at,
+           COALESCE(bn.sent_at, bn.updated_at) AS finished_at, bn.error_message,
+           bn.notification_type, bn.dedupe_key, bn.email, bn.license_id,
+           l.name, l.license_key, l.expires_at
+    FROM billing_notifications bn
+    LEFT JOIN licenses l ON l.id = bn.license_id
+    WHERE NOT EXISTS (SELECT 1 FROM billing_notification_attempts a WHERE a.notification_id = bn.id)
+      AND date(COALESCE(bn.sent_at, bn.updated_at), '-3 hours') = ?
+      AND bn.notification_type IN ('manual_expiration_reminder', 'stripe_cancel_expiration_reminder', 'access_expired')
+    ORDER BY COALESCE(bn.sent_at, bn.updated_at) DESC, bn.id DESC
+    LIMIT 300
+  `).bind(date).all<Record<string, unknown>>()).results || [];
+  const history: Record<string, unknown>[] = [...attempts, ...legacy].map((item: Record<string, unknown>) => ({
+    ...item,
+    reason: billingReason(String(item.notification_type), String(item.dedupe_key)),
+  }));
+  history.sort((a, b) => String(b.finished_at || b.started_at).localeCompare(String(a.finished_at || a.started_at)));
+  history.splice(300);
+
+  const upcoming = (await env.merlin_db.prepare(`
+    SELECT l.id AS license_id, l.name, l.contact AS email, l.license_key, l.expires_at,
+           CASE WHEN l.stripe_subscription_id IS NOT NULL THEN 'stripe' ELSE 'pix' END AS provider
+    FROM licenses l
+    LEFT JOIN subscriptions s ON s.license_id = l.id
+    WHERE l.status = 'active' AND l.contact_type = 'email'
+      AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+      AND datetime(l.expires_at) > datetime(?)
+      AND datetime(l.expires_at) <= datetime(?)
+      AND NOT (l.stripe_subscription_id IS NOT NULL
+        AND COALESCE(l.billing_cancel_at_period_end, 0) = 0
+        AND COALESCE(s.cancel_at_period_end, 0) = 0
+        AND COALESCE(s.status, l.billing_status, '') IN ('active', 'trialing'))
+      AND NOT EXISTS (SELECT 1 FROM checkout_sessions cs
+        WHERE cs.provider = 'mercadopago' AND cs.scheduled_renewal_license_id = l.id
+          AND cs.payment_status = 'paid' AND cs.renewal_applied_at IS NULL)
+    ORDER BY datetime(l.expires_at) ASC LIMIT 200
+  `).bind(now.toISOString(), addDays(now, 7).toISOString()).all<Record<string, unknown>>()).results || [];
+
+  return { date, today: localDateAtOffset(now, 0), generatedAt: now.toISOString(), timezone: BILLING_TIME_ZONE, schedule, history, upcoming };
+}
+
+export async function retryFailedBillingNotification(env: AppBindings, notificationId: number, now = new Date()) {
+  const c = { env };
+  const record = await env.merlin_db.prepare(`
+    SELECT bn.id AS notification_id, bn.notification_type, bn.dedupe_key, bn.email AS original_email,
+           bn.status AS notification_status, bn.updated_at AS notification_updated_at,
+           l.id, l.customer_id, l.license_key, l.name, l.contact, l.expires_at, l.access_type,
+           l.billing_status, l.stripe_customer_id, l.stripe_subscription_id, l.billing_cancel_at_period_end,
+           l.status AS license_status, l.contact_type, s.status AS subscription_status,
+           s.cancel_at_period_end AS subscription_cancel_at_period_end,
+           cst.stripe_customer_id AS customer_stripe_customer_id
+    FROM billing_notifications bn
+    JOIN licenses l ON l.id = bn.license_id
+    LEFT JOIN subscriptions s ON s.license_id = l.id
+    LEFT JOIN customers cst ON cst.id = l.customer_id
+    WHERE bn.id = ? LIMIT 1
+  `).bind(notificationId).first<BillingLicenseRow & {
+    notification_id: number; notification_type: BillingEmailKind; dedupe_key: string;
+    original_email: string; notification_status: string; notification_updated_at: string;
+    license_status: string; contact_type: string;
+  }>();
+  if (!record || !["manual_expiration_reminder", "stripe_cancel_expiration_reminder", "access_expired"].includes(record.notification_type)) {
+    return { sent: false, reason: "Aviso não encontrado." };
+  }
+  const stalePending = record.notification_status === "pending"
+    && new Date(record.notification_updated_at).getTime() < now.getTime() - 60 * 60 * 1000;
+  if (record.notification_status !== "failed" && !stalePending) {
+    return { sent: false, reason: "Este aviso não está disponível para reenvio." };
+  }
+  if (record.contact_type !== "email" || record.contact !== record.original_email
+    || !["monthly_subscription", "annual_subscription", "annual_manual"].includes(record.access_type || "")
+    || !["active", "expired"].includes(record.license_status)
+    || !record.dedupe_key.includes(`:license:${record.id}:expires:${dateOnly(record.expires_at)}`)) {
+    return { sent: false, reason: "A licença ou o e-mail mudou; revise os dados antes de reenviar." };
+  }
+  const autoRenewing = Boolean(record.stripe_subscription_id)
+    && !record.billing_cancel_at_period_end && !record.subscription_cancel_at_period_end
+    && ["active", "trialing"].includes(record.subscription_status || record.billing_status || "");
+  const paidPix = await env.merlin_db.prepare(`
+    SELECT id FROM checkout_sessions WHERE provider = 'mercadopago'
+      AND scheduled_renewal_license_id = ? AND payment_status = 'paid'
+      AND renewal_applied_at IS NULL LIMIT 1
+  `).bind(record.id).first<{ id: number }>();
+  if (autoRenewing || paidPix) return { sent: false, reason: "A renovação já está ativa ou foi paga." };
+  const remaining = new Date(record.expires_at).getTime() - now.getTime();
+  const localDays = localDayNumber(new Date(record.expires_at)) - localDayNumber(now);
+  const isExpired = record.notification_type === "access_expired";
+  if (isExpired ? !(remaining < 0 && localDays >= -2 && localDays <= -1)
+    : !(record.license_status === "active" && remaining > 0 && remaining <= 7 * 86_400_000)) {
+    return { sent: false, reason: "A janela deste aviso terminou." };
+  }
+  const newerSent = await env.merlin_db.prepare(`
+    SELECT id FROM billing_notifications
+    WHERE license_id = ? AND id <> ? AND status = 'sent'
+      AND dedupe_key LIKE ? AND sent_at > ?
+    LIMIT 1
+  `).bind(record.id, record.notification_id,
+    `${isExpired ? "access_expired" : "expiration_reminder"}:license:${record.id}:expires:${dateOnly(record.expires_at)}%`,
+    record.notification_updated_at).first<{ id: number }>();
+  if (newerSent) return { sent: false, reason: "Um aviso mais recente já foi entregue." };
+  const sent = await sendOnce(c, {
+    licenseId: record.id, customerId: record.customer_id, provider: record.stripe_subscription_id ? PROVIDER_STRIPE : providerForManualRow(record),
+    notificationType: record.notification_type, dedupeKey: record.dedupe_key, email: record.original_email,
+    name: record.name, ctaUrl: publicAccessUrl(publicOriginFromEnv(env)), expiresAt: record.expires_at,
+    daysUntilExpiry: isExpired ? null : localDays, daysSinceExpiry: isExpired ? Math.abs(localDays) : null,
+    licenseKey: record.license_key, source: "admin",
+  });
+  return sent ? { sent: true } : { sent: false, reason: "Outro envio já está em andamento." };
 }

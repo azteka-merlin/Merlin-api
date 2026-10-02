@@ -46,7 +46,7 @@ import {
 import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings } from "./lib/billing-settings";
 import { getLauncherUpdatePolicySettings, updateLauncherUpdatePolicySettings } from "./lib/launcher-update-policy-settings";
 import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSourceSettings } from "./lib/manifest-source-settings";
-import { getExpirationReminderEligibility, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
+import { getBillingNotificationsDashboard, getExpirationReminderEligibility, retryFailedBillingNotification, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
@@ -2949,6 +2949,44 @@ app.get("/panel-api/licenses/:id/expiration-reminder", async (c) => {
   await requireAdminSession(c);
   const result = await getExpirationReminderEligibility(c, parseLicenseId(c.req.param("id")));
   return c.json({ eligible: result.eligible, reason: result.eligible ? null : result.reason }, 200);
+});
+
+app.get("/panel-api/billing-notifications/dashboard", async (c) => {
+  await requireAdminSession(c);
+  const date = String(c.req.query("date") || "").trim();
+  if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00.000Z`)))) {
+    throw new HTTPException(400, { message: "Data inválida." });
+  }
+  const now = new Date();
+  const todayParts = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
+  const localPart = (type: string) => todayParts.find((part) => part.type === type)?.value || "";
+  const today = `${localPart("year")}-${localPart("month")}-${localPart("day")}`;
+  const selected = date || today;
+  const distance = (Date.parse(`${selected}T00:00:00.000Z`) - Date.parse(`${today}T00:00:00.000Z`)) / 86_400_000;
+  if (!Number.isFinite(distance) || distance < -30 || distance > 14) {
+    throw new HTTPException(400, { message: "Consulte até 30 dias atrás ou 14 dias à frente." });
+  }
+  c.header("Cache-Control", "no-store");
+  return c.json(await getBillingNotificationsDashboard(c.env, selected, now), 200);
+});
+
+app.post("/panel-api/billing-notifications/:id/retry", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const notificationId = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(notificationId) || notificationId <= 0) {
+    throw new HTTPException(400, { message: "Aviso inválido." });
+  }
+  const result = await retryFailedBillingNotification(c.env, notificationId);
+  if (!result.sent) throw new HTTPException(409, { message: result.reason });
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "billing_notification_retried",
+    entityType: "billing_notification",
+    entityId: String(notificationId),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  return c.json({ success: true }, 200);
 });
 
 app.post("/panel-api/licenses/:id/send-expiration-reminder", async (c) => {

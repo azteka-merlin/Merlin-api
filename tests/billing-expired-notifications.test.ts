@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { getExpirationReminderEligibility, runBillingNotificationCron } from "../src/lib/billing-notifications";
+import { getBillingNotificationsDashboard, getExpirationReminderEligibility, retryFailedBillingNotification, runBillingNotificationCron } from "../src/lib/billing-notifications";
 import { sendBillingEmail } from "../src/lib/billing-emails";
 import type { AppBindings } from "../src/types";
 
@@ -15,7 +15,10 @@ function notificationEnv(sqlite: DatabaseSync) {
         bind(...values: unknown[]) { args = values; return this; },
         async all() { return { results: sqlite.prepare(sql).all(...args as []) }; },
         async first() { return sqlite.prepare(sql).get(...args as []) || null; },
-        async run() { return { meta: { changes: Number(sqlite.prepare(sql).run(...args as []).changes) } }; },
+        async run() {
+          const result = sqlite.prepare(sql).run(...args as []);
+          return { meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) } };
+        },
       };
     },
   };
@@ -33,10 +36,12 @@ function setup() {
     CREATE TABLE subscriptions (license_id INTEGER, status TEXT, cancel_at_period_end INTEGER);
     CREATE TABLE customers (id INTEGER PRIMARY KEY, stripe_customer_id TEXT);
     CREATE TABLE checkout_sessions (
-      provider TEXT, scheduled_renewal_license_id INTEGER, payment_status TEXT, renewal_applied_at TEXT
+      id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, scheduled_renewal_license_id INTEGER,
+      payment_status TEXT, renewal_applied_at TEXT
     );
   `);
   sqlite.exec(readFileSync(new URL("../migrations/0026_billing_notifications.sql", import.meta.url), "utf8"));
+  sqlite.exec(readFileSync(new URL("../migrations/0073_billing_notification_attempts.sql", import.meta.url), "utf8"));
   const add = (id: number, expiresAt = "2026-10-09T15:00:00.000Z", accessType = "monthly_subscription",
     stripeId: string | null = null, cancel = 0, status = "active") => {
     sqlite.prepare(`
@@ -95,14 +100,14 @@ describe("billing reminder cadence", () => {
     add(3, "2026-10-09T15:00:00.000Z", "monthly_subscription", "sub_3");
     add(4, "2026-10-09T15:00:00.000Z", "monthly_subscription", "sub_4", 1);
     add(5, "2026-10-09T15:00:00.000Z", "monthly_subscription", null, 0, "revoked");
-    sqlite.prepare("INSERT INTO checkout_sessions VALUES ('mercadopago', 2, 'paid', NULL)").run();
+    sqlite.prepare("INSERT INTO checkout_sessions (provider, scheduled_renewal_license_id, payment_status, renewal_applied_at) VALUES ('mercadopago', 2, 'paid', NULL)").run();
     vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
     const first = await runBillingNotificationCron(env);
     expect(first.expirationSent).toBe(2); // Annual Pix and canceled card.
     expect(sqlite.prepare("SELECT license_id FROM billing_notifications ORDER BY license_id").all())
       .toEqual([{ license_id: 1 }, { license_id: 4 }]);
     sqlite.prepare("UPDATE licenses SET expires_at = '2026-11-09T15:00:00.000Z' WHERE id = 1").run();
-    sqlite.prepare("INSERT INTO checkout_sessions VALUES ('mercadopago', 4, 'paid', NULL)").run();
+    sqlite.prepare("INSERT INTO checkout_sessions (provider, scheduled_renewal_license_id, payment_status, renewal_applied_at) VALUES ('mercadopago', 4, 'paid', NULL)").run();
     vi.setSystemTime(new Date("2026-10-07T12:00:00.000Z"));
     expect((await runBillingNotificationCron(env)).expirationSent).toBe(0);
     sqlite.close();
@@ -140,6 +145,43 @@ describe("billing reminder cadence", () => {
     expect((await runBillingNotificationCron(env)).expiredSent).toBe(0);
     vi.setSystemTime(new Date("2026-10-11T22:00:00.000Z"));
     expect((await runBillingNotificationCron(env)).expiredSent).toBe(1);
+    sqlite.close();
+  });
+
+  test("shows a failed attempt, resends it once, and keeps both outcomes in history", async () => {
+    vi.useFakeTimers();
+    const { sqlite, env, add } = setup();
+    add(1);
+    vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+    vi.mocked(sendBillingEmail).mockRejectedValueOnce(new Error("Resend unavailable"));
+    expect((await runBillingNotificationCron(env)).expirationSent).toBe(0);
+
+    const failed = await getBillingNotificationsDashboard(env, "2026-10-05");
+    expect(failed.schedule).toMatchObject([{ name: "User 1", email: "user1@example.com", reason: "Vence em 4 dias", status: "failed" }]);
+    expect(failed.history).toMatchObject([{ status: "failed", error_message: "Resend unavailable" }]);
+    const notificationId = failed.schedule[0].notificationId!;
+
+    vi.setSystemTime(new Date("2026-10-05T12:05:00.000Z"));
+    expect(await retryFailedBillingNotification(env, notificationId)).toEqual({ sent: true });
+    expect((await retryFailedBillingNotification(env, notificationId)).sent).toBe(false);
+    const after = await getBillingNotificationsDashboard(env, "2026-10-05");
+    expect(after.schedule[0].status).toBe("sent");
+    expect(after.history.map((item) => item.status)).toEqual(["sent", "failed"]);
+    expect(sqlite.prepare("SELECT COUNT(*) AS count FROM billing_notification_attempts").get()).toEqual({ count: 2 });
+    sqlite.close();
+  });
+
+  test("does not resend after the license is renewed", async () => {
+    vi.useFakeTimers();
+    const { sqlite, env, add } = setup();
+    add(1);
+    vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+    vi.mocked(sendBillingEmail).mockRejectedValueOnce(new Error("Temporary failure"));
+    await runBillingNotificationCron(env);
+    const notificationId = Number(sqlite.prepare("SELECT id FROM billing_notifications WHERE license_id = 1").get()?.id);
+    sqlite.prepare("UPDATE licenses SET expires_at = '2026-11-09T15:00:00.000Z' WHERE id = 1").run();
+    expect((await retryFailedBillingNotification(env, notificationId)).sent).toBe(false);
+    expect(sendBillingEmail).toHaveBeenCalledTimes(1);
     sqlite.close();
   });
 });
