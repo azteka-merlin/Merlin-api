@@ -181,12 +181,6 @@ export async function fetchSource(source: ManifestSource, appId: string): Promis
 			if (response.ok) {
 				const zipResponse = await validatedZipResponse(response);
 				if (zipResponse) {
-					console.info("[manifests] source ZIP fetched", {
-						appId,
-						source: source.name,
-						attempt,
-						status: response.status,
-					});
 					return { response: zipResponse, outcome: { name: source.name, result: "missing", kind: "http", status: response.status } };
 				}
 				const outcome = { name: source.name, result: "unavailable" as const, kind: "invalid_zip" as const, status: response.status };
@@ -411,6 +405,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: "r2-override" },
 			});
+			console.info({ event: "manifest_source_selected", appId, source: "r2-override", picsValidation: "not_applicable" });
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
@@ -422,8 +417,10 @@ export class ManifestsRoute extends OpenAPIRoute {
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
 			let selectedResponse = response;
+			let picsValidation: "not_applicable" | "disabled" | "passed" | "unavailable" = "not_applicable";
 			const settingName = source.name === "ryu" ? "ryuu" : source.name;
 			if (settingName === "depotbox" || settingName === "ryuu" || settingName === "steam-api") {
+				picsValidation = sourceSettings.depotValidation[settingName] ? "unavailable" : "disabled";
 				if (sourceSettings.depotValidation[settingName]) {
 					try {
 						picsLookup ||= getPicsDepotIds(env, appId);
@@ -437,6 +434,8 @@ export class ManifestsRoute extends OpenAPIRoute {
 							await selectedResponse.body?.cancel();
 							sourceOutcomes[sourceOutcomes.length - 1] = { name: source.name, result: "unavailable", kind: "missing_pics_depots" };
 							continue;
+						} else {
+							picsValidation = "passed";
 						}
 					} catch (error) {
 						console.warn("[manifests] PICS validation unavailable; serving source", {
@@ -458,6 +457,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: source.name },
 			});
+			console.info({ event: "manifest_source_selected", appId, source: source.name, picsValidation });
 
 			return buildZipResponse(selectedResponse.body!, appId, source.name);
 		}
