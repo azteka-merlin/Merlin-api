@@ -10,6 +10,7 @@ import { GamesSearchRoute } from "./endpoints/games-search";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
+import { getCommunityVoting, postCommunityVote, removeCommunityVote } from "./lib/community-voting";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
@@ -212,8 +213,11 @@ app.use("*", async (c, next) => {
   await next();
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
+  const isVotingRoute = c.req.path === "/votacao" || c.req.path.startsWith("/votacao/");
   const csp = isSwaggerRoute
     ? "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob: https://fastly.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    : isVotingRoute
+      ? "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https://shared.fastly.steamstatic.com; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     : "default-src 'self'; script-src 'self' https://www.mercadopago.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
   const headers = new Headers(c.res.headers);
@@ -1310,6 +1314,11 @@ app.get("/", (c) => {
 });
 
 app.get("/download", (c) => serveDownloadApp(c));
+app.get("/votacao", (c) => serveNoStoreAsset(c, "/votacao/index.html"));
+app.get("/votacao/", (c) => serveNoStoreAsset(c, "/votacao/index.html"));
+app.get("/api/public/votacao/games", getCommunityVoting);
+app.post("/api/public/votacao/votes", postCommunityVote);
+app.post("/api/public/votacao/votes/remove", removeCommunityVote);
 app.get("/checkout", (c) => {
   const target = new URL(c.req.url);
   target.pathname = "/download";
@@ -1360,6 +1369,44 @@ app.post("/panel-api/auth/logout", async (c) => {
 
   await logoutAdminSession(c);
   return c.json({ success: true }, 200);
+});
+
+app.get("/panel-api/community-voting/summary", async (c) => {
+  await requireAdminSession(c);
+  const [votes, networkClaims] = await Promise.all([
+    c.env.merlin_db.prepare("SELECT COUNT(*) AS total FROM community_game_votes").first<{ total: number }>(),
+    c.env.merlin_db.prepare("SELECT COUNT(*) AS total FROM community_vote_ip_claims").first<{ total: number }>(),
+  ]);
+  c.header("Cache-Control", "no-store");
+  return c.json({ votes: votes?.total ?? 0, networkClaims: networkClaims?.total ?? 0 }, 200);
+});
+
+app.post("/panel-api/community-voting/reset", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = await c.req.json().catch(() => null);
+  if (body?.confirm !== "RESETAR VOTACAO") {
+    throw new HTTPException(400, { message: "Confirmacao do reset invalida." });
+  }
+
+  const [votes, networkClaims] = await c.env.merlin_db.batch([
+    c.env.merlin_db.prepare("DELETE FROM community_game_votes"),
+    c.env.merlin_db.prepare("DELETE FROM community_vote_ip_claims"),
+  ]);
+  if (!votes || !networkClaims) {
+    throw new HTTPException(500, { message: "Falha ao resetar a votacao." });
+  }
+  const removedVotes = votes.meta.changes;
+  const removedNetworkClaims = networkClaims.meta.changes;
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: "community_voting_reset",
+    entityType: "community_voting",
+    metadata: { removedVotes, removedNetworkClaims },
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
+  c.header("Cache-Control", "no-store");
+  return c.json({ success: true, removedVotes, removedNetworkClaims }, 200);
 });
 
 app.get("/panel-api/user-activity", async (c) => {
@@ -4041,7 +4088,10 @@ export default {
       await Promise.all([runCatalogEnrichment(env), runCatalogAvailabilitySync(env)]);
       return;
     }
-    if (scheduledAt.getUTCHours() === 12) await runBillingNotificationCron(env);
+    const billingHour = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Sao_Paulo", hour: "2-digit", hourCycle: "h23",
+    }).format(scheduledAt);
+    if (billingHour === "09" || billingHour === "19") await runBillingNotificationCron(env, scheduledAt);
     {
       const cronContext = { env, executionCtx: _ctx } as AppContext;
       await Promise.all([runCatalogAvailabilitySync(env), refreshConfirmedDenuvo(env), applyDuePixScheduledRenewals(cronContext)]);

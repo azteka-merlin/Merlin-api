@@ -4,10 +4,49 @@ import { sendBillingEmail, type BillingEmailKind } from "./billing-emails";
 const PROVIDER_STRIPE = "stripe";
 const PROVIDER_MERCADO_PAGO = "mercadopago";
 const PROVIDER_MANUAL = "manual";
-const REMINDER_WINDOW_START_DAYS = 2;
-const REMINDER_WINDOW_END_DAYS = 4;
-const EXPIRED_LOOKBACK_DAYS = 2;
+const REMINDER_WINDOW_DAYS = 7;
+const BILLING_TIME_ZONE = "America/Sao_Paulo";
 const CRON_LIMIT = 200;
+
+type ReminderSlot = { kind: "reminder" | "expired"; days: number; code: string };
+
+function localParts(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: BILLING_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  return { year: value("year"), month: value("month"), day: value("day"), hour: value("hour") };
+}
+
+function localDayNumber(date: Date) {
+  const { year, month, day } = localParts(date);
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+}
+
+function localDateAtOffset(now: Date, days: number) {
+  return new Date((localDayNumber(now) + days) * 86_400_000).toISOString().slice(0, 10);
+}
+
+function slotsAt(now: Date): ReminderSlot[] {
+  const hour = localParts(now).hour;
+  if (hour === 9) return [
+    { kind: "reminder", days: 7, code: "d-7" },
+    { kind: "reminder", days: 4, code: "d-4" },
+    { kind: "reminder", days: 2, code: "d-2" },
+    { kind: "expired", days: -1, code: "d+1" },
+  ];
+  if (hour === 19) return [
+    { kind: "reminder", days: 7, code: "d-7" }, // Catch D-7 after the exact seven-day renewal window opens.
+    { kind: "reminder", days: 1, code: "d-1" },
+    { kind: "expired", days: -2, code: "d+2" },
+  ];
+  return [];
+}
+
+function slotForExpiry(now: Date, expiresAt: string, kind: ReminderSlot["kind"]) {
+  const days = localDayNumber(new Date(expiresAt)) - localDayNumber(now);
+  return slotsAt(now).find((slot) => slot.kind === kind && slot.days === days) || null;
+}
 
 type BillingNotificationContext = {
   env: AppBindings;
@@ -55,6 +94,12 @@ function addDays(date: Date, days: number) {
 
 function dateOnly(value: string | null | undefined) {
   return value ? value.slice(0, 10) : "";
+}
+
+function displayExpiryDate(value: string) {
+  return new Intl.DateTimeFormat("pt-BR", {
+    timeZone: BILLING_TIME_ZONE, day: "2-digit", month: "2-digit", year: "numeric",
+  }).format(new Date(value));
 }
 
 function publicOriginFromEnv(env: AppBindings) {
@@ -124,7 +169,8 @@ async function reserveBillingNotification(
   },
 ) {
   const now = new Date().toISOString();
-  await c.env.merlin_db
+  const stalePendingBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const reservation = await c.env.merlin_db
     .prepare(
       `
         INSERT INTO billing_notifications (
@@ -136,6 +182,7 @@ async function reserveBillingNotification(
           error_message = NULL,
           updated_at = excluded.updated_at
         WHERE billing_notifications.status = 'failed'
+          OR (billing_notifications.status = 'pending' AND billing_notifications.updated_at < ?)
       `,
     )
     .bind(
@@ -147,8 +194,11 @@ async function reserveBillingNotification(
       input.email,
       now,
       now,
+      stalePendingBefore,
     )
     .run();
+
+  if (!reservation.meta.changes) return null;
 
   const notification = await c.env.merlin_db
     .prepare(
@@ -195,6 +245,8 @@ async function sendOnce(
     name: string | null;
     ctaUrl: string;
     expiresAt?: string | null;
+    daysUntilExpiry?: number | null;
+    daysSinceExpiry?: number | null;
     invoiceAmount?: string | null;
     licenseKey?: string | null;
   },
@@ -209,7 +261,9 @@ async function sendOnce(
       name: input.name,
       ctaUrl: input.ctaUrl,
       idempotencyKey: input.dedupeKey,
-      expiresAt: input.expiresAt ? dateOnly(input.expiresAt) : null,
+      expiresAt: input.expiresAt ? displayExpiryDate(input.expiresAt) : null,
+      daysUntilExpiry: input.daysUntilExpiry,
+      daysSinceExpiry: input.daysSinceExpiry,
       invoiceAmount: input.invoiceAmount,
       licenseKeyMasked: maskLicenseKey(input.licenseKey),
     });
@@ -288,8 +342,9 @@ export async function sendStripeInvoicePaymentFailedNotification(
 }
 
 async function listExpirationReminderCandidates(c: BillingNotificationContext, now: Date) {
-  const start = addDays(now, REMINDER_WINDOW_START_DAYS).toISOString();
-  const end = addDays(now, REMINDER_WINDOW_END_DAYS).toISOString();
+  const slots = slotsAt(now).filter((slot) => slot.kind === "reminder");
+  if (!slots.length) return { results: [] as BillingLicenseRow[] };
+  const dates = slots.map((slot) => localDateAtOffset(now, slot.days));
   return c.env.merlin_db
     .prepare(
       `
@@ -304,19 +359,28 @@ async function listExpirationReminderCandidates(c: BillingNotificationContext, n
         LEFT JOIN customers cst ON cst.id = l.customer_id
         WHERE l.status = 'active'
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') = 'monthly_subscription'
-          AND datetime(l.expires_at) BETWEEN datetime(?) AND datetime(?)
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND date(l.expires_at, '-3 hours') IN (${dates.map(() => "?").join(", ")})
+          AND datetime(l.expires_at) > datetime(?)
+          AND datetime(l.expires_at) <= datetime(?)
           AND NOT (
             l.stripe_subscription_id IS NOT NULL
             AND COALESCE(l.billing_cancel_at_period_end, 0) = 0
             AND COALESCE(s.cancel_at_period_end, 0) = 0
             AND COALESCE(s.status, l.billing_status, '') IN ('active', 'trialing')
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM checkout_sessions cs
+            WHERE cs.provider = 'mercadopago'
+              AND cs.scheduled_renewal_license_id = l.id
+              AND cs.payment_status = 'paid'
+              AND cs.renewal_applied_at IS NULL
+          )
         ORDER BY datetime(l.expires_at) ASC
         LIMIT ?
       `,
     )
-    .bind(start, end, CRON_LIMIT)
+    .bind(...dates, now.toISOString(), addDays(now, REMINDER_WINDOW_DAYS).toISOString(), CRON_LIMIT)
     .all<BillingLicenseRow>();
 }
 
@@ -325,8 +389,7 @@ export async function getExpirationReminderEligibility(
   licenseId: number,
   now = new Date(),
 ) {
-  const start = addDays(now, REMINDER_WINDOW_START_DAYS).toISOString();
-  const end = addDays(now, REMINDER_WINDOW_END_DAYS).toISOString();
+  const end = addDays(now, REMINDER_WINDOW_DAYS).toISOString();
   const license = await c.env.merlin_db
     .prepare(
       `
@@ -342,18 +405,26 @@ export async function getExpirationReminderEligibility(
         WHERE l.id = ?
           AND l.status = 'active'
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') = 'monthly_subscription'
-          AND datetime(l.expires_at) BETWEEN datetime(?) AND datetime(?)
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND datetime(l.expires_at) > datetime(?)
+          AND datetime(l.expires_at) <= datetime(?)
           AND NOT (
             l.stripe_subscription_id IS NOT NULL
             AND COALESCE(l.billing_cancel_at_period_end, 0) = 0
             AND COALESCE(s.cancel_at_period_end, 0) = 0
             AND COALESCE(s.status, l.billing_status, '') IN ('active', 'trialing')
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM checkout_sessions cs
+            WHERE cs.provider = 'mercadopago'
+              AND cs.scheduled_renewal_license_id = l.id
+              AND cs.payment_status = 'paid'
+              AND cs.renewal_applied_at IS NULL
+          )
         LIMIT 1
       `,
     )
-    .bind(licenseId, start, end)
+    .bind(licenseId, now.toISOString(), end)
     .first<BillingLicenseRow>();
 
   if (!license) return { eligible: false as const, reason: "Licença fora da janela de aviso." };
@@ -368,6 +439,21 @@ export async function getExpirationReminderEligibility(
     return { eligible: false as const, reason: "Aviso já enviado para este vencimento." };
   }
 
+  const today = localDateAtOffset(now, 0);
+  const sameDay = await c.env.merlin_db
+    .prepare(`SELECT id FROM billing_notifications WHERE license_id = ? AND notification_type IN ('manual_expiration_reminder', 'stripe_cancel_expiration_reminder') AND status = 'sent' AND date(sent_at, '-3 hours') = ? LIMIT 1`)
+    .bind(license.id, today)
+    .first<BillingNotificationRow>();
+  if (sameDay) return { eligible: false as const, reason: "Aviso já enviado hoje para esta licença." };
+
+  const sentCount = await c.env.merlin_db
+    .prepare("SELECT COUNT(*) AS count FROM billing_notifications WHERE license_id = ? AND status = 'sent' AND dedupe_key LIKE ?")
+    .bind(license.id, `${dedupeKey}%`)
+    .first<{ count: number }>();
+  if ((sentCount?.count || 0) >= 4) {
+    return { eligible: false as const, reason: "Os quatro avisos deste vencimento já foram enviados." };
+  }
+
   return { eligible: true as const, license };
 }
 
@@ -380,8 +466,9 @@ export async function sendExpirationReminderForLicense(c: BillingNotificationCon
 }
 
 async function listExpiredAccessCandidates(c: BillingNotificationContext, now: Date) {
-  const start = addDays(now, -EXPIRED_LOOKBACK_DAYS).toISOString();
-  const end = now.toISOString();
+  const slots = slotsAt(now).filter((slot) => slot.kind === "expired");
+  if (!slots.length) return { results: [] as BillingLicenseRow[] };
+  const dates = slots.map((slot) => localDateAtOffset(now, slot.days));
   return c.env.merlin_db
     .prepare(
       `
@@ -394,10 +481,10 @@ async function listExpiredAccessCandidates(c: BillingNotificationContext, now: D
         FROM licenses l
         LEFT JOIN subscriptions s ON s.license_id = l.id
         LEFT JOIN customers cst ON cst.id = l.customer_id
-        WHERE l.status = 'active'
+        WHERE l.status IN ('active', 'expired')
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') = 'monthly_subscription'
-          AND datetime(l.expires_at) >= datetime(?)
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND date(l.expires_at, '-3 hours') IN (${dates.map(() => "?").join(", ")})
           AND datetime(l.expires_at) < datetime(?)
           AND NOT (
             l.stripe_subscription_id IS NOT NULL
@@ -405,11 +492,18 @@ async function listExpiredAccessCandidates(c: BillingNotificationContext, now: D
             AND COALESCE(s.cancel_at_period_end, 0) = 0
             AND COALESCE(s.status, l.billing_status, '') IN ('active', 'trialing')
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM checkout_sessions cs
+            WHERE cs.provider = 'mercadopago'
+              AND cs.scheduled_renewal_license_id = l.id
+              AND cs.payment_status = 'paid'
+              AND cs.renewal_applied_at IS NULL
+          )
         ORDER BY datetime(l.expires_at) ASC
         LIMIT ?
       `,
     )
-    .bind(start, end, CRON_LIMIT)
+    .bind(...dates, now.toISOString(), CRON_LIMIT)
     .all<BillingLicenseRow>();
 }
 
@@ -424,18 +518,35 @@ function providerForManualRow(row: BillingLicenseRow) {
   return row.customer_id ? PROVIDER_MERCADO_PAGO : PROVIDER_MANUAL;
 }
 
-async function sendExpirationReminder(c: BillingNotificationContext, row: BillingLicenseRow, origin: string) {
+async function replacedByLegacyEmail(c: BillingNotificationContext, row: BillingLicenseRow, slot: ReminderSlot) {
+  const prefix = slot.kind === "reminder" ? "expiration_reminder" : "access_expired";
+  const legacy = await c.env.merlin_db
+    .prepare("SELECT sent_at FROM billing_notifications WHERE dedupe_key = ? AND status = 'sent' LIMIT 1")
+    .bind(`${prefix}:license:${row.id}:expires:${dateOnly(row.expires_at)}`)
+    .first<{ sent_at: string | null }>();
+  if (!legacy?.sent_at) return false;
+  const legacyDays = localDayNumber(new Date(row.expires_at)) - localDayNumber(new Date(legacy.sent_at));
+  if (slot.kind === "expired") {
+    return legacyDays === slot.days || (slot.days === -1 && legacyDays === 0);
+  }
+  const previous = slot.days === 1 ? 2 : slot.days === 2 ? 4 : slot.days === 4 ? 7 : 8;
+  return legacyDays >= slot.days && legacyDays < previous;
+}
+
+async function sendExpirationReminder(c: BillingNotificationContext, row: BillingLicenseRow, origin: string, slot?: ReminderSlot) {
+  const suffix = slot ? `:${slot.code}` : "";
   if (isStripeCancelAtPeriodEnd(row)) {
     return sendOnce(c, {
       licenseId: row.id,
       customerId: row.customer_id,
       provider: PROVIDER_STRIPE,
       notificationType: "stripe_cancel_expiration_reminder",
-      dedupeKey: `expiration_reminder:license:${row.id}:expires:${dateOnly(row.expires_at)}`,
+      dedupeKey: `expiration_reminder:license:${row.id}:expires:${dateOnly(row.expires_at)}${suffix}`,
       email: row.contact,
       name: row.name,
       ctaUrl: publicAccessUrl(origin),
       expiresAt: row.expires_at,
+      daysUntilExpiry: slot?.days,
       licenseKey: row.license_key,
     });
   }
@@ -445,33 +556,34 @@ async function sendExpirationReminder(c: BillingNotificationContext, row: Billin
     customerId: row.customer_id,
     provider: providerForManualRow(row),
     notificationType: "manual_expiration_reminder",
-    dedupeKey: `expiration_reminder:license:${row.id}:expires:${dateOnly(row.expires_at)}`,
+    dedupeKey: `expiration_reminder:license:${row.id}:expires:${dateOnly(row.expires_at)}${suffix}`,
     email: row.contact,
     name: row.name,
     ctaUrl: publicAccessUrl(origin),
     expiresAt: row.expires_at,
+    daysUntilExpiry: slot?.days,
     licenseKey: row.license_key,
   });
 }
 
-async function sendAccessExpired(c: BillingNotificationContext, row: BillingLicenseRow, origin: string) {
+async function sendAccessExpired(c: BillingNotificationContext, row: BillingLicenseRow, origin: string, slot: ReminderSlot) {
   return sendOnce(c, {
     licenseId: row.id,
     customerId: row.customer_id,
     provider: row.stripe_subscription_id ? PROVIDER_STRIPE : providerForManualRow(row),
     notificationType: "access_expired",
-    dedupeKey: `access_expired:license:${row.id}:expires:${dateOnly(row.expires_at)}`,
+    dedupeKey: `access_expired:license:${row.id}:expires:${dateOnly(row.expires_at)}:${slot.code}`,
     email: row.contact,
     name: row.name,
     ctaUrl: publicAccessUrl(origin),
     expiresAt: row.expires_at,
+    daysSinceExpiry: Math.abs(slot.days),
     licenseKey: row.license_key,
   });
 }
 
-export async function runBillingNotificationCron(env: AppBindings) {
+export async function runBillingNotificationCron(env: AppBindings, now = new Date()) {
   const c = { env };
-  const now = new Date();
   const origin = publicOriginFromEnv(env);
   const summary = {
     expirationCandidates: 0,
@@ -484,7 +596,9 @@ export async function runBillingNotificationCron(env: AppBindings) {
   summary.expirationCandidates = reminderRows.length;
   for (const row of reminderRows) {
     try {
-      if (await sendExpirationReminder(c, row, origin)) summary.expirationSent += 1;
+      const slot = slotForExpiry(now, row.expires_at, "reminder");
+      if (!slot || await replacedByLegacyEmail(c, row, slot)) continue;
+      if (await sendExpirationReminder(c, row, origin, slot)) summary.expirationSent += 1;
     } catch (error) {
       console.warn("[billing-notifications] expiration reminder failed", row.id, error instanceof Error ? error.message : error);
     }
@@ -494,7 +608,9 @@ export async function runBillingNotificationCron(env: AppBindings) {
   summary.expiredCandidates = expiredRows.length;
   for (const row of expiredRows) {
     try {
-      if (await sendAccessExpired(c, row, origin)) summary.expiredSent += 1;
+      const slot = slotForExpiry(now, row.expires_at, "expired");
+      if (!slot || await replacedByLegacyEmail(c, row, slot)) continue;
+      if (await sendAccessExpired(c, row, origin, slot)) summary.expiredSent += 1;
     } catch (error) {
       console.warn("[billing-notifications] access expired email failed", row.id, error instanceof Error ? error.message : error);
     }

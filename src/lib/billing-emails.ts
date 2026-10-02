@@ -17,6 +17,8 @@ export type BillingEmailInput = {
   ctaUrl: string;
   idempotencyKey: string;
   expiresAt?: string | null;
+  daysUntilExpiry?: number | null;
+  daysSinceExpiry?: number | null;
   invoiceAmount?: string | null;
   licenseKeyMasked?: string | null;
 };
@@ -115,28 +117,30 @@ function renderManualExpiration(input: BillingEmailInput) {
   const name = escapeHtml(customerName(input.name));
   const expiresAt = escapeHtml(input.expiresAt || "");
   const licenseBlock = optionalLicenseBlock(input.licenseKeyMasked);
+  const days = input.daysUntilExpiry;
+  const title = days ? `Seu acesso Merlin vence em ${days} ${days === 1 ? "dia" : "dias"}` : "Seu acesso Merlin vence em breve";
   return {
-    subject: "Seu acesso Merlin vence em breve",
+    subject: title,
     preheader: "Renove seu acesso para continuar usando o Merlin sem interrupção.",
     text: [
-      "Seu acesso Merlin vence em breve",
+      title,
       "",
-      `Olá, ${customerName(input.name)}. Seu acesso mensal ao Merlin está disponível até ${input.expiresAt || ""}.`,
+      `Olá, ${customerName(input.name)}. Seu acesso ao Merlin está disponível até ${input.expiresAt || ""}.`,
       "Como este acesso não possui renovação automática, você pode renovar manualmente para continuar usando o Merlin.",
       "",
       `Renovar acesso: ${input.ctaUrl}`,
     ].join("\n"),
     html: renderShell({
-      title: "Seu acesso Merlin vence em breve",
+      title,
       preheader: "Renove seu acesso para continuar usando o Merlin sem interrupção.",
-      heroLabel: "Acesso mensal",
+      heroLabel: "Acesso Merlin",
       eyebrow: "Renovação",
-      heading: "Seu acesso vence em breve",
+      heading: days ? `Seu acesso vence em ${days} ${days === 1 ? "dia" : "dias"}` : "Seu acesso vence em breve",
       ctaLabel: "Renovar acesso",
       ctaUrl: input.ctaUrl,
       footer: "Merlin Launcher • Este e-mail foi enviado porque existe um acesso Merlin vinculado a este endereço.",
       bodyHtml: `
-              <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#374151;">Olá, ${name}. Seu acesso mensal ao Merlin está disponível até <strong>${expiresAt}</strong>.</p>
+              <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#374151;">Olá, ${name}. Seu acesso ao Merlin está disponível até <strong>${expiresAt}</strong>.</p>
               <p style="margin:0 0 22px;font-size:14px;line-height:22px;color:#374151;">Como este acesso não possui renovação automática, você pode renovar manualmente para continuar usando o Merlin.</p>
 ${licenseBlock}
               <p style="margin:22px 0 0;font-size:12px;line-height:18px;color:#6b7280;">Se você já renovou, pode ignorar este aviso.</p>`,
@@ -148,21 +152,23 @@ function renderStripeCancelExpiration(input: BillingEmailInput) {
   const name = escapeHtml(customerName(input.name));
   const expiresAt = escapeHtml(input.expiresAt || "");
   const licenseBlock = optionalLicenseBlock(input.licenseKeyMasked);
+  const days = input.daysUntilExpiry;
+  const title = days ? `Seu acesso Merlin vence em ${days} ${days === 1 ? "dia" : "dias"}` : "Sua renovação automática está desativada";
   return {
-    subject: "Sua renovação automática está desativada",
+    subject: title,
     preheader: "Seu acesso continua ativo até o fim do período pago.",
     text: [
-      "Sua renovação automática está desativada",
+      title,
       "",
       `Olá, ${customerName(input.name)}. Sua assinatura Merlin está ativa até ${input.expiresAt || ""}, mas a renovação automática está desativada.`,
-      "Se quiser continuar com a mensalidade sem interrupção, revise as opções da sua assinatura.",
+      "Se quiser continuar com o acesso sem interrupção, revise as opções da sua assinatura.",
       "",
       `Gerenciar assinatura: ${input.ctaUrl}`,
     ].join("\n"),
     html: renderShell({
-      title: "Sua renovação automática está desativada",
+      title,
       preheader: "Seu acesso continua ativo até o fim do período pago.",
-      heroLabel: "Assinatura mensal",
+      heroLabel: "Assinatura Merlin",
       eyebrow: "Renovação automática desativada",
       heading: "Seu acesso continua ativo por enquanto",
       ctaLabel: "Gerenciar assinatura",
@@ -170,7 +176,7 @@ function renderStripeCancelExpiration(input: BillingEmailInput) {
       footer: "Merlin Launcher • Este e-mail foi enviado porque sua assinatura mensal está perto do fim do período pago.",
       bodyHtml: `
               <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#374151;">Olá, ${name}. Sua assinatura Merlin está ativa até <strong>${expiresAt}</strong>, mas a renovação automática está desativada.</p>
-              <p style="margin:0 0 22px;font-size:14px;line-height:22px;color:#374151;">Se quiser continuar com a mensalidade sem interrupção, revise as opções da sua assinatura.</p>
+              <p style="margin:0 0 22px;font-size:14px;line-height:22px;color:#374151;">Se quiser continuar com o acesso sem interrupção, revise as opções da sua assinatura.</p>
 ${licenseBlock}
               <p style="margin:22px 0 0;font-size:12px;line-height:18px;color:#6b7280;">Se você desativou a renovação de propósito, não precisa fazer nada.</p>`,
     }),
@@ -251,11 +257,13 @@ function renderAccessExpired(input: BillingEmailInput) {
   const name = escapeHtml(customerName(input.name));
   const expiresAt = escapeHtml(input.expiresAt || "");
   const licenseBlock = optionalLicenseBlock(input.licenseKeyMasked);
+  const days = input.daysSinceExpiry;
+  const title = days ? `Seu acesso Merlin expirou há ${days} ${days === 1 ? "dia" : "dias"}` : "Seu acesso Merlin expirou";
   return {
-    subject: "Seu acesso Merlin expirou",
+    subject: title,
     preheader: "Regularize seu acesso para voltar a usar o Merlin.",
     text: [
-      "Seu acesso Merlin expirou",
+      title,
       "",
       `Olá, ${customerName(input.name)}. Seu acesso ao Merlin expirou em ${input.expiresAt || ""}.`,
       "Você pode regularizar o acesso usando a mesma chave. Não é necessário criar uma nova conta.",
@@ -263,7 +271,7 @@ function renderAccessExpired(input: BillingEmailInput) {
       `Regularizar acesso: ${input.ctaUrl}`,
     ].join("\n"),
     html: renderShell({
-      title: "Seu acesso Merlin expirou",
+      title,
       preheader: "Regularize seu acesso para voltar a usar o Merlin.",
       heroLabel: "Acesso expirado",
       eyebrow: "Regularização",

@@ -1,0 +1,977 @@
+[
+  {
+    "id": "1273400",
+    "appid": "1273400",
+    "name": "Construction Simulator",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1273400/header.jpg",
+    "genres": [
+      "Simulação"
+    ],
+    "currentPrice": 739,
+    "originalPrice": 7399,
+    "discount": 90,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1570010",
+    "appid": "1570010",
+    "name": "FAR: Changing Tides",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1570010/header.jpg",
+    "genres": [
+      "Aventura"
+    ],
+    "currentPrice": 1199,
+    "originalPrice": 3999,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "678960",
+    "appid": "678960",
+    "name": "CODE VEIN",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/678960/header.jpg",
+    "genres": [
+      "Ação",
+      "RPG"
+    ],
+    "currentPrice": 1499,
+    "originalPrice": 14999,
+    "discount": 90,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1029690",
+    "appid": "1029690",
+    "name": "Sniper Elite 5",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1029690/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 1879,
+    "originalPrice": 9399,
+    "discount": 80,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1142710",
+    "appid": "1142710",
+    "name": "Total War: WARHAMMER III",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1142710/header.jpg",
+    "genres": [
+      "Estratégia"
+    ],
+    "currentPrice": 3748,
+    "originalPrice": 24990,
+    "discount": 85,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1805480",
+    "appid": "1805480",
+    "name": "Like a Dragon: Ishin!",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1805480/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 4122,
+    "originalPrice": 16490,
+    "discount": 75,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1602010",
+    "appid": "1602010",
+    "name": "Persona 4 Arena Ultimax",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1602010/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 4197,
+    "originalPrice": 13990,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "368260",
+    "appid": "368260",
+    "name": "Marvel's Midnight Suns",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/368260/header.jpg",
+    "genres": [
+      "Estratégia",
+      "RPG"
+    ],
+    "currentPrice": 4498,
+    "originalPrice": 29990,
+    "discount": 85,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1794960",
+    "appid": "1794960",
+    "name": "Sonic Origins",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1794960/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 4739,
+    "originalPrice": 15799,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2058190",
+    "appid": "2058190",
+    "name": "Lost Judgment",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2058190/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 4947,
+    "originalPrice": 16490,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2022670",
+    "appid": "2022670",
+    "name": "SONIC SUPERSTARS",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2022670/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 4947,
+    "originalPrice": 16490,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1113000",
+    "appid": "1113000",
+    "name": "Persona 4 Golden",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1113000/header.jpg",
+    "genres": [
+      "RPG"
+    ],
+    "currentPrice": 4995,
+    "originalPrice": 9990,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1809700",
+    "appid": "1809700",
+    "name": "Persona 3 Portable",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1809700/header.jpg",
+    "genres": [
+      "RPG"
+    ],
+    "currentPrice": 4999,
+    "originalPrice": 9999,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "801800",
+    "appid": "801800",
+    "name": "Atomfall",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/801800/header.jpg",
+    "genres": [
+      "Aventura",
+      "Ação"
+    ],
+    "currentPrice": 5399,
+    "originalPrice": 13499,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2688950",
+    "appid": "2688950",
+    "name": "Planet Coaster 2",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2688950/header.jpg",
+    "genres": [
+      "Simulação",
+      "Estratégia"
+    ],
+    "currentPrice": 5399,
+    "originalPrice": 13499,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2169200",
+    "appid": "2169200",
+    "name": "Sniper Elite: Resistance",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2169200/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 5399,
+    "originalPrice": 13499,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2361770",
+    "appid": "2361770",
+    "name": "SHINOBI: Art of Vengeance",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2361770/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 5495,
+    "originalPrice": 10990,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2556990",
+    "appid": "2556990",
+    "name": "Beyond Good & Evil - 20th Anniversary Edition",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2556990/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 5999,
+    "originalPrice": 9999,
+    "discount": 40,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1777620",
+    "appid": "1777620",
+    "name": "Soul Hackers 2",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1777620/header.jpg",
+    "genres": [
+      "RPG"
+    ],
+    "currentPrice": 5999,
+    "originalPrice": 29995,
+    "discount": 80,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2375550",
+    "appid": "2375550",
+    "name": "Like a Dragon Gaiden: The Man Who Erased His Name",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2375550/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 6225,
+    "originalPrice": 24900,
+    "discount": 75,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3061810",
+    "appid": "3061810",
+    "name": "Like a Dragon: Pirate Yakuza in Hawaii",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3061810/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura",
+      "RPG"
+    ],
+    "currentPrice": 6247,
+    "originalPrice": 24990,
+    "discount": 75,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2513280",
+    "appid": "2513280",
+    "name": "SONIC X SHADOW GENERATIONS",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2513280/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 6297,
+    "originalPrice": 20990,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1364780",
+    "appid": "1364780",
+    "name": "Street Fighter™ 6",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1364780/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 7160,
+    "originalPrice": 17900,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2185060",
+    "appid": "2185060",
+    "name": "Two Point Museum",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2185060/header.jpg",
+    "genres": [
+      "Simulação",
+      "Estratégia"
+    ],
+    "currentPrice": 7363,
+    "originalPrice": 10990,
+    "discount": 33,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1382330",
+    "appid": "1382330",
+    "name": "Persona® 5 Strikers",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1382330/header.jpg",
+    "genres": [
+      "Aventura"
+    ],
+    "currentPrice": 7470,
+    "originalPrice": 24900,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1785650",
+    "appid": "1785650",
+    "name": "TopSpin 2K25",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1785650/header.jpg",
+    "genres": [
+      "Simulação"
+    ],
+    "currentPrice": 7492,
+    "originalPrice": 9990,
+    "discount": 25,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2072450",
+    "appid": "2072450",
+    "name": "Like a Dragon: Infinite Wealth",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2072450/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 7497,
+    "originalPrice": 29990,
+    "discount": 75,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2254740",
+    "appid": "2254740",
+    "name": "Persona 5 Tactica",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2254740/header.jpg",
+    "genres": [
+      "RPG",
+      "Estratégia",
+      "Ação"
+    ],
+    "currentPrice": 7497,
+    "originalPrice": 24990,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2495100",
+    "appid": "2495100",
+    "name": "Hello Kitty Island Adventure",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2495100/header.jpg",
+    "genres": [
+      "Aventura",
+      "Simulação"
+    ],
+    "currentPrice": 8109,
+    "originalPrice": 14745,
+    "discount": 45,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1761390",
+    "appid": "1761390",
+    "name": "Hatsune Miku: Project DIVA Mega Mix+",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1761390/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 8598,
+    "originalPrice": 21495,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1875830",
+    "appid": "1875830",
+    "name": "Shin Megami Tensei V: Vengeance",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1875830/header.jpg",
+    "genres": [
+      "RPG",
+      "Aventura"
+    ],
+    "currentPrice": 8997,
+    "originalPrice": 29990,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "491540",
+    "appid": "491540",
+    "name": "The Bus",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/491540/header.jpg",
+    "genres": [
+      "Simulação"
+    ],
+    "currentPrice": 9719,
+    "originalPrice": 10799,
+    "discount": 10,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2424110",
+    "appid": "2424110",
+    "name": "Demon Slayer -Kimetsu no Yaiba- Sweep the Board!",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2424110/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 9897,
+    "originalPrice": 32990,
+    "discount": 70,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2928600",
+    "appid": "2928600",
+    "name": "Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles 2",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2928600/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 10796,
+    "originalPrice": 26990,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3936610",
+    "appid": "3936610",
+    "name": "Monopoly: Star Wars™ Heroes vs. Villains",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3936610/4c994dffe6840c2ee0e653afe281685ae85db64c/header.jpg?t=1782837212",
+    "genres": [
+      "Estratégia"
+    ],
+    "currentPrice": 11249,
+    "originalPrice": 14999,
+    "discount": 25,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2288350",
+    "appid": "2288350",
+    "name": "RAIDOU Remastered: The Mystery of the Soulless Army",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2288350/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 11544,
+    "originalPrice": 20990,
+    "discount": 45,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2679460",
+    "appid": "2679460",
+    "name": "Metaphor: ReFantazio",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2679460/header.jpg",
+    "genres": [
+      "RPG",
+      "Aventura"
+    ],
+    "currentPrice": 11996,
+    "originalPrice": 29990,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2486820",
+    "appid": "2486820",
+    "name": "Sonic Racing: CrossWorlds",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2486820/header.jpg",
+    "genres": [
+      "Outros"
+    ],
+    "currentPrice": 11996,
+    "originalPrice": 29990,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2246340",
+    "appid": "2246340",
+    "name": "Monster Hunter Wilds",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2246340/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 12675,
+    "originalPrice": 16900,
+    "discount": 25,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2624870",
+    "appid": "2624870",
+    "name": "Life is Strange: Reunion",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2624870/09c486f1ebf7c30ebf3abf5df054833b03c3367d/header.jpg?t=1777999087",
+    "genres": [
+      "Aventura",
+      "Ação"
+    ],
+    "currentPrice": 13492,
+    "originalPrice": 17990,
+    "discount": 25,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3059520",
+    "appid": "3059520",
+    "name": "F1® 25",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3059520/76dc8ac45f1bd6dec26e04434ca1c8814e7bb330/header.jpg?t=1786646076",
+    "genres": [
+      "Simulação"
+    ],
+    "currentPrice": 13930,
+    "originalPrice": 19900,
+    "discount": 30,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1490890",
+    "appid": "1490890",
+    "name": "Demon Slayer -Kimetsu no Yaiba- The Hinokami Chronicles",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1490890/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 14450,
+    "originalPrice": 28900,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3937550",
+    "appid": "3937550",
+    "name": "Yakuza Kiwami 3 & Dark Ties",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3937550/a90df0d7be6d8f1dd5d8eceb796840ff522d002a/header.jpg?t=1781257873",
+    "genres": [
+      "Ação",
+      "Aventura",
+      "RPG"
+    ],
+    "currentPrice": 14825,
+    "originalPrice": 29650,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2958130",
+    "appid": "2958130",
+    "name": "Jurassic World Evolution 3",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2958130/df39f8c59232633e8e01ab63313b095402bdd0d5/header.jpg?t=1790687062",
+    "genres": [
+      "Simulação",
+      "Estratégia"
+    ],
+    "currentPrice": 15142,
+    "originalPrice": 22600,
+    "discount": 33,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3717070",
+    "appid": "3717070",
+    "name": "WWE 2K26",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3717070/8b97e5cf401bdb74cdf51dbbded07cb1c09a9101/header_alt_assets_1.jpg?t=1790892362",
+    "genres": [
+      "Simulação"
+    ],
+    "currentPrice": 15199,
+    "originalPrice": 37999,
+    "discount": 60,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "1295660",
+    "appid": "1295660",
+    "name": "Sid Meier's Civilization VII",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1295660/header.jpg",
+    "genres": [
+      "Estratégia",
+      "Simulação"
+    ],
+    "currentPrice": 17495,
+    "originalPrice": 34990,
+    "discount": 50,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3274580",
+    "appid": "3274580",
+    "name": "Anno 117: Pax Romana",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3274580/header.jpg",
+    "genres": [
+      "Estratégia",
+      "Simulação"
+    ],
+    "currentPrice": 19499,
+    "originalPrice": 29999,
+    "discount": 35,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2852190",
+    "appid": "2852190",
+    "name": "Monster Hunter Stories 3: Twisted Reflection",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2852190/de3717096a093d7bf9ab504563621bc17e37ccf4/header.jpg?t=1790900261",
+    "genres": [
+      "RPG",
+      "Aventura"
+    ],
+    "currentPrice": 20930,
+    "originalPrice": 29900,
+    "discount": 30,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "2244210",
+    "appid": "2244210",
+    "name": "Echoes of Aincrad",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2244210/25fb6350451b21ca824562c8d1eebe89091347cc/header.jpg?t=1789707603",
+    "genres": [
+      "Ação",
+      "RPG"
+    ],
+    "currentPrice": 21245,
+    "originalPrice": 30350,
+    "discount": 30,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "3483510",
+    "appid": "3483510",
+    "name": "The Adventures of Elliot: The Millennium Tales",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3483510/3c96b19255b69aa9b2e131dda3e19d622b0d6562/header.jpg?t=1789463096",
+    "genres": [
+      "Ação",
+      "Aventura",
+      "RPG"
+    ],
+    "currentPrice": 25492,
+    "originalPrice": 33990,
+    "discount": 25,
+    "available": true,
+    "source": "Denuvo Available"
+  },
+  {
+    "id": "934700",
+    "appid": "934700",
+    "name": "Dead Island 2",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/934700/header.jpg",
+    "genres": [
+      "Outros"
+    ],
+    "currentPrice": 2490,
+    "originalPrice": 24900,
+    "discount": 90,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "668580",
+    "appid": "668580",
+    "name": "Atomic Heart",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/668580/header.jpg",
+    "genres": [
+      "Aventura",
+      "Ação"
+    ],
+    "currentPrice": 3998,
+    "originalPrice": 19990,
+    "discount": 80,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "1971870",
+    "appid": "1971870",
+    "name": "Mortal Kombat 1",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1971870/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 3999,
+    "originalPrice": 19999,
+    "discount": 80,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "1693980",
+    "appid": "1693980",
+    "name": "Dead Space",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1693980/header.jpg",
+    "genres": [
+      "Outros"
+    ],
+    "currentPrice": 4980,
+    "originalPrice": 24900,
+    "discount": 80,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "1237320",
+    "appid": "1237320",
+    "name": "Sonic Frontiers",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1237320/header.jpg",
+    "genres": [
+      "Aventura",
+      "Ação"
+    ],
+    "currentPrice": 5771,
+    "originalPrice": 16490,
+    "discount": 65,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "287700",
+    "appid": "287700",
+    "name": "METAL GEAR SOLID V: THE PHANTOM PAIN",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/287700/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 5940,
+    "originalPrice": 9900,
+    "discount": 40,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "2055290",
+    "appid": "2055290",
+    "name": "Sonic Colors: Ultimate",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2055290/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 5985,
+    "originalPrice": 19950,
+    "discount": 70,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "3035570",
+    "appid": "3035570",
+    "name": "Assassin's Creed Mirage",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3035570/header.jpg",
+    "genres": [
+      "Aventura"
+    ],
+    "currentPrice": 6299,
+    "originalPrice": 20999,
+    "discount": 70,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "2161700",
+    "appid": "2161700",
+    "name": "Persona 3 Reload",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2161700/header.jpg",
+    "genres": [
+      "RPG"
+    ],
+    "currentPrice": 7497,
+    "originalPrice": 24990,
+    "discount": 70,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "1687950",
+    "appid": "1687950",
+    "name": "Persona 5 Royal",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1687950/header.jpg",
+    "genres": [
+      "RPG"
+    ],
+    "currentPrice": 7497,
+    "originalPrice": 24990,
+    "discount": 70,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "2840770",
+    "appid": "2840770",
+    "name": "Avatar: Frontiers of Pandora™",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2840770/header.jpg",
+    "genres": [
+      "Aventura",
+      "Ação"
+    ],
+    "currentPrice": 8249,
+    "originalPrice": 14999,
+    "discount": 45,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "2842040",
+    "appid": "2842040",
+    "name": "Star Wars Outlaws",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2842040/header.jpg",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 8749,
+    "originalPrice": 34999,
+    "discount": 75,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "2680010",
+    "appid": "2680010",
+    "name": "The First Berserker: Khazan",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2680010/header.jpg",
+    "genres": [
+      "Outros"
+    ],
+    "currentPrice": 13770,
+    "originalPrice": 22950,
+    "discount": 40,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "3159330",
+    "appid": "3159330",
+    "name": "Assassin’s Creed Shadows",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3159330/header.jpg",
+    "genres": [
+      "Outros"
+    ],
+    "currentPrice": 13999,
+    "originalPrice": 34999,
+    "discount": 60,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "1941540",
+    "appid": "1941540",
+    "name": "Mafia: The Old Country",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1941540/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 14994,
+    "originalPrice": 24990,
+    "discount": 40,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "3489700",
+    "appid": "3489700",
+    "name": "Stellar Blade™",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3489700/header.jpg",
+    "genres": [
+      "Ação"
+    ],
+    "currentPrice": 16743,
+    "originalPrice": 24990,
+    "discount": 33,
+    "available": true,
+    "source": "Correção"
+  },
+  {
+    "id": "3357650",
+    "appid": "3357650",
+    "name": "PRAGMATA",
+    "image": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3357650/e32e168b25ed68a0cf6264c220c07e96c2abfb56/header.jpg?t=1789603448",
+    "genres": [
+      "Ação",
+      "Aventura"
+    ],
+    "currentPrice": 20720,
+    "originalPrice": 25900,
+    "discount": 20,
+    "available": true,
+    "source": "Correção"
+  }
+]
