@@ -3,9 +3,14 @@ import { resolveSteamGameByAppId, searchGamesForCatalog } from "../endpoints/gam
 import type { AppContext } from "../types";
 
 const HOME_IMAGE_PREFIX = "home";
+const HOME_REMOTE_IMAGE_CACHE_PREFIX = "home/remote-cache";
 const MAX_HOME_IMAGE_BYTES = 8 * 1024 * 1024;
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const SLOT_LIMITS = { hero: 30, side: 2, showcase: 4 } as const;
+
+function originLabel(url: string) {
+  try { return new URL(url).hostname; } catch { return "invalid_url"; }
+}
 
 export type HomeSlotType = keyof typeof SLOT_LIMITS;
 type HomeAction = "none" | "premium" | "add_game";
@@ -303,6 +308,7 @@ export async function deleteHomeContent(c: AppContext, value: string | number) {
   if (row.slot_type !== "hero") throw new HTTPException(400, { message: "Cards fixos devem ser desativados, nao excluidos." });
   await c.env.merlin_db.prepare("DELETE FROM home_content_items WHERE id = ?").bind(row.id).run();
   if (row.image_key && c.env.MERLIN_FILES) await c.env.MERLIN_FILES.delete(row.image_key).catch(() => undefined);
+  if (c.env.MERLIN_FILES) await c.env.MERLIN_FILES.delete(`${HOME_REMOTE_IMAGE_CACHE_PREFIX}/${row.id}`).catch(() => undefined);
   return { success: true, id: row.id };
 }
 
@@ -333,7 +339,64 @@ export async function getHomeContentImage(c: AppContext, value: string | number)
     return { kind: "r2" as const, object };
   }
   if (!row.image_url) throw new HTTPException(404, { message: "Imagem nao encontrada." });
-  const response = await fetch(row.image_url, { headers: { Accept: "image/*", "User-Agent": "Merlin/2.0" } });
-  if (!response.ok || !response.body) throw new HTTPException(502, { message: "Imagem remota indisponivel." });
-  return { kind: "remote" as const, response };
+  const cacheKey = `${HOME_REMOTE_IMAGE_CACHE_PREFIX}/${row.id}`;
+  if (c.env.MERLIN_FILES) {
+    try {
+      const cached = await c.env.MERLIN_FILES.get(cacheKey);
+      if (cached?.customMetadata?.revision === row.updated_at) return { kind: "r2" as const, object: cached };
+      await cached?.body?.cancel();
+    } catch (error) {
+      console.warn("[home] image cache read failed", { itemId: row.id, error: String(error) });
+    }
+  }
+
+  const urls = [row.image_url];
+  if (row.image_mode === "steam" && row.app_id && /^\d+$/.test(row.app_id)) {
+    urls.push(
+      `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${row.app_id}/header.jpg`,
+      `https://cdn.cloudflare.steamstatic.com/steam/apps/${row.app_id}/header.jpg`,
+    );
+  }
+  const failures: string[] = [];
+  for (const url of [...new Set(urls)]) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: "image/*", "User-Agent": "Merlin/2.0" },
+        signal: controller.signal,
+      });
+      const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || "";
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (!response.ok || !response.body || !ALLOWED_IMAGE_TYPES.has(contentType)
+        || contentLength > MAX_HOME_IMAGE_BYTES) {
+        failures.push(`${originLabel(url)}:${response.status}`);
+        await response.body?.cancel();
+        continue;
+      }
+      const bytes = await response.arrayBuffer();
+      if (!bytes.byteLength || bytes.byteLength > MAX_HOME_IMAGE_BYTES) {
+        failures.push(`${originLabel(url)}:invalid_size`);
+        continue;
+      }
+      if (c.env.MERLIN_FILES) {
+        try {
+          await c.env.MERLIN_FILES.put(cacheKey, bytes, {
+            httpMetadata: { contentType },
+            customMetadata: { revision: row.updated_at },
+          });
+        } catch (error) {
+          console.warn("[home] image cache write failed", { itemId: row.id, error: String(error) });
+        }
+      }
+      if (failures.length) console.info("[home] alternate image origin used", { itemId: row.id, attempts: failures.length });
+      return { kind: "remote" as const, response: new Response(bytes, { headers: { "Content-Type": contentType } }) };
+    } catch (error) {
+      failures.push(`${originLabel(url)}:${controller.signal.aborted ? "timeout" : "request_failed"}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  console.warn("[home] image origins unavailable", { itemId: row.id, appId: row.app_id, attempts: failures });
+  throw new HTTPException(502, { message: "Imagem remota indisponivel." });
 }
