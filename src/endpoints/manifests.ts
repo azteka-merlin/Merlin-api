@@ -38,6 +38,24 @@ type ManifestFetchResult = {
 	outcome: ManifestSourceOutcome;
 };
 
+type PicsValidationResult = "not_applicable" | "disabled" | "passed" | "unavailable";
+
+function logSelectedManifestSource(appId: string, source: string, picsValidation: PicsValidationResult) {
+	const picsLabel = {
+		not_applicable: "não aplicável",
+		disabled: "desligado",
+		passed: "aprovado",
+		unavailable: "indisponível",
+	}[picsValidation];
+	console.info({
+		message: `Manifest ${appId}: fonte ${source} selecionada (PICS: ${picsLabel})`,
+		event: "manifest_source_selected",
+		appId,
+		source,
+		picsValidation,
+	});
+}
+
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
 const SOURCE_TIMEOUT_MS = 10_000;
@@ -405,7 +423,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: "r2-override" },
 			});
-			console.info({ event: "manifest_source_selected", appId, source: "r2-override", picsValidation: "not_applicable" });
+			logSelectedManifestSource(appId, "r2-override", "not_applicable");
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
@@ -417,7 +435,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
 			let selectedResponse = response;
-			let picsValidation: "not_applicable" | "disabled" | "passed" | "unavailable" = "not_applicable";
+			let picsValidation: PicsValidationResult = "not_applicable";
 			const settingName = source.name === "ryu" ? "ryuu" : source.name;
 			if (settingName === "depotbox" || settingName === "ryuu" || settingName === "steam-api") {
 				picsValidation = sourceSettings.depotValidation[settingName] ? "unavailable" : "disabled";
@@ -457,7 +475,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				hwid: license.hwid,
 				metadata: { source: source.name },
 			});
-			console.info({ event: "manifest_source_selected", appId, source: source.name, picsValidation });
+			logSelectedManifestSource(appId, source.name, picsValidation);
 
 			return buildZipResponse(selectedResponse.body!, appId, source.name);
 		}
