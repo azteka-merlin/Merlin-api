@@ -39,7 +39,7 @@ type ManifestFetchResult = {
 
 function logSelectedManifestSource(appId: string, source: string) {
 	console.info({
-		message: `Manifest ${appId}: fonte ${source} selecionada`,
+		message: `[manifests] source selected: ${source} for app ${appId}`,
 		event: "manifest_source_selected",
 		appId,
 		source,
