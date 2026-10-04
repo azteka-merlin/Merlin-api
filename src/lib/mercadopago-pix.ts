@@ -1040,17 +1040,19 @@ async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow,
         UPDATE licenses
         SET plan_tier = ?,
             access_type = ?,
-            expires_at = ?,
+            expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END,
             status = 'active',
             billing_status = 'active',
             billing_current_period_start = ?,
-            billing_current_period_end = ?,
+            billing_current_period_end = CASE
+              WHEN billing_current_period_end IS NULL OR billing_current_period_end < ? THEN ?
+              ELSE billing_current_period_end END,
             billing_cancel_at_period_end = 1,
             updated_at = ?
         WHERE id = ?
       `,
     )
-    .bind(planTier, accessType, expiresAt, effectiveAt, expiresAt, appliedAt, checkout.scheduled_renewal_license_id)
+    .bind(planTier, accessType, expiresAt, expiresAt, effectiveAt, expiresAt, expiresAt, appliedAt, checkout.scheduled_renewal_license_id)
     .run();
   await c.env.merlin_db
     .prepare(
@@ -1062,6 +1064,25 @@ async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow,
     )
     .bind(appliedAt, appliedAt, checkout.id)
     .run();
+  return true;
+}
+
+// Credit a confirmed Pix payment immediately, starting the extra period at the
+// existing expiry. A different tier/period still takes effect at that boundary.
+export async function extendPaidPixRenewal(c: AppContext, checkout: PixCheckoutRow, now = new Date()) {
+  if (!checkout.scheduled_renewal_license_id || !checkout.renewal_effective_at
+    || checkout.payment_status !== "paid" || checkout.renewal_applied_at) return false;
+  const expiresAt = addRenewalPeriod(checkout.renewal_effective_at, checkout.plan_type);
+  const updatedAt = now.toISOString();
+  await c.env.merlin_db.prepare(`
+    UPDATE licenses
+    SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END,
+        billing_current_period_end = CASE
+          WHEN billing_current_period_end IS NULL OR billing_current_period_end < ? THEN ?
+          ELSE billing_current_period_end END,
+        updated_at = ?
+    WHERE id = ?
+  `).bind(expiresAt, expiresAt, expiresAt, expiresAt, updatedAt, checkout.scheduled_renewal_license_id).run();
   return true;
 }
 
@@ -1078,7 +1099,11 @@ export async function applyDuePixScheduledRenewals(c: AppContext, now = new Date
           AND payment_status = 'paid'
           AND scheduled_renewal_license_id IS NOT NULL
           AND renewal_applied_at IS NULL
-          AND renewal_effective_at <= ?
+          AND (renewal_effective_at <= ? OR EXISTS (
+            SELECT 1 FROM licenses
+            WHERE licenses.id = checkout_sessions.scheduled_renewal_license_id
+              AND licenses.expires_at <= checkout_sessions.renewal_effective_at
+          ))
         ORDER BY renewal_effective_at ASC
         LIMIT 100
       `,
@@ -1087,6 +1112,7 @@ export async function applyDuePixScheduledRenewals(c: AppContext, now = new Date
     .all<PixCheckoutRow>();
   let applied = 0;
   for (const checkout of rows.results || []) {
+    await extendPaidPixRenewal(c, checkout, now);
     if (await applyPixScheduledRenewal(c, checkout, now)) applied += 1;
   }
   return { applied };
@@ -1159,9 +1185,11 @@ async function updateCheckoutFromOrder(c: AppContext, checkout: PixCheckoutRow, 
 
 async function applyPaidPixOrder(c: AppContext, checkout: PixCheckoutRow, order: MercadoPagoOrder) {
   if (checkout.processed_at && checkout.license_id) {
+    await extendPaidPixRenewal(c, checkout);
     await applyPixScheduledRenewal(c, checkout);
     const existing = await getLicenseById(c, checkout.license_id);
     if (existing) {
+      await savePixPayment(c, checkout, order, existing.id);
       return existing;
     }
   }
@@ -1169,6 +1197,7 @@ async function applyPaidPixOrder(c: AppContext, checkout: PixCheckoutRow, order:
   const refreshed = await updateCheckoutFromOrder(c, checkout, order) || checkout;
   const license = await activatePixLicense(c, refreshed);
   const completedCheckout = await getPixCheckoutByReference(c, refreshed.provider_external_reference || refreshed.provider_session_id) || refreshed;
+  await extendPaidPixRenewal(c, completedCheckout);
   await savePixPayment(c, completedCheckout, order, license.id);
   await applyPixScheduledRenewal(c, completedCheckout);
   return license;

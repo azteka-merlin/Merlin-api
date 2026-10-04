@@ -65,7 +65,7 @@ Novos cadastros gratuitos nascem em Bronze com a restricao marcada. Quando essa 
 
 ## Pix
 
-O Pix e manual. Enquanto um acesso Pix mensal/anual estiver ativo, nao ha upgrade, downgrade, proracao ou Stripe Portal para ele. No vencimento, o usuario volta aos planos publicos, escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
+O Pix e manual. Enquanto um acesso Pix mensal/anual estiver ativo, nao ha upgrade, downgrade, proracao ou Stripe Portal para ele. Nos ultimos sete dias do periodo, o usuario pode pagar antecipadamente a proxima mensalidade/anuidade. Assim que o pagamento e confirmado, a validade da mesma licenca e estendida a partir do vencimento atual, sem aguardar cron; tier e periodicidade novos so passam a valer na fronteira do periodo. Se nao houver pagamento antecipado, apos o vencimento o usuario escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
 
 ## Staging
 
