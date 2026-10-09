@@ -103,6 +103,14 @@ import {
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
 import { requireLauncherLicense, requireLauncherSearchLicense } from "./lib/launcher-auth";
+import {
+  getCloudGame,
+  handleCloudGateway,
+  issueCloudCredentials,
+  listCloudGames,
+  restoreCloudGame,
+  revokeCloudCredentials,
+} from "./lib/cloud-sync";
 import { extractTokenFromLicenseFile, LicenseTokenError, MAX_LICENSE_FILE_BYTES } from "./lib/license-token";
 import {
   SPECIAL_CORRECTION_APP_ID,
@@ -3733,6 +3741,14 @@ app.post("/api/polls/:id/vote", async (c) => {
   const poll = await votePoll(c, c.req.param("id"), license.id, body);
   return c.json({ success: true, poll }, 200);
 });
+
+app.post("/api/launcher/cloud/credentials", issueCloudCredentials);
+app.post("/api/launcher/cloud/revoke", revokeCloudCredentials);
+app.get("/api/launcher/cloud/games", listCloudGames);
+app.get("/api/launcher/cloud/games/:appId", getCloudGame);
+app.post("/api/launcher/cloud/restore", restoreCloudGame);
+app.all("/merlin-cloud", handleCloudGateway);
+app.all("/merlin-cloud/*", handleCloudGateway);
 
 app.get("/api/home", async (c) => {
   await requireLauncherLicense(c);

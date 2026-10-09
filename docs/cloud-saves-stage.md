@@ -1,0 +1,11 @@
+# Gateway S3 dos saves — stage
+
+O piloto é exposto apenas quando `ENVIRONMENT=staging`. `POST /api/launcher/cloud/credentials` exige o bearer token do Launcher, licença ativa e HWID correspondente. A resposta entrega uma chave S3 derivada de `JWT_SECRET` para o gateway virtual `merlin-cloud`, com lease de 20 minutos. `POST /api/launcher/cloud/revoke` revoga a chave. A chave não é uma credencial de R2; a API não a grava em texto puro no D1.
+
+As requisições SigV4 para `/merlin-cloud` suportam listagem por prefixo de conta, GET/HEAD/PUT/DELETE, multipart e consulta de versionamento (desativado). O objeto real fica em `MERLIN_FILES` sob `cloud-sync/stage/steam/<account-id>/<appid>/...`; AppID `0` é reservado para metadados da conta CloudRedirect. Antes de sobrescrever/excluir, a API guarda o objeto antigo em uma cópia de recuperação escopada por conta e jogo. São mantidas no máximo duas cópias de recuperação por jogo; as mais antigas são removidas automaticamente. As cópias de recuperação não são listadas pelo S3 virtual.
+
+O Launcher consulta a lista sem expor IDs técnicos na interface por `GET /api/launcher/cloud/games?accountId=...` e os detalhes por `GET /api/launcher/cloud/games/<appid>?accountId=...`. A restauração é `POST /api/launcher/cloud/restore` com `accountId`, `appId` e um identificador opaco de backup; ela grava os blobs restaurados no mesmo formato do CloudRedirect, incrementa o change number e deixa a DLL fazer a sincronização normal quando a Steam for aberta. Não há upload, download manual ou segunda engine de saves no Launcher.
+
+A migração `0076_cloud_sync_stage.sql` cria a tabela de clientes e a contagem de uploads. Stage usa o mesmo bucket R2 que produção, mas o prefixo de stage é separado. Não mudar esse prefixo sem migração planejada. A atribuição dos saves é pelo account ID da Steam, não pela licença Merlin. A DLL fornece esse ID, sem prova OpenID no piloto; uma licença ativa maliciosa poderia informar outro ID. Essa limitação precisa ser resolvida antes de exposição ampla.
+
+O teste de integração de rede deve usar uma licença stage real e o Launcher stage. Os testes automatizados cobrem assinatura SigV4, alteração da assinatura, caminho permitido, roundtrip PUT/list/GET, cópia de recuperação e isolamento de ambiente; eles não substituem um teste com Steam real, jogo com Steam Cloud e R2.
