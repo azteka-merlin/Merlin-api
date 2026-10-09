@@ -5,7 +5,7 @@ const RELEASE_ASSET_PREFIX = "release-notes";
 const MAX_RELEASE_ASSET_BYTES = 12 * 1024 * 1024;
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const SUPPORTED_LOCALES = ["ptbr", "en", "es", "fr", "de"] as const;
-const SUPPORTED_ICONS = new Set(["home", "steam", "library", "settings", "sparkles", "wrench", "gift", "megaphone"]);
+const SUPPORTED_ICONS = new Set(["home", "steam", "library", "settings", "sparkles", "wrench", "gift", "megaphone", "cloud", "database-backup", "refresh-cw", "credit-card", "shield-check"]);
 
 type ReleaseType = "major" | "standard";
 type Locale = (typeof SUPPORTED_LOCALES)[number];
