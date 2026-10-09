@@ -1,10 +1,9 @@
 import type { AppContext } from "../types";
 import { requireLauncherLicense } from "./launcher-auth";
 
-// CloudRedirect speaks path-style S3. This is deliberately a small, stage-only
-// S3 facade, not an R2 key: clients never receive credentials to merlin-files.
+// CloudRedirect speaks path-style S3. This facade never exposes R2 credentials
+// to clients. Stage and production use separate prefixes in the shared bucket.
 const VIRTUAL_BUCKET = "merlin-cloud";
-const STORAGE_PREFIX = "cloud-sync/stage/";
 const LEASE_SECONDS = 20 * 60;
 const MAX_PUT_BYTES = 32 * 1024 * 1024;
 const MAX_DAILY_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
@@ -28,9 +27,6 @@ async function sha256(value: string | Uint8Array): Promise<string> {
   return hex(await crypto.subtle.digest("SHA-256", typeof value === "string" ? encoder.encode(value) : value));
 }
 
-async function sha1(value: Uint8Array): Promise<string> {
-  return hex(await crypto.subtle.digest("SHA-1", value));
-}
 
 async function hmac(key: string | Uint8Array, value: string): Promise<Uint8Array> {
   const rawKey = typeof key === "string" ? encoder.encode(key) : key;
@@ -42,8 +38,10 @@ async function clientSecret(master: string, accessKeyId: string): Promise<string
   return hex(await hmac(master, `merlin-cloud-s3:v1:${accessKeyId}`));
 }
 
-function stageOnly(c: AppContext): boolean {
-  return (c.env as AppContext["env"] & { ENVIRONMENT?: string }).ENVIRONMENT === "staging";
+function storagePrefix(c: AppContext): string | null {
+  const environment = (c.env as AppContext["env"] & { ENVIRONMENT?: string }).ENVIRONMENT;
+  return environment === "staging" ? "cloud-sync/stage/"
+    : environment === "production" ? "cloud-sync/production/" : null;
 }
 
 function xmlEscape(value: string): string {
@@ -71,7 +69,7 @@ function randomKeyId(): string {
 }
 
 export async function issueCloudCredentials(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
+  if (!storagePrefix(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
   const license = await requireLauncherLicense(c);
   const payload: { accessKeyId?: unknown } = await c.req.json<{ accessKeyId?: unknown }>().catch(() => ({}));
   const previousId = typeof payload.accessKeyId === "string" && /^MCL[a-f0-9]{40}$/.test(payload.accessKeyId)
@@ -111,7 +109,7 @@ export async function issueCloudCredentials(c: AppContext): Promise<Response> {
 }
 
 export async function revokeCloudCredentials(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
+  if (!storagePrefix(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
   const license = await requireLauncherLicense(c);
   const payload: { accessKeyId?: unknown } = await c.req.json<{ accessKeyId?: unknown }>().catch(() => ({}));
   if (typeof payload.accessKeyId !== "string" || !/^MCL[a-f0-9]{40}$/.test(payload.accessKeyId)) {
@@ -202,15 +200,17 @@ function listPrefix(raw: string | null): string | null {
 }
 
 async function backupExisting(c: AppContext, key: string): Promise<void> {
+  const storage = storagePrefix(c);
+  if (!storage) return;
   const old = await c.env.MERLIN_FILES.get(key);
   if (!old) return;
-  const logicalKey = key.startsWith(STORAGE_PREFIX) ? key.slice(STORAGE_PREFIX.length) : key;
+  const logicalKey = key.startsWith(storage) ? key.slice(storage.length) : key;
   const scope = /^steam\/([1-9]\d{0,9})\/([1-9]\d{0,9})\//.exec(logicalKey);
   if (!scope) return;
-  const recoveryPrefix = `${STORAGE_PREFIX}recovery/steam/${scope[1]}/${scope[2]}/${await sha256(logicalKey)}/`;
+  const recoveryPrefix = `${storage}recovery/steam/${scope[1]}/${scope[2]}/${await sha256(logicalKey)}/`;
   let snapshotId = String(Date.now());
   try {
-    const state = await c.env.MERLIN_FILES.get(`${STORAGE_PREFIX}${logicalKey.split("/").slice(0, 3).join("/")}/state.cloudredirect`);
+    const state = await c.env.MERLIN_FILES.get(`${storage}${logicalKey.split("/").slice(0, 3).join("/")}/state.cloudredirect`);
     if (state) {
       const parsed = JSON.parse(await state.text()) as { cn?: unknown };
       if (Number.isSafeInteger(parsed.cn) && Number(parsed.cn) >= 0) snapshotId = String(parsed.cn);
@@ -252,11 +252,12 @@ async function backupExisting(c: AppContext, key: string): Promise<void> {
 }
 
 type CloudStateFile = { sha?: unknown; size?: unknown; ts?: unknown };
-type CloudState = { cn?: unknown; files?: Record<string, CloudStateFile> };
+type CloudState = { cn?: unknown; files?: Record<string, CloudStateFile>; session?: { client_id?: unknown; op?: unknown } };
 
-function parseCloudScope(accountId: string, appId: string): { accountId: string; appId: string; prefix: string } | null {
-  if (!/^[1-9]\d{0,9}$/.test(accountId) || !/^[1-9]\d{0,9}$/.test(appId)) return null;
-  return { accountId, appId, prefix: `${STORAGE_PREFIX}steam/${accountId}/${appId}/` };
+function parseCloudScope(c: AppContext, accountId: string, appId: string): { accountId: string; appId: string; prefix: string } | null {
+  const storage = storagePrefix(c);
+  if (!storage || !/^[1-9]\d{0,9}$/.test(accountId) || !/^[1-9]\d{0,9}$/.test(appId)) return null;
+  return { accountId, appId, prefix: `${storage}steam/${accountId}/${appId}/` };
 }
 
 async function listR2Objects(bucket: R2Bucket, prefix: string): Promise<R2Object[]> {
@@ -287,6 +288,8 @@ async function readCloudState(bucket: R2Bucket, scope: { prefix: string }): Prom
 type RecoveryFile = {
   objectKey: string;
   originalKey: string;
+  filePath: string;
+  digest: string;
   size: number;
   uploaded: Date;
 };
@@ -295,34 +298,58 @@ type RecoveryGroup = {
   id: string;
   createdAt: Date;
   totalSize: number;
+  fileCount: number;
   files: RecoveryFile[];
 };
 
-async function listRecoveryGroups(c: AppContext, scope: { accountId: string; appId: string }): Promise<RecoveryGroup[]> {
-  const prefix = `${STORAGE_PREFIX}recovery/steam/${scope.accountId}/${scope.appId}/`;
+function parseRecoveryBlobKey(originalKey: string, scope: { accountId: string; appId: string }): { filePath: string; digest: string } | null {
+  const prefix = `steam/${scope.accountId}/${scope.appId}/blobs/`;
+  if (!originalKey.startsWith(prefix)) return null;
+  const relative = originalKey.slice(prefix.length);
+  const separator = relative.lastIndexOf("/");
+  if (separator <= 0) return null;
+  const filePath = relative.slice(0, separator);
+  const digest = relative.slice(separator + 1);
+  if (!/^[a-f0-9]{40}$/.test(digest) || filePath.includes("\\")
+    || /[\x00-\x1f]/.test(filePath) || filePath.split("/").some((part) => !part || part === "." || part === "..")) return null;
+  return { filePath, digest };
+}
+
+async function listRecoveryGroups(c: AppContext, scope: { accountId: string; appId: string }, current: CloudState): Promise<RecoveryGroup[]> {
+  const prefix = `${storagePrefix(c)}recovery/steam/${scope.accountId}/${scope.appId}/`;
   const objects = await listR2Objects(c.env.MERLIN_FILES, prefix);
   const groups = new Map<string, RecoveryFile[]>();
   for (const object of objects) {
     const head = await c.env.MERLIN_FILES.head(object.key);
     const originalKey = head?.customMetadata?.originalKey || "";
-    if (!originalKey.startsWith(`steam/${scope.accountId}/${scope.appId}/`)) continue;
-    const snapshotId = head?.customMetadata?.snapshotId || `legacy-${Math.floor(object.uploaded.getTime() / 10_000)}`;
-    const files = groups.get(snapshotId) || [];
-    files.push({ objectKey: object.key, originalKey, size: object.size, uploaded: object.uploaded });
-    groups.set(snapshotId, files);
+    const parsed = parseRecoveryBlobKey(originalKey, scope);
+    if (!parsed) continue;
+    const snapshotId = head?.customMetadata?.snapshotId || "legacy";
+    // CN alone is not a backup boundary: CloudRedirect can overwrite blobs
+    // many minutes before publishing a new state with the same CN. Group
+    // nearby file copies instead, and leave state/cn metadata out of the UI.
+    const minute = Math.floor(object.uploaded.getTime() / 60_000);
+    const groupKey = `${snapshotId}:${minute}`;
+    const files = groups.get(groupKey) || [];
+    files.push({ objectKey: object.key, originalKey, ...parsed, size: object.size, uploaded: object.uploaded });
+    groups.set(groupKey, files);
   }
   const result: RecoveryGroup[] = [];
-  for (const [snapshotId, files] of groups) {
+  for (const [groupKey, files] of groups) {
     if (!files.length) continue;
-    files.sort((a, b) => a.originalKey.localeCompare(b.originalKey));
-    const firstFile = files[0];
+    files.sort((a, b) => a.uploaded.getTime() - b.uploaded.getTime());
+    const selected = new Map<string, RecoveryFile>();
+    for (const file of files) if (!selected.has(file.filePath)) selected.set(file.filePath, file);
+    const restorable = [...selected.values()].filter((file) => current.files?.[file.filePath]?.sha !== file.digest);
+    const firstFile = restorable[0];
     if (!firstFile) continue;
-    const createdAt = files.reduce((latest, item) => item.uploaded > latest ? item.uploaded : latest, firstFile.uploaded);
+    const createdAt = restorable.reduce((latest, item) => item.uploaded > latest ? item.uploaded : latest, firstFile.uploaded);
     result.push({
-      id: await sha256(files.map((item) => item.objectKey).join("\n")),
+      id: await sha256(`${scope.accountId}/${scope.appId}/${groupKey}`),
       createdAt,
-      totalSize: files.reduce((total, item) => total + item.size, 0),
-      files,
+      totalSize: restorable.reduce((total, file) => total + file.size, 0),
+      fileCount: restorable.length,
+      files: restorable,
     });
   }
   return result.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, 2);
@@ -338,23 +365,24 @@ function stateSummary(state: CloudState, updatedAt: Date) {
 }
 
 export async function listCloudGames(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
+  const storage = storagePrefix(c);
+  if (!storage) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
   await requireLauncherLicense(c);
   const accountId = c.req.query("accountId") || "";
   if (!/^[1-9]\d{0,9}$/.test(accountId)) return c.json({ success: false, error: "Invalid Steam account" }, 400);
-  const prefix = `${STORAGE_PREFIX}steam/${accountId}/`;
+  const prefix = `${storage}steam/${accountId}/`;
   const objects = await listR2Objects(c.env.MERLIN_FILES, prefix);
   const stateObjects = objects.filter((item) => /\/state\.cloudredirect$/.test(item.key));
   const games = [];
   for (const object of stateObjects.slice(0, 100)) {
-    const match = new RegExp(`^${STORAGE_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}steam/${accountId}/([1-9]\\d{0,9})/state\\.cloudredirect$`).exec(object.key);
+    const match = new RegExp(`^${storage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}steam/${accountId}/([1-9]\\d{0,9})/state\\.cloudredirect$`).exec(object.key);
     if (!match) continue;
     const appId = match[1] || "";
-    const scope = parseCloudScope(accountId, appId);
+    const scope = parseCloudScope(c, accountId, appId);
     if (!scope) continue;
     const current = await readCloudState(c.env.MERLIN_FILES, scope);
     if (!current) continue;
-    const backups = await listRecoveryGroups(c, scope);
+    const backups = await listRecoveryGroups(c, scope, current.state);
     const game = await c.env.merlin_db.prepare(
       "SELECT name, cover_url FROM catalog_games WHERE app_id = ? LIMIT 1",
     ).bind(appId).first<{ name?: string; cover_url?: string | null }>();
@@ -373,15 +401,15 @@ export async function listCloudGames(c: AppContext): Promise<Response> {
 }
 
 export async function getCloudGame(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
+  if (!storagePrefix(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
   await requireLauncherLicense(c);
   const accountId = c.req.query("accountId") || "";
   const appId = c.req.param("appId") || "";
-  const scope = parseCloudScope(accountId, appId);
+  const scope = parseCloudScope(c, accountId, appId);
   if (!scope) return c.json({ success: false, error: "Invalid cloud game" }, 400);
   const current = await readCloudState(c.env.MERLIN_FILES, scope);
   if (!current) return c.json({ success: false, error: "Cloud game not found" }, 404);
-  const backups = await listRecoveryGroups(c, scope);
+  const backups = await listRecoveryGroups(c, scope, current.state);
   const game = await c.env.merlin_db.prepare(
     "SELECT name, cover_url FROM catalog_games WHERE app_id = ? LIMIT 1",
   ).bind(appId).first<{ name?: string; cover_url?: string | null }>();
@@ -396,7 +424,7 @@ export async function getCloudGame(c: AppContext): Promise<Response> {
       backups: backups.map((backup) => ({
         id: backup.id,
         createdAt: backup.createdAt.toISOString(),
-        fileCount: backup.files.length,
+        fileCount: backup.fileCount,
         totalSize: backup.totalSize,
       })),
     },
@@ -404,40 +432,56 @@ export async function getCloudGame(c: AppContext): Promise<Response> {
 }
 
 export async function restoreCloudGame(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
+  if (!storagePrefix(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
   await requireLauncherLicense(c);
   const body: { accountId?: unknown; appId?: unknown; recoveryId?: unknown } = await c.req.json().catch(() => ({}));
   const accountId = typeof body.accountId === "string" ? body.accountId : "";
   const appId = typeof body.appId === "string" ? body.appId : "";
   const recoveryId = typeof body.recoveryId === "string" ? body.recoveryId : "";
-  const scope = parseCloudScope(accountId, appId);
+  const scope = parseCloudScope(c, accountId, appId);
   if (!scope || !/^[a-f0-9]{64}$/.test(recoveryId)) return c.json({ success: false, error: "Invalid recovery" }, 400);
   const current = await readCloudState(c.env.MERLIN_FILES, scope);
   if (!current) return c.json({ success: false, error: "Cloud game not found" }, 404);
-  const backup = (await listRecoveryGroups(c, scope)).find((item) => item.id === recoveryId);
-  if (!backup) return c.json({ success: false, error: "Recovery not found" }, 404);
+  if (current.state.session?.client_id && current.state.session.op) {
+    return c.json({ success: false, code: "game_active", error: "Close the game before restoring its save" }, 409);
+  }
+  const backup = (await listRecoveryGroups(c, scope, current.state)).find((item) => item.id === recoveryId);
+  if (!backup) return c.json({ success: false, code: "recovery_not_found", error: "Recovery not found" }, 404);
   const nextState: CloudState = JSON.parse(JSON.stringify(current.state));
-  // A recovery represents the complete snapshot for the game. Keep the
-  // current blob objects untouched, but replace the state index so files that
-  // did not exist in the selected snapshot are no longer restored locally.
-  nextState.files = {};
+  delete nextState.session;
+  // A recovery group holds only the files replaced in that save operation.
+  // Preserve every other file in the current index. Verify both old copies
+  // and the current versions before changing the published state.
+  for (const file of backup.files) {
+    if (!await c.env.MERLIN_FILES.head(file.objectKey)) {
+      return c.json({ success: false, code: "recovery_incomplete", error: "Recovery blob is unavailable" }, 409);
+    }
+    const currentDigest = current.state.files?.[file.filePath]?.sha;
+    if (typeof currentDigest === "string" && /^[a-f0-9]{40}$/.test(currentDigest)
+      && !await c.env.MERLIN_FILES.head(`${scope.prefix}blobs/${file.filePath}/${currentDigest}`)) {
+      return c.json({ success: false, code: "recovery_incomplete", error: "Current blob is unavailable" }, 409);
+    }
+  }
   const now = Math.floor(Date.now() / 1000);
   for (const file of backup.files) {
-    const original = await c.env.MERLIN_FILES.get(file.objectKey);
-    if (!original) return c.json({ success: false, error: "Recovery is no longer available" }, 404);
-    const bytes = new Uint8Array(await original.arrayBuffer());
-    const filePath = file.originalKey.slice(`steam/${accountId}/${appId}/`.length);
-    const digest = await sha1(bytes);
-    await c.env.MERLIN_FILES.put(`${scope.prefix}blobs/${filePath}/${digest}`, bytes);
-    nextState.files[filePath] = { sha: digest, size: bytes.byteLength, ts: now };
+    const currentDigest = current.state.files?.[file.filePath]?.sha;
+    if (typeof currentDigest === "string" && /^[a-f0-9]{40}$/.test(currentDigest)) {
+      await backupExisting(c, `${scope.prefix}blobs/${file.filePath}/${currentDigest}`);
+    }
+    const oldCopy = await c.env.MERLIN_FILES.get(file.objectKey);
+    if (!oldCopy) return c.json({ success: false, code: "recovery_incomplete", error: "Recovery blob is unavailable" }, 409);
+    await c.env.MERLIN_FILES.put(`${scope.prefix}blobs/${file.filePath}/${file.digest}`, oldCopy.body);
+    nextState.files![file.filePath] = {
+      ...(current.state.files?.[file.filePath] || {}), sha: file.digest, size: file.size, ts: now,
+    };
   }
-  const currentCn = Number.isSafeInteger(nextState.cn) ? Number(nextState.cn) : 0;
-  nextState.cn = currentCn + 1;
+  nextState.cn = (Number.isSafeInteger(current.state.cn) ? Number(current.state.cn) : 0) + 1;
+  await backupExisting(c, `${scope.prefix}state.cloudredirect`);
   await c.env.MERLIN_FILES.put(`${scope.prefix}state.cloudredirect`, JSON.stringify(nextState), {
     httpMetadata: { contentType: "application/json" },
   });
   await c.env.MERLIN_FILES.put(`${scope.prefix}cn.cloudredirect`, String(nextState.cn));
-  return c.json({ success: true, restoredAt: new Date().toISOString(), fileCount: backup.files.length }, 200, { "Cache-Control": "no-store" });
+  return c.json({ success: true, restoredAt: new Date().toISOString(), fileCount: backup.fileCount }, 200, { "Cache-Control": "no-store" });
 }
 
 async function chargeUpload(c: AppContext, accessKeyId: string, bytes: number): Promise<boolean> {
@@ -490,9 +534,9 @@ async function readCheckedBody(request: Request, limit = MAX_PUT_BYTES): Promise
   return body;
 }
 
-function listXml(bucket: string, prefix: string, result: R2Objects): string {
+function listXml(bucket: string, prefix: string, result: R2Objects, storage: string): string {
   const contents = result.objects.map((item) => {
-    const key = item.key.slice(STORAGE_PREFIX.length);
+    const key = item.key.slice(storage.length);
     return `<Contents><Key>${xmlEscape(key)}</Key><LastModified>${item.uploaded.toISOString()}</LastModified><ETag>${xmlEscape(item.httpEtag)}</ETag><Size>${item.size}</Size></Contents>`;
   }).join("");
   return `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>${bucket}</Name><Prefix>${xmlEscape(prefix)}</Prefix><IsTruncated>${result.truncated}</IsTruncated>${result.truncated && result.cursor ? `<NextContinuationToken>${xmlEscape(result.cursor)}</NextContinuationToken>` : ""}${contents}</ListBucketResult>`;
@@ -515,7 +559,8 @@ function parseCompletionParts(xml: string): R2UploadedPart[] | null {
 }
 
 export async function handleCloudGateway(c: AppContext): Promise<Response> {
-  if (!stageOnly(c)) return s3Error(404, "NoSuchBucket", "Cloud sync is not enabled here");
+  const storage = storagePrefix(c);
+  if (!storage) return s3Error(404, "NoSuchBucket", "Cloud sync is not enabled here");
   const request = c.req.raw;
   const signature = parseSignature(request);
   if (!signature || !await activeClient(c, signature.accessKeyId)
@@ -536,11 +581,11 @@ export async function handleCloudGateway(c: AppContext): Promise<Response> {
   if (isBucketRoot && request.method === "GET" && query.get("list-type") === "2") {
     const prefix = listPrefix(query.get("prefix"));
     if (!prefix) return s3Error(400, "InvalidArgument", "Invalid list prefix");
-    const result = await bucket.list({ prefix: STORAGE_PREFIX + prefix, cursor: query.get("continuation-token") || undefined, limit: 1000 });
-    return xmlResponse(listXml(VIRTUAL_BUCKET, prefix, result));
+    const result = await bucket.list({ prefix: storage + prefix, cursor: query.get("continuation-token") || undefined, limit: 1000 });
+    return xmlResponse(listXml(VIRTUAL_BUCKET, prefix, result, storage));
   }
   if (!key) return s3Error(400, "InvalidArgument", "Invalid object key");
-  const storageKey = STORAGE_PREFIX + key;
+  const storageKey = storage + key;
   const uploadId = query.get("uploadId");
 
   try {

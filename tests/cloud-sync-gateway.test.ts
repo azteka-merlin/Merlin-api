@@ -122,9 +122,25 @@ describe("stage cloud gateway roundtrip", () => {
     expect(await (await handleCloudGateway(fixture.context)).text()).toBe("save-v5");
   });
 
-  it("denies requests outside the stage environment", async () => {
+  it("denies requests outside supported environments", async () => {
     const fixture = fakeContext(signed("GET", "/merlin-cloud?list-type=2&prefix=steam%2F"));
+    (fixture.context.env as unknown as { ENVIRONMENT: string }).ENVIRONMENT = "development";
+    expect((await handleCloudGateway(fixture.context)).status).toBe(404);
+  });
+
+  it("stores production saves under a separate prefix in the shared bucket", async () => {
+    const key = "/merlin-cloud/steam/123456/730/blobs/save.dat";
+    const fixture = fakeContext(signed("PUT", key, "prod-save"));
     (fixture.context.env as unknown as { ENVIRONMENT: string }).ENVIRONMENT = "production";
+    expect((await handleCloudGateway(fixture.context)).status).toBe(200);
+    expect(fixture.objects.has("cloud-sync/production/steam/123456/730/blobs/save.dat")).toBe(true);
+    expect(fixture.objects.has("cloud-sync/stage/steam/123456/730/blobs/save.dat")).toBe(false);
+    fixture.context.req.raw = signed("GET", "/merlin-cloud?list-type=2&prefix=steam%2F123456%2F730%2F");
+    const listing = await handleCloudGateway(fixture.context);
+    expect(listing.status).toBe(200);
+    expect(await listing.text()).toContain("steam/123456/730/blobs/save.dat");
+    (fixture.context.env as unknown as { ENVIRONMENT: string }).ENVIRONMENT = "staging";
+    fixture.context.req.raw = signed("GET", key);
     expect((await handleCloudGateway(fixture.context)).status).toBe(404);
   });
 
