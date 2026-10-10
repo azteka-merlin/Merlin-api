@@ -7,7 +7,7 @@ import type { AppContext } from "../types";
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
 
-export type BillingPeriod = "monthly" | "annual";
+export type BillingPeriod = "monthly" | "semiannual" | "annual";
 export type BillingPlanPaymentMethod = "card" | "pix";
 type ChangeTiming = "immediate" | "period_end";
 type ChangeType = "upgrade" | "downgrade" | "interval_change";
@@ -151,13 +151,8 @@ function unixToIso(value: unknown) {
 
 function periodFromAccessType(accessType: string | null | undefined): BillingPeriod | null {
   if (accessType === "monthly_subscription") return "monthly";
+  if (accessType === "semiannual_subscription") return "semiannual";
   if (accessType === "annual_subscription") return "annual";
-  return null;
-}
-
-function intervalToPeriod(interval: string | null | undefined): BillingPeriod | null {
-  if (interval === "month") return "monthly";
-  if (interval === "year") return "annual";
   return null;
 }
 
@@ -474,15 +469,15 @@ function classifyPlanChange(currentTier: PlanTier, currentPeriod: BillingPeriod,
 } {
   const currentRank = PLAN_RULES[currentTier].rank;
   const targetRank = PLAN_RULES[targetTier].rank;
-  // Preserve prepaid annual access even when the customer also chooses a higher tier.
-  if (currentPeriod === "annual" && targetPeriod === "monthly") {
+  // Preserve the paid term when moving to a shorter billing interval.
+  const months = { monthly: 1, semiannual: 6, annual: 12 };
+  if (months[currentPeriod] > months[targetPeriod]) {
     if (targetRank > currentRank) return { changeType: "upgrade", timing: "period_end" };
     if (targetRank < currentRank) return { changeType: "downgrade", timing: "period_end" };
     return { changeType: "interval_change", timing: "period_end" };
   }
   if (targetRank > currentRank) return { changeType: "upgrade", timing: "immediate" };
   if (targetRank < currentRank) return { changeType: "downgrade", timing: "period_end" };
-  if (currentPeriod === "monthly" && targetPeriod === "annual") return { changeType: "interval_change", timing: "immediate" };
   return { changeType: "interval_change", timing: "immediate" };
 }
 
@@ -895,7 +890,8 @@ async function applyPlanChange(c: AppContext, input: {
     `)
     .bind(
       input.targetTier,
-      input.targetPeriod === "annual" ? "annual_subscription" : "monthly_subscription",
+      input.targetPeriod === "annual" ? "annual_subscription"
+        : input.targetPeriod === "semiannual" ? "semiannual_subscription" : "monthly_subscription",
       input.periodStart,
       input.periodEnd,
       now,

@@ -271,7 +271,7 @@ const recoverySecretSchema = z.string().trim().refine(isValidRecoverySecret, {
   message: "Use 4 a 8 caracteres, sem espacos.",
 });
 const planTierSchema = z.enum(["bronze", "prata", "ouro"]);
-const billingPlanPeriodSchema = z.enum(["monthly", "annual"]);
+const billingPlanPeriodSchema = z.enum(["monthly", "semiannual", "annual"]);
 const billingPlanPaymentMethodSchema = z.enum(["card", "pix"]);
 const subscriptionPlanChangeSchema = z.object({
   targetTier: planTierSchema,
@@ -341,10 +341,12 @@ const publicSignupSettingsSchema = z.object({
     billingEnabled: z.boolean(),
     plansEnabled: z.boolean().optional().default(false),
     monthlyEnabled: z.boolean(),
+    semiannualEnabled: z.boolean().optional().default(false),
     annualEnabled: z.boolean().optional().default(false),
     lifetimeEnabled: z.boolean(),
     pixEnabled: z.boolean().optional().default(false),
     pixMonthlyEnabled: z.boolean().optional().default(true),
+    pixSemiannualEnabled: z.boolean().optional().default(false),
     pixAnnualEnabled: z.boolean().optional().default(true),
     pixLifetimeEnabled: z.boolean().optional().default(true),
     monthlyCardTrialEnabled: z.boolean().optional().default(false),
@@ -363,7 +365,7 @@ const publicCheckoutSchema = z.object({
   contact: z.string().trim().email(),
   recoveryPin: recoverySecretSchema,
   acceptedRecoveryNotice: z.boolean(),
-  planType: z.enum(["monthly", "annual", "lifetime"]),
+  planType: z.enum(["monthly", "semiannual", "annual", "lifetime"]),
   planTier: planTierSchema.optional().nullable(),
 });
 const publicPixOrderSchema = publicCheckoutSchema.extend({
@@ -396,7 +398,8 @@ async function createExpiredCardRenewalCheckout(c: any, license: Awaited<ReturnT
     contact: license.contact,
     recoveryPin: "",
     acceptedRecoveryNotice: true,
-    planType: license.access_type === "annual_subscription" ? "annual" : "monthly",
+    planType: license.access_type === "annual_subscription" ? "annual"
+      : license.access_type === "semiannual_subscription" || license.access_type === "semiannual_manual" ? "semiannual" : "monthly",
     planTier: normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
   }, { reactivationLicenseId: license.id });
 }
@@ -1081,6 +1084,7 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
         amountCents: price.amountCents,
         currency: price.currency,
         recurringInterval: price.recurringInterval,
+        recurringIntervalCount: price.recurringIntervalCount,
         active: price.active,
         syncedAt: price.syncedAt,
         stale: price.stale,
@@ -1089,6 +1093,7 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
 
   const pixRuntimeAvailable = isMercadoPagoPixAvailable(c);
   const pixMonthlyAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.monthlyEnabled && billing.pixMonthlyEnabled;
+  const pixSemiannualAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.semiannualEnabled && billing.pixSemiannualEnabled;
   const pixAnnualAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.annualEnabled && billing.pixAnnualEnabled;
   const pixLifetimeAvailable = pixRuntimeAvailable && billing.pixEnabled && billing.lifetimeEnabled && billing.pixLifetimeEnabled;
 
@@ -1096,6 +1101,7 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
     billingEnabled: billing.billingEnabled,
     plansEnabled: billing.plansEnabled,
     monthlyEnabled: billing.monthlyEnabled,
+    semiannualEnabled: billing.semiannualEnabled,
     annualEnabled: billing.annualEnabled,
     lifetimeEnabled: billing.lifetimeEnabled,
     monthlyCardTrial: {
@@ -1104,8 +1110,9 @@ function getPublicBillingPayload(c: AppContext, billing: Awaited<ReturnType<type
     },
     paymentMethods: {
       card: true,
-      pix: pixMonthlyAvailable || pixAnnualAvailable || pixLifetimeAvailable,
+      pix: pixMonthlyAvailable || pixSemiannualAvailable || pixAnnualAvailable || pixLifetimeAvailable,
       pixMonthly: pixMonthlyAvailable,
+      pixSemiannual: pixSemiannualAvailable,
       pixAnnual: pixAnnualAvailable,
       pixLifetime: pixLifetimeAvailable,
     },
@@ -3243,7 +3250,7 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
   const session = await requirePublicAccessSession(c, { mutate: true });
   const body = parseBody(z.object({
     mercadoPagoDeviceId: mercadoPagoDeviceIdSchema.optional(),
-    planType: z.enum(["monthly", "annual"]).optional(),
+    planType: billingPlanPeriodSchema.optional(),
     planTier: planTierSchema.optional(),
   }), await c.req.json());
   const license = await getLicense(c, session.session.license_id);
@@ -3260,7 +3267,8 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
     // A Pix renewal may choose its next recurring plan. When it is paid while
     // access is still active, the selected plan is stored separately and only
     // takes effect after the current paid period ends.
-    planType: body.planType || (license.access_type === "annual_subscription" ? "annual" : "monthly"),
+    planType: body.planType || (license.access_type === "annual_subscription" || license.access_type === "annual_manual" ? "annual"
+      : license.access_type === "semiannual_subscription" || license.access_type === "semiannual_manual" ? "semiannual" : "monthly"),
     planTier: body.planTier || normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
     mercadoPagoDeviceId: body.mercadoPagoDeviceId,
   }, expiredRenewal
@@ -3939,7 +3947,7 @@ app.get("/api/launcher/access-notice", async (c) => {
   const identity = await requireLauncherSearchLicense(c);
   const license = await getLicense(c, identity.id);
   const recurringPix = !license.stripe_subscription_id
-    && ["monthly_subscription", "annual_subscription", "annual_manual"].includes(license.access_type || "");
+    && ["monthly_subscription", "semiannual_subscription", "semiannual_manual", "annual_subscription", "annual_manual"].includes(license.access_type || "");
   const paidRenewal = recurringPix ? await c.env.merlin_db
     .prepare(`
       SELECT id FROM checkout_sessions
@@ -3964,7 +3972,7 @@ app.get("/api/launcher/access-notice", async (c) => {
         entitlementExpiresAt: license.expires_at,
         currentPeriodEnd: license.billing_current_period_end || null,
         cancelAtPeriodEnd: license.billing_cancel_at_period_end === 1,
-        canManageSubscription: ["monthly_subscription", "annual_subscription"].includes(license.access_type || "") && Boolean(license.stripe_subscription_id),
+        canManageSubscription: ["monthly_subscription", "semiannual_subscription", "annual_subscription"].includes(license.access_type || "") && Boolean(license.stripe_subscription_id),
         renewalScheduled: Boolean(paidRenewal),
       },
     },

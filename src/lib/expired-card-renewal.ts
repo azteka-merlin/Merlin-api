@@ -8,7 +8,7 @@ type ExpiredCardRenewalLicense = {
 };
 
 function isRecurringPixAccess(accessType?: string | null) {
-  return ["monthly_subscription", "annual_subscription", "annual_manual"].includes(accessType || "");
+  return ["monthly_subscription", "semiannual_subscription", "semiannual_manual", "annual_subscription", "annual_manual"].includes(accessType || "");
 }
 
 // `status` is denormalized in D1 while entitlement expiry is calculated from
@@ -22,7 +22,7 @@ export function isEligibleForExpiredCardRenewal(
   const hasExpired = Number.isFinite(expiresAt) && expiresAt < now;
   const hasRenewableStatus = license.status === "active" || license.status === "expired";
   const isCardAccess = Boolean(license.stripe_customer_id && license.stripe_subscription_id);
-  const isRecurring = ["monthly_subscription", "annual_subscription"].includes(license.access_type || "");
+  const isRecurring = ["monthly_subscription", "semiannual_subscription", "annual_subscription"].includes(license.access_type || "");
 
   return hasExpired
     && hasRenewableStatus

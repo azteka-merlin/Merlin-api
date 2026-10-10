@@ -4,6 +4,7 @@ import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { findLicenseByEmailContact, normalizeContact } from "./admin-license-service";
 import { assertBillingPlanPrice, getBillingSettings, getStripePriceSnapshot, type BillingPlanType } from "./billing-settings";
+import { addBillingPeriod } from "./billing-period";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { generateLicenseKey } from "./licenses";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
@@ -174,6 +175,7 @@ function normalizeEmail(email: string) {
 
 function checkoutMode(planType: BillingPlanType) {
   if (planType === "monthly") return "pix_monthly";
+  if (planType === "semiannual") return "pix_semiannual";
   if (planType === "annual") return "pix_annual";
   return "pix_lifetime";
 }
@@ -191,10 +193,7 @@ function oneYearFromNowIso() {
 }
 
 function addRenewalPeriod(start: string, planType: BillingPlanType) {
-  const next = new Date(start);
-  if (planType === "annual") next.setUTCFullYear(next.getUTCFullYear() + 1);
-  else next.setUTCMonth(next.getUTCMonth() + 1);
-  return next.toISOString();
+  return addBillingPeriod(start, planType);
 }
 
 function addSeconds(date: Date, seconds: number) {
@@ -204,6 +203,7 @@ function addSeconds(date: Date, seconds: number) {
 function pixProductTitle(planType: BillingPlanType, planTier: PlanTier | null) {
   const tier = planTier ? ` ${planTier.charAt(0).toUpperCase()}${planTier.slice(1)}` : "";
   if (planType === "monthly") return `Merlin${tier} mensal`;
+  if (planType === "semiannual") return `Merlin${tier} semestral`;
   if (planType === "annual") return `Merlin${tier} anual`;
   return "Merlin vitalicio";
 }
@@ -211,6 +211,7 @@ function pixProductTitle(planType: BillingPlanType, planTier: PlanTier | null) {
 function pixExternalCode(planType: BillingPlanType, planTier: PlanTier | null) {
   const tier = planTier ? `_${planTier}` : "";
   if (planType === "monthly") return `merlin${tier}_monthly`;
+  if (planType === "semiannual") return `merlin${tier}_semiannual`;
   if (planType === "annual") return `merlin${tier}_annual`;
   return "merlin_lifetime";
 }
@@ -818,12 +819,12 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
     ? "paid_lifetime"
     : checkout.plan_type === "annual"
       ? "annual_manual"
+      : checkout.plan_type === "semiannual"
+        ? "semiannual_manual"
       : "monthly_subscription";
   const expiresAt = checkout.plan_type === "lifetime"
     ? LIFETIME_EXPIRES_AT
-    : checkout.plan_type === "annual"
-      ? oneYearFromNowIso()
-      : oneMonthFromNowIso();
+    : addBillingPeriod(now, checkout.plan_type);
   const periodEnd = checkout.plan_type === "lifetime" ? null : expiresAt;
   const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
   let licenseId: number | null = null;
@@ -1030,7 +1031,8 @@ async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow,
   if (new Date(checkout.renewal_effective_at).getTime() > now.getTime()) return false;
 
   const effectiveAt = checkout.renewal_effective_at;
-  const accessType = checkout.plan_type === "annual" ? "annual_manual" : "monthly_subscription";
+  const accessType = checkout.plan_type === "annual" ? "annual_manual"
+    : checkout.plan_type === "semiannual" ? "semiannual_manual" : "monthly_subscription";
   const expiresAt = addRenewalPeriod(effectiveAt, checkout.plan_type);
   const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
   const appliedAt = now.toISOString();
@@ -1315,6 +1317,9 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   if (billing.plansEnabled && input.planType === "lifetime") {
     throw new HTTPException(409, { message: "Novos acessos vitalicios nao estao disponiveis com a estrutura de planos ativa." });
   }
+  if (!billing.plansEnabled && input.planType === "semiannual") {
+    throw new HTTPException(409, { message: "Plano semestral indisponivel nesta estrutura de planos." });
+  }
 
   const name = input.name.trim();
   if (!name) {
@@ -1369,11 +1374,15 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const planEnabled = input.planType === "monthly"
     ? billing.monthlyEnabled
+    : input.planType === "semiannual"
+      ? billing.semiannualEnabled
     : input.planType === "annual"
       ? billing.annualEnabled
       : billing.lifetimeEnabled;
   const pixPlanEnabled = input.planType === "monthly"
     ? billing.pixMonthlyEnabled
+    : input.planType === "semiannual"
+      ? billing.pixSemiannualEnabled
     : input.planType === "annual"
       ? billing.pixAnnualEnabled
       : billing.pixLifetimeEnabled;

@@ -58,6 +58,22 @@ function setup(paymentStatus = "paid") {
 }
 
 describe("paid Pix renewal entitlement", () => {
+  test("credits a paid semiannual renewal immediately and applies its tier at the boundary", async () => {
+    const { sqlite, c, checkout } = setup();
+    sqlite.prepare("UPDATE checkout_sessions SET plan_type = 'semiannual' WHERE id = 8").run();
+    checkout.plan_type = "semiannual";
+    const paidAt = new Date("2030-01-10T10:00:00.000Z");
+    expect(await extendPaidPixRenewal(c, checkout, paidAt)).toBe(true);
+    expect(sqlite.prepare("SELECT expires_at, plan_tier FROM licenses WHERE id = 7").get()).toMatchObject({
+      expires_at: "2030-07-15T12:00:00.000Z", plan_tier: "ouro",
+    });
+    expect((await applyDuePixScheduledRenewals(c, new Date("2030-01-15T13:00:00.000Z"))).applied).toBe(1);
+    expect(sqlite.prepare("SELECT access_type, plan_tier FROM licenses WHERE id = 7").get()).toMatchObject({
+      access_type: "semiannual_manual", plan_tier: "prata",
+    });
+    sqlite.close();
+  });
+
   test("credits the next month immediately, without changing the current tier or adding it twice", async () => {
     const { sqlite, c, checkout } = setup();
     const paidAt = new Date("2030-01-10T10:00:00.000Z");

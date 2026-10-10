@@ -201,7 +201,7 @@ async function getOrCreateSubscriptionUpdateConfiguration(c: AppContext, targetP
 }
 
 function isStripeSubscriptionAccess(accessType: string | null | undefined) {
-  return accessType === "monthly_subscription" || accessType === "annual_subscription";
+  return accessType === "monthly_subscription" || accessType === "semiannual_subscription" || accessType === "annual_subscription";
 }
 
 export async function createStripeBillingPortalSession(c: AppContext, input: { stripeCustomerId: string; returnPath: string }) {

@@ -354,7 +354,7 @@ function isActiveSubscriptionCancelingAtPeriodEnd(existingLicense: Awaited<Retur
   if (!existingLicense) {
     return false;
   }
-  if (existingLicense.status !== "active" || !["monthly_subscription", "annual_subscription"].includes(existingLicense.access_type || "")) {
+  if (existingLicense.status !== "active" || !["monthly_subscription", "semiannual_subscription", "annual_subscription"].includes(existingLicense.access_type || "")) {
     return false;
   }
   if (!existingLicense.billing_cancel_at_period_end) {
@@ -470,6 +470,9 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   if (billing.plansEnabled && input.planType === "lifetime") {
     throw new HTTPException(409, { message: "Novos acessos vitalicios nao estao disponiveis com a estrutura de planos ativa." });
   }
+  if (!billing.plansEnabled && input.planType === "semiannual") {
+    throw new HTTPException(409, { message: "Plano semestral indisponivel nesta estrutura de planos." });
+  }
 
   const name = input.name.trim();
   if (!name) {
@@ -502,6 +505,8 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
 
   const planEnabled = input.planType === "monthly"
     ? billing.monthlyEnabled
+    : input.planType === "semiannual"
+      ? billing.semiannualEnabled
     : input.planType === "annual"
       ? billing.annualEnabled
       : billing.lifetimeEnabled;

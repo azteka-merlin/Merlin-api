@@ -15,6 +15,7 @@ import {
   createSubscriptionPlanChange,
   previewImmediatePlanChangeCharge,
   previewSubscriptionPlanChange,
+  listPublicBillingPlanPrices,
   type BillingPeriod,
 } from "./subscription-plan-change";
 
@@ -177,6 +178,7 @@ function isCurrentLicense(license: LicenseAccessRow) {
 
 function accessKind(license: LicenseAccessRow) {
   if (license.access_type === "monthly_subscription") return "monthly" as const;
+  if (license.access_type === "semiannual_subscription" || license.access_type === "semiannual_manual") return "semiannual" as const;
   if (license.access_type === "annual_subscription" || license.access_type === "annual_manual") return "annual" as const;
   if (license.access_type === "paid_lifetime" || license.access_type === "legacy_lifetime") return "lifetime" as const;
   return "active" as const;
@@ -254,6 +256,35 @@ async function getUpgradeAvailability(c: AppContext, license: LicenseAccessRow, 
 async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, current: boolean) {
   const billing = await getBillingSettings(c);
   const kind = accessKind(license);
+  const pixOnlyRenewal = !license.stripe_customer_id
+    && !license.stripe_subscription_id
+    && String(license.source || "").toLowerCase().includes("mercadopago");
+  if (kind === "semiannual" && !billing.plansEnabled) {
+    return { available: false, card: false, pix: false, earlyPix: false, price: null };
+  }
+  if (billing.plansEnabled && (kind === "monthly" || kind === "semiannual" || kind === "annual")) {
+    const tier = normalizeStoredPlanTier(license.plan_tier, "ouro");
+    const method = pixOnlyRenewal ? "pix" : "card";
+    const prices = await listPublicBillingPlanPrices(c);
+    const row = prices.find((entry) => entry.billingPeriod === kind && entry.planTier === tier && entry.paymentMethod === method);
+    const periodEnabled = kind === "monthly" ? billing.monthlyEnabled : kind === "semiannual" ? billing.semiannualEnabled : billing.annualEnabled;
+    const pixPeriodEnabled = kind === "monthly" ? billing.pixMonthlyEnabled : kind === "semiannual" ? billing.pixSemiannualEnabled : billing.pixAnnualEnabled;
+    const enabled = billing.billingEnabled && billing.publicSignupEnabled && periodEnabled
+      && (!pixOnlyRenewal || billing.pixEnabled && pixPeriodEnabled && isPixRuntimeAvailable(c));
+    const available = Boolean(row && enabled && !current);
+    return {
+      available,
+      card: available && !pixOnlyRenewal,
+      pix: available && pixOnlyRenewal,
+      earlyPix: Boolean(row && pixOnlyRenewal && enabled && isEligibleForEarlyPixRenewal(license)),
+      price: available && row ? {
+        amountCents: row.amountCents, currency: row.currency,
+        recurringInterval: pixOnlyRenewal ? null : kind === "annual" ? "year" : "month",
+        recurringIntervalCount: pixOnlyRenewal ? null : kind === "semiannual" ? 6 : 1,
+        active: true, stale: false,
+      } : null,
+    };
+  }
   const price = kind === "annual" ? billing.prices.annual : billing.prices.monthly;
   const pixEnabled = kind === "annual" ? billing.pixAnnualEnabled : billing.pixMonthlyEnabled;
   const priceId = kind === "annual" ? billing.annualPriceId : billing.monthlyPriceId;
@@ -265,10 +296,6 @@ async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, 
     && planEnabled
     && Boolean(price?.active)
     && Boolean(priceId);
-  const pixOnlyRenewal = !license.stripe_customer_id
-    && !license.stripe_subscription_id
-    && String(license.source || "").toLowerCase().includes("mercadopago");
-
   return {
     available,
     card: available && !pixOnlyRenewal,
@@ -358,7 +385,7 @@ function mapAccessPayload(
       planTier: normalizeStoredPlanTier(license.plan_tier, "ouro"),
       billingStatus: license.billing_status || "none",
       expiresAt: toDateOnly(license.expires_at),
-      subscription: kind === "monthly" || kind === "annual" ? {
+      subscription: kind === "monthly" || kind === "semiannual" || kind === "annual" ? {
         status: subscription?.status || license.billing_status || "active",
         currentPeriodEnd: currentPeriodEnd ? toDateOnly(currentPeriodEnd) : null,
         cancelAtPeriodEnd,
@@ -421,7 +448,12 @@ export async function previewPublicAccessPlanChangeForLicense(
   input: { targetTier: PlanTier; targetPeriod: BillingPeriod },
 ) {
   const billing = await getBillingSettings(c);
-  if (!billing.plansEnabled) throw new HTTPException(409, { message: "A troca de planos nao esta disponivel neste momento." });
+  if (!billing.plansEnabled || !billing.billingEnabled) throw new HTTPException(409, { message: "A troca de planos nao esta disponivel neste momento." });
+  const targetEnabled = input.targetPeriod === "monthly" ? billing.monthlyEnabled
+    : input.targetPeriod === "semiannual" ? billing.semiannualEnabled : billing.annualEnabled;
+  if (!targetEnabled) {
+    throw new HTTPException(409, { message: "O periodo de destino nao esta disponivel neste momento." });
+  }
   const preview = await previewSubscriptionPlanChange(c, { licenseId, targetTier: input.targetTier, targetPeriod: input.targetPeriod });
   if (!preview.requiresPaymentConfirmation) {
     return { ...preview, amountDueNowCents: null, prorationDate: null };
@@ -698,7 +730,7 @@ export async function createPublicAccessBillingPortal(c: AppContext, input: { em
 }
 
 export async function createPublicAccessBillingPortalForLicense(c: AppContext, license: LicenseAccessRow, returnPath: string) {
-  if (!["monthly", "annual"].includes(accessKind(license)) || !license.stripe_customer_id || !license.stripe_subscription_id) {
+  if (!["monthly", "semiannual", "annual"].includes(accessKind(license)) || !license.stripe_customer_id || !license.stripe_subscription_id) {
     throw new HTTPException(409, { message: "Este acesso nao possui assinatura Stripe para gerenciar." });
   }
   return createStripeBillingPortalSession(c, {

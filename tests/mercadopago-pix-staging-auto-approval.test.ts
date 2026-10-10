@@ -27,6 +27,7 @@ describe("staging Mercado Pago Pix auto approval", () => {
 describe("Pix renewal policy", () => {
   test("keeps every recurring Pix plan manually renewable", () => {
     expect(getPixBillingCancelAtPeriodEnd("monthly")).toBe(1);
+    expect(getPixBillingCancelAtPeriodEnd("semiannual")).toBe(1);
     expect(getPixBillingCancelAtPeriodEnd("annual")).toBe(1);
     expect(getPixBillingCancelAtPeriodEnd("lifetime")).toBe(0);
   });

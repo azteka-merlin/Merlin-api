@@ -4,7 +4,7 @@
 
 - O tier efetivo e calculado na API. O Launcher somente consome o catalogo devolvido.
 - A ativacao Premium continua contabilizada em `completePremiumActivation`, antes da etapa local do Launcher. Esta regra nao deve ser movida por mudancas de plano.
-- Bronze possui tres ativacoes Premium por mes calendario do ciclo da licenca, inclusive para assinaturas anuais. O contador `premium_activation_cycle_usage` e atualizado de forma condicional para nao ultrapassar o limite sob concorrencia.
+- Bronze possui tres ativacoes Premium por mes calendario do ciclo da licenca, inclusive para assinaturas semestrais e anuais. O contador `premium_activation_cycle_usage` e atualizado de forma condicional para nao ultrapassar o limite sob concorrencia.
 - Prata e Ouro nao possuem limite mensal. Cooldowns e prazo de lancamento permanecem em `src/lib/plan-tiers.ts`.
 
 ## Acesso antecipado individual
@@ -65,7 +65,17 @@ Novos cadastros gratuitos nascem em Bronze com a restricao marcada. Quando essa 
 
 ## Pix
 
-O Pix e manual. Enquanto um acesso Pix mensal/anual estiver ativo, nao ha upgrade, downgrade, proracao ou Stripe Portal para ele. Nos ultimos sete dias do periodo, o usuario pode pagar antecipadamente a proxima mensalidade/anuidade. Assim que o pagamento e confirmado, a validade da mesma licenca e estendida a partir do vencimento atual, sem aguardar cron; tier e periodicidade novos so passam a valer na fronteira do periodo. Se nao houver pagamento antecipado, apos o vencimento o usuario escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
+O Pix e manual. Enquanto um acesso Pix mensal/semestral/anual estiver ativo, nao ha upgrade, downgrade, proracao ou Stripe Portal para ele. Nos ultimos sete dias do periodo, o usuario pode pagar antecipadamente o proximo periodo. Assim que o pagamento e confirmado, a validade da mesma licenca e estendida a partir do vencimento atual, sem aguardar cron; tier e periodicidade novos so passam a valer na fronteira do periodo. Se nao houver pagamento antecipado, apos o vencimento o usuario escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
+
+## Periodos de cobranca
+
+- `monthly`: um mes; `semiannual`: seis meses; `annual`: doze meses. Pix soma meses calendario, ajustando o ultimo dia quando necessario. No cartao, as datas confirmadas pela Stripe sao a fonte de verdade.
+- Cartao semestral exige Price recorrente `interval=month`, `interval_count=6`; mensal exige `month/1`, anual `year/1`. Os valores sao o total do periodo, nao parcelas mensais.
+- Precos de Bronze, Prata e Ouro sao escolhidos pela API em `billing_plan_prices`, inclusive na consulta de renovacao. Nao usar precos legados como fallback quando os tiers estiverem ativos.
+- Semestral so existe com tiers ativos. A migration `0077_semiannual_billing.sql` adiciona flags opt-in; nao habilita producao automaticamente.
+- Downgrade de tier ou encurtamento de periodo fica para o fim do periodo pago. Outras alteracoes elegiveis de cartao usam a confirmacao hospedada da Stripe; o tier alvo nao e liberado antes do pagamento.
+- Precos Pix semestrais/anuais sao independentes do cartao. Pix mensal continua espelhando o cartao mensal.
+- Consulte `PAYMENTS_AUDIT.md` para o mapa integrado e os limites de validacao.
 
 ## Staging
 

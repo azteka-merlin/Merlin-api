@@ -386,7 +386,7 @@ async function listExpirationReminderCandidates(c: BillingNotificationContext, n
         LEFT JOIN customers cst ON cst.id = l.customer_id
         WHERE l.status = 'active'
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'semiannual_subscription', 'semiannual_manual', 'annual_subscription', 'annual_manual')
           AND date(l.expires_at, '-3 hours') IN (${dates.map(() => "?").join(", ")})
           AND datetime(l.expires_at) > datetime(?)
           AND datetime(l.expires_at) <= datetime(?)
@@ -432,7 +432,7 @@ export async function getExpirationReminderEligibility(
         WHERE l.id = ?
           AND l.status = 'active'
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'semiannual_subscription', 'semiannual_manual', 'annual_subscription', 'annual_manual')
           AND datetime(l.expires_at) > datetime(?)
           AND datetime(l.expires_at) <= datetime(?)
           AND NOT (
@@ -510,7 +510,7 @@ async function listExpiredAccessCandidates(c: BillingNotificationContext, now: D
         LEFT JOIN customers cst ON cst.id = l.customer_id
         WHERE l.status IN ('active', 'expired')
           AND l.contact_type = 'email'
-          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+          AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'semiannual_subscription', 'semiannual_manual', 'annual_subscription', 'annual_manual')
           AND date(l.expires_at, '-3 hours') IN (${dates.map(() => "?").join(", ")})
           AND datetime(l.expires_at) < datetime(?)
           AND NOT (
@@ -769,7 +769,7 @@ export async function getBillingNotificationsDashboard(env: AppBindings, date: s
     FROM licenses l
     LEFT JOIN subscriptions s ON s.license_id = l.id
     WHERE l.status = 'active' AND l.contact_type = 'email'
-      AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'annual_subscription', 'annual_manual')
+      AND COALESCE(l.access_type, 'free') IN ('monthly_subscription', 'semiannual_subscription', 'semiannual_manual', 'annual_subscription', 'annual_manual')
       AND datetime(l.expires_at) > datetime(?)
       AND datetime(l.expires_at) <= datetime(?)
       AND NOT (l.stripe_subscription_id IS NOT NULL
@@ -814,7 +814,7 @@ export async function retryFailedBillingNotification(env: AppBindings, notificat
     return { sent: false, reason: "Este aviso não está disponível para reenvio." };
   }
   if (record.contact_type !== "email" || record.contact !== record.original_email
-    || !["monthly_subscription", "annual_subscription", "annual_manual"].includes(record.access_type || "")
+    || !["monthly_subscription", "semiannual_subscription", "semiannual_manual", "annual_subscription", "annual_manual"].includes(record.access_type || "")
     || !["active", "expired"].includes(record.license_status)
     || !record.dedupe_key.includes(`:license:${record.id}:expires:${dateOnly(record.expires_at)}`)) {
     return { sent: false, reason: "A licença ou o e-mail mudou; revise os dados antes de reenviar." };

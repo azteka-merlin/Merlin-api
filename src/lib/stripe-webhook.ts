@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import type { AppContext } from "../types";
 import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePaymentFailedNotification } from "./billing-notifications";
+import { addBillingPeriod } from "./billing-period";
 import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier } from "./plan-tiers";
 import { getPublicAppOrigin } from "./public-origin";
@@ -34,7 +35,7 @@ type CheckoutRow = {
   provider_price_id: string;
   provider_subscription_id: string | null;
   plan_tier: string | null;
-  plan_type: "monthly" | "annual" | "lifetime";
+  plan_type: "monthly" | "semiannual" | "annual" | "lifetime";
   mode: "subscription" | "payment";
   status: string;
   payment_status: string | null;
@@ -330,11 +331,12 @@ function oneYearFromNowIso() {
 
 function subscriptionFallbackPeriodEnd(planType: CheckoutRow["plan_type"], trialDays: number | null) {
   if (trialDays) return daysFromNowIso(trialDays);
-  return planType === "annual" ? oneYearFromNowIso() : oneMonthFromNowIso();
+  return addBillingPeriod(new Date().toISOString(), planType);
 }
 
 function subscriptionAccessType(planType: CheckoutRow["plan_type"]) {
-  return planType === "annual" ? "annual_subscription" : "monthly_subscription";
+  return planType === "annual" ? "annual_subscription"
+    : planType === "semiannual" ? "semiannual_subscription" : "monthly_subscription";
 }
 
 function daysFromNowIso(days: number) {
@@ -461,7 +463,7 @@ async function activateLicenseFromCheckout(
   c: AppContext,
   checkout: CheckoutRow,
   input: {
-    accessType: "paid_lifetime" | "monthly_subscription" | "annual_subscription";
+    accessType: "paid_lifetime" | "monthly_subscription" | "semiannual_subscription" | "annual_subscription";
     billingStatus: "active" | "past_due" | "canceled" | "expired";
     expiresAt: string;
     stripeCustomerId: string | null;
@@ -920,7 +922,7 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
     await cancelCustomerSubscriptionsAtPeriodEnd(c, checkout.customer_id);
   }
 
-  if (checkout.plan_type === "monthly" || checkout.plan_type === "annual") {
+  if (checkout.plan_type === "monthly" || checkout.plan_type === "semiannual" || checkout.plan_type === "annual") {
     const cardTrialDays = getCheckoutCardTrialDays(checkout);
     const isPaid = paymentStatus === "paid";
     const isTrialCheckout = !isPaid && Boolean(subscriptionId) && Boolean(cardTrialDays);

@@ -6,7 +6,7 @@ const PRICE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
 
-export type BillingPlanType = "monthly" | "annual" | "lifetime";
+export type BillingPlanType = "monthly" | "semiannual" | "annual" | "lifetime";
 
 type BillingSettingsRow = {
   id: number;
@@ -14,10 +14,12 @@ type BillingSettingsRow = {
   public_signup_enabled: number;
   plans_enabled: number;
   monthly_enabled: number;
+  semiannual_enabled: number;
   annual_enabled: number;
   lifetime_enabled: number;
   pix_enabled: number;
   pix_monthly_enabled: number;
+  pix_semiannual_enabled: number;
   pix_annual_enabled: number;
   pix_lifetime_enabled: number;
   monthly_card_trial_enabled: number;
@@ -53,7 +55,7 @@ type StripePrice = {
   active: boolean;
   currency: string;
   unit_amount: number | null;
-  recurring: { interval?: string | null } | null;
+  recurring: { interval?: string | null; interval_count?: number | null } | null;
   product: string | { id?: string; name?: string | null } | null;
 };
 
@@ -64,6 +66,7 @@ export type BillingPriceSnapshot = {
   amountCents: number;
   currency: string;
   recurringInterval: string | null;
+  recurringIntervalCount: number | null;
   active: boolean;
   syncedAt: string;
   stale: boolean;
@@ -74,10 +77,12 @@ export type BillingSettingsPayload = {
   publicSignupEnabled: boolean;
   plansEnabled: boolean;
   monthlyEnabled: boolean;
+  semiannualEnabled: boolean;
   annualEnabled: boolean;
   lifetimeEnabled: boolean;
   pixEnabled: boolean;
   pixMonthlyEnabled: boolean;
+  pixSemiannualEnabled: boolean;
   pixAnnualEnabled: boolean;
   pixLifetimeEnabled: boolean;
   monthlyCardTrialEnabled: boolean;
@@ -106,10 +111,12 @@ export type BillingSettingsInput = {
   billingEnabled: boolean;
   plansEnabled?: boolean;
   monthlyEnabled: boolean;
+  semiannualEnabled?: boolean;
   annualEnabled?: boolean;
   lifetimeEnabled: boolean;
   pixEnabled?: boolean;
   pixMonthlyEnabled?: boolean;
+  pixSemiannualEnabled?: boolean;
   pixAnnualEnabled?: boolean;
   pixLifetimeEnabled?: boolean;
   monthlyCardTrialEnabled?: boolean;
@@ -141,6 +148,8 @@ function isPriceCacheFresh(syncedAt: string) {
 }
 
 function mapPriceCache(row: PaymentPriceCacheRow): BillingPriceSnapshot {
+  let raw: StripePrice | null = null;
+  try { raw = JSON.parse(row.raw_json) as StripePrice; } catch { /* stale cache; refresh before use */ }
   return {
     provider: "stripe",
     priceId: row.provider_price_id,
@@ -148,6 +157,7 @@ function mapPriceCache(row: PaymentPriceCacheRow): BillingPriceSnapshot {
     amountCents: row.amount_cents,
     currency: row.currency,
     recurringInterval: row.recurring_interval,
+    recurringIntervalCount: raw?.recurring?.interval_count ?? null,
     active: row.active === 1,
     syncedAt: row.synced_at,
     stale: !isPriceCacheFresh(row.synced_at),
@@ -163,6 +173,7 @@ function mapStripePrice(price: StripePrice, syncedAt: string): BillingPriceSnaps
     amountCents: price.unit_amount ?? 0,
     currency: price.currency,
     recurringInterval: price.recurring?.interval || null,
+    recurringIntervalCount: price.recurring?.interval_count ?? null,
     active: Boolean(price.active),
     syncedAt,
     stale: false,
@@ -290,10 +301,13 @@ export function assertBillingPlanPrice(planType: BillingPlanType, price: Billing
   if (price.currency !== "brl") {
     throw new HTTPException(400, { message: "O Price ID precisa estar em BRL." });
   }
-  if (planType === "monthly" && price.recurringInterval !== "month") {
+  if (planType === "monthly" && (price.recurringInterval !== "month" || price.recurringIntervalCount !== 1)) {
     throw new HTTPException(400, { message: "O Price ID mensal precisa ser recorrente mensal." });
   }
-  if (planType === "annual" && price.recurringInterval !== "year") {
+  if (planType === "semiannual" && (price.recurringInterval !== "month" || price.recurringIntervalCount !== 6)) {
+    throw new HTTPException(400, { message: "O Price ID semestral precisa ser recorrente a cada 6 meses." });
+  }
+  if (planType === "annual" && (price.recurringInterval !== "year" || price.recurringIntervalCount !== 1)) {
     throw new HTTPException(400, { message: "O Price ID anual precisa ser recorrente anual." });
   }
   if (planType === "lifetime" && price.recurringInterval !== null) {
@@ -318,10 +332,12 @@ function mapBillingSettings(c: AppContext, row: BillingSettingsRow, prices: Bill
     publicSignupEnabled: row.public_signup_enabled === 1,
     plansEnabled: row.plans_enabled === 1,
     monthlyEnabled: row.monthly_enabled === 1,
+    semiannualEnabled: row.semiannual_enabled === 1,
     annualEnabled: row.annual_enabled === 1,
     lifetimeEnabled: row.lifetime_enabled === 1,
     pixEnabled: row.pix_enabled === 1,
     pixMonthlyEnabled: row.pix_monthly_enabled === 1,
+    pixSemiannualEnabled: row.pix_semiannual_enabled === 1,
     pixAnnualEnabled: row.pix_annual_enabled === 1,
     pixLifetimeEnabled: row.pix_lifetime_enabled === 1,
     monthlyCardTrialEnabled: row.monthly_card_trial_enabled === 1,
@@ -349,10 +365,12 @@ export async function getBillingSettings(c: AppContext) {
         SELECT id, billing_enabled, public_signup_enabled,
           COALESCE(plans_enabled, 0) AS plans_enabled,
           monthly_enabled,
+          semiannual_enabled,
           COALESCE(annual_enabled, 0) AS annual_enabled,
           lifetime_enabled,
           COALESCE(pix_enabled, 0) AS pix_enabled,
           COALESCE(pix_monthly_enabled, 1) AS pix_monthly_enabled,
+          pix_semiannual_enabled,
           COALESCE(pix_annual_enabled, 1) AS pix_annual_enabled,
           COALESCE(pix_lifetime_enabled, 1) AS pix_lifetime_enabled,
           COALESCE(monthly_card_trial_enabled, 0) AS monthly_card_trial_enabled,
@@ -371,10 +389,10 @@ export async function getBillingSettings(c: AppContext) {
       .prepare(
         `
           INSERT INTO billing_settings (
-            id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, annual_enabled, lifetime_enabled,
-            pix_enabled, pix_monthly_enabled, pix_annual_enabled, pix_lifetime_enabled, monthly_card_trial_enabled, monthly_card_trial_days, staging_email_delivery_enabled, premium_catalog_cutoff_at, currency, free_access_type, updated_at
+            id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, semiannual_enabled, annual_enabled, lifetime_enabled,
+            pix_enabled, pix_monthly_enabled, pix_semiannual_enabled, pix_annual_enabled, pix_lifetime_enabled, monthly_card_trial_enabled, monthly_card_trial_days, staging_email_delivery_enabled, premium_catalog_cutoff_at, currency, free_access_type, updated_at
           )
-          VALUES (1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 30, 0, NULL, 'brl', 'free', ?)
+          VALUES (1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 30, 0, NULL, 'brl', 'free', ?)
         `,
       )
       .bind(now)
@@ -385,10 +403,12 @@ export async function getBillingSettings(c: AppContext) {
       public_signup_enabled: 1,
       plans_enabled: 0,
       monthly_enabled: 1,
+      semiannual_enabled: 0,
       annual_enabled: 0,
       lifetime_enabled: 1,
       pix_enabled: 0,
       pix_monthly_enabled: 1,
+      pix_semiannual_enabled: 0,
       pix_annual_enabled: 1,
       pix_lifetime_enabled: 1,
       monthly_card_trial_enabled: 0,
@@ -434,7 +454,7 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
   const premiumCatalogCutoffAt = String(input.premiumCatalogCutoffAt || "").trim() || null;
   const validateLegacySubscriptionPrices = !input.plansEnabled;
 
-  if (input.billingEnabled && !input.monthlyEnabled && !input.annualEnabled && !input.lifetimeEnabled) {
+  if (input.billingEnabled && !input.monthlyEnabled && !input.semiannualEnabled && !input.annualEnabled && !input.lifetimeEnabled) {
     throw new HTTPException(400, { message: "Ative pelo menos um plano para exigir pagamento." });
   }
 
@@ -475,21 +495,23 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
     .prepare(
       `
         INSERT INTO billing_settings (
-          id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, annual_enabled, lifetime_enabled,
-          pix_enabled, pix_monthly_enabled, pix_annual_enabled, pix_lifetime_enabled,
+          id, billing_enabled, public_signup_enabled, plans_enabled, monthly_enabled, semiannual_enabled, annual_enabled, lifetime_enabled,
+          pix_enabled, pix_monthly_enabled, pix_semiannual_enabled, pix_annual_enabled, pix_lifetime_enabled,
           monthly_card_trial_enabled, monthly_card_trial_days, staging_email_delivery_enabled, premium_catalog_cutoff_at,
           monthly_price_id, annual_price_id, lifetime_price_id, pix_annual_price_id, pix_lifetime_price_id, currency, free_access_type, free_duration_days, updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'brl', 'free', NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           billing_enabled = excluded.billing_enabled,
           public_signup_enabled = excluded.public_signup_enabled,
           plans_enabled = excluded.plans_enabled,
           monthly_enabled = excluded.monthly_enabled,
+          semiannual_enabled = excluded.semiannual_enabled,
           annual_enabled = excluded.annual_enabled,
           lifetime_enabled = excluded.lifetime_enabled,
           pix_enabled = excluded.pix_enabled,
           pix_monthly_enabled = excluded.pix_monthly_enabled,
+          pix_semiannual_enabled = excluded.pix_semiannual_enabled,
           pix_annual_enabled = excluded.pix_annual_enabled,
           pix_lifetime_enabled = excluded.pix_lifetime_enabled,
           monthly_card_trial_enabled = excluded.monthly_card_trial_enabled,
@@ -512,10 +534,12 @@ export async function updateBillingSettings(c: AppContext, input: BillingSetting
       input.publicSignupEnabled ? 1 : 0,
       input.plansEnabled ? 1 : 0,
       input.monthlyEnabled ? 1 : 0,
+      input.semiannualEnabled ? 1 : 0,
       input.annualEnabled ? 1 : 0,
       input.lifetimeEnabled ? 1 : 0,
       input.pixEnabled ? 1 : 0,
       input.pixMonthlyEnabled !== false ? 1 : 0,
+      input.pixSemiannualEnabled ? 1 : 0,
       input.pixAnnualEnabled !== false ? 1 : 0,
       input.pixLifetimeEnabled !== false ? 1 : 0,
       input.monthlyCardTrialEnabled ? 1 : 0,

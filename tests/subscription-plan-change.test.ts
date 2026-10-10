@@ -210,12 +210,18 @@ function seedDb(overrides: Partial<Row> = {}) {
     price("bronze", "monthly", "price_bronze_monthly", 1490),
     price("prata", "monthly", "price_prata_monthly", 1990),
     price("ouro", "monthly", "price_ouro_monthly", 2490),
+    price("bronze", "semiannual", "price_bronze_semiannual", 7490),
+    price("prata", "semiannual", "price_prata_semiannual", 9990),
+    price("ouro", "semiannual", "price_ouro_semiannual", 12490),
     price("bronze", "annual", "price_bronze_annual", 11990),
     price("prata", "annual", "price_prata_annual", 15990),
     price("ouro", "annual", "price_ouro_annual", 19990),
     price("bronze", "monthly", null, 1490, "pix"),
     price("prata", "monthly", null, 1990, "pix"),
     price("ouro", "monthly", null, 2490, "pix"),
+    price("bronze", "semiannual", null, 7490, "pix"),
+    price("prata", "semiannual", null, 9990, "pix"),
+    price("ouro", "semiannual", null, 12490, "pix"),
     price("bronze", "annual", null, 11990, "pix"),
     price("prata", "annual", null, 15990, "pix"),
     price("ouro", "annual", null, 19990, "pix"),
@@ -354,6 +360,33 @@ describe("subscription plan changes", () => {
       .resolves.toMatchObject({ changeType: "upgrade", timing: "period_end", requiresPaymentConfirmation: false });
   });
 
+  test("preserves a prepaid six-month term when moving to monthly", async () => {
+    const db = seedDb({ plan_tier: "prata", access_type: "semiannual_subscription" });
+    await expect(previewSubscriptionPlanChange(createContext(db), { licenseId: 1, targetTier: "ouro", targetPeriod: "monthly" }))
+      .resolves.toMatchObject({ changeType: "upgrade", timing: "period_end" });
+
+    db.licenses[0].access_type = "monthly_subscription";
+    await expect(previewSubscriptionPlanChange(createContext(db), { licenseId: 1, targetTier: "prata", targetPeriod: "semiannual" }))
+      .resolves.toMatchObject({ changeType: "interval_change", timing: "immediate" });
+  });
+
+  test("covers every tier and interval combination without shortening a paid term", async () => {
+    const tiers = ["bronze", "prata", "ouro"] as const;
+    const periods = ["monthly", "semiannual", "annual"] as const;
+    const months = { monthly: 1, semiannual: 6, annual: 12 };
+    for (const currentTier of tiers) for (const currentPeriod of periods) {
+      const db = seedDb({ plan_tier: currentTier, access_type: `${currentPeriod}_subscription` });
+      for (const targetTier of tiers) for (const targetPeriod of periods) {
+        if (currentTier === targetTier && currentPeriod === targetPeriod) continue;
+        const downgrade = tiers.indexOf(targetTier) < tiers.indexOf(currentTier);
+        const shorterTerm = months[targetPeriod] < months[currentPeriod];
+        const timing = downgrade || shorterTerm ? "period_end" : "immediate";
+        await expect(previewSubscriptionPlanChange(createContext(db), { licenseId: 1, targetTier, targetPeriod }))
+          .resolves.toMatchObject({ timing, requiresPaymentConfirmation: timing === "immediate" });
+      }
+    }
+  });
+
   test("does not allow a canceled Stripe subscription to start another plan change", async () => {
     const db = seedDb({ billing_status: "canceled" });
 
@@ -412,7 +445,7 @@ describe("subscription plan changes", () => {
     const db = seedDb();
     const prices = await listPublicBillingPlanPrices(createContext(db));
 
-    expect(prices).toHaveLength(12);
+    expect(prices).toHaveLength(18);
     expect(prices).toContainEqual({
       paymentMethod: "card",
       planTier: "bronze",

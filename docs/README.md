@@ -13,6 +13,7 @@ Use this file as the docs router. Do not open every `.md` by default; pick the s
 7. `SPECIAL_CORRECTION.md` — contract for the AppID `4407750` license-token correction across API, Admin, and Launcher.
 8. `CONTEXT.md` — architecture, routes, modules, and behavior notes for code changes.
 9. `RELEASE_NOTES.md` — launcher changelog, its D1 records, R2 assets, and the Admin/Launcher contract.
+10. `PAYMENTS_AUDIT.md` — monthly, semiannual and annual billing contracts across public, API, Admin and Launcher, plus validation boundaries.
 
 ## Quick rule
 
