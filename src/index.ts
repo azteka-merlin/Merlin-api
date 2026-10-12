@@ -106,6 +106,7 @@ import {
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
 import { requireLauncherLicense, requireLauncherSearchLicense } from "./lib/launcher-auth";
+import { registerCustomGamesRoutes } from "./lib/custom-games";
 import {
   getCloudGame,
   handleCloudGateway,
@@ -260,7 +261,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home"] as const;
+const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -4156,6 +4157,8 @@ openapi.post("/api/fixes/vote", FixesVoteRoute);
 openapi.post("/api/auth/login", LoginRoute);
 openapi.post("/api/public/email-verification/start", PublicEmailVerificationStartRoute);
 openapi.post("/api/public/email-verification/verify", PublicEmailVerificationVerifyRoute);
+
+registerCustomGamesRoutes(app);
 
 app.onError((error, c) => {
   const status = getErrorStatus(error);
