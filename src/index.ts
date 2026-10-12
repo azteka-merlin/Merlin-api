@@ -73,8 +73,11 @@ import {
   revokePublicAccessSession,
 } from "./lib/public-access-session";
 import { createPublicStripeCheckout } from "./lib/public-checkout";
-import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardRenewal, isEligibleForExpiredPixRenewal } from "./lib/expired-card-renewal";
+import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardRenewal, isEligibleForExpiredCardToPix, isEligibleForExpiredPixRenewal } from "./lib/expired-card-renewal";
+import { assertExpiredCardToPixReady } from "./lib/card-to-pix";
 import { normalizeStoredPlanTier } from "./lib/plan-tiers";
+import { createCardPixTransitionCheckout, reconcilePriorPixPlanTransitions, previewPixPlanTransition, PIX_PLAN_TRANSITION_OPERATION } from "./lib/pix-plan-management";
+import { getPrepaidCardContext } from "./lib/prepaid-card-change";
 import {
   cancelScheduledSubscriptionPlanChange,
   createSubscriptionPlanChange,
@@ -3126,11 +3129,14 @@ app.post("/panel-api/licenses/:id/plan-change/preview", async (c) => {
   await requireAdminSession(c);
   const licenseId = parseLicenseId(c.req.param("id"));
   const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
-  const planChange = await previewSubscriptionPlanChange(c, {
-    licenseId,
-    targetTier: body.targetTier,
-    targetPeriod: body.targetPeriod,
-  });
+  const prepaid = await getPrepaidCardContext(c, licenseId);
+  const planChange = prepaid
+    ? await previewPublicAccessPlanChangeForLicense(c, licenseId, body)
+    : await previewSubscriptionPlanChange(c, {
+      licenseId,
+      targetTier: body.targetTier,
+      targetPeriod: body.targetPeriod,
+    });
   return c.json({ success: true, planChange }, 200);
 });
 
@@ -3138,11 +3144,14 @@ app.post("/panel-api/licenses/:id/plan-change", async (c) => {
   const session = await requireAdminSession(c, { mutate: true });
   const licenseId = parseLicenseId(c.req.param("id"));
   const body = parseBody(subscriptionPlanChangeSchema, await c.req.json());
-  const planChange = await createSubscriptionPlanChange(c, {
-    licenseId,
-    targetTier: body.targetTier,
-    targetPeriod: body.targetPeriod,
-  });
+  const prepaid = await getPrepaidCardContext(c, licenseId);
+  const planChange = prepaid
+    ? await createPublicAccessPlanChangeForLicense(c, await getLicense(c, licenseId), body, { returnPath: "/meu-acesso" })
+    : await createSubscriptionPlanChange(c, {
+      licenseId,
+      targetTier: body.targetTier,
+      targetPeriod: body.targetPeriod,
+    });
   await writeAdminAuditLog(c, {
     adminUserId: session.session.admin_user_id,
     action: "license_plan_change_requested",
@@ -3150,7 +3159,10 @@ app.post("/panel-api/licenses/:id/plan-change", async (c) => {
     entityId: String(licenseId),
     ipHash: session.session.ip_hash,
     userAgentHash: session.session.user_agent_hash,
-    metadata: planChange,
+    metadata: "checkoutUrl" in planChange
+      ? { status: planChange.status, amountDueNowCents: planChange.amountDueNowCents,
+        nextRenewalAt: planChange.nextRenewalAt, hostedCheckout: true }
+      : planChange,
   });
   const updated = await getLicense(c, licenseId);
   return c.json({ success: true, planChange, license: mapLicense(updated) }, 201);
@@ -3223,6 +3235,63 @@ app.post("/api/public/access/session/plan-change/cancel", async (c) => {
   return c.json({ success: true, planChange }, 200);
 });
 
+const pixPlanTransitionSchema = z.object({
+  targetTier: planTierSchema,
+  targetPeriod: billingPlanPeriodSchema,
+  paymentMethod: z.enum(["pix", "card"]),
+  mercadoPagoDeviceId: mercadoPagoDeviceIdSchema.optional(),
+});
+
+app.post("/api/public/access/session/pix-plan-transition/preview", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const body = parseBody(pixPlanTransitionSchema, await c.req.json());
+  const quote = await previewPixPlanTransition(c, { licenseId: session.session.license_id, ...body });
+  return c.json({ success: true, transition: {
+    currentTier: quote.currentTier,
+    currentPeriod: quote.currentPeriod,
+    targetTier: quote.targetTier,
+    targetPeriod: quote.targetPeriod,
+    paymentMethod: quote.paymentMethod,
+    timing: quote.timing,
+    amountDueNowCents: quote.amountDueNowCents,
+    unusedPixCreditCents: quote.unusedPixCreditCents,
+    targetAmountCents: quote.targetPriceCents,
+    nextRenewalAt: quote.nextRenewalAt,
+    currency: quote.currency,
+  } }, 200);
+});
+
+app.post("/api/public/access/session/pix-plan-transition", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const body = parseBody(pixPlanTransitionSchema, await c.req.json());
+  await reconcilePriorPixPlanTransitions(c, session.session.license_id);
+  const quote = await previewPixPlanTransition(c, { licenseId: session.session.license_id, ...body });
+  const inProgress = await c.env.merlin_db.prepare(`
+    SELECT id FROM checkout_sessions WHERE operation_type = ? AND upgrade_license_id = ?
+      AND upgrade_processed_at IS NULL AND status NOT IN ('expired', 'failed', 'canceled') LIMIT 1
+  `).bind(PIX_PLAN_TRANSITION_OPERATION, quote.license.id).first<{ id: number }>();
+  if (inProgress) throw new HTTPException(409, { message: "Ja existe uma troca de plano em processamento." });
+
+  if (body.paymentMethod === "card") {
+    const checkout = await createCardPixTransitionCheckout(c, quote);
+    return c.json({ success: true, kind: "card", ...checkout }, 201);
+  }
+  const pix = await createPublicPixOrder(c, {
+    name: quote.license.name,
+    contact: quote.license.contact,
+    recoveryPin: "",
+    acceptedRecoveryNotice: true,
+    planType: quote.targetPeriod,
+    planTier: quote.targetTier,
+    mercadoPagoDeviceId: body.mercadoPagoDeviceId,
+  }, quote.timing === "period_end"
+    ? { scheduledRenewalLicenseId: quote.license.id }
+    : quote.timing === "reactivation"
+      ? { reactivationLicenseId: quote.license.id }
+      : { immediateTransition: quote });
+  return c.json({ success: true, kind: "pix", ...pix }, 201);
+});
+
 app.post("/api/public/access/session/billing-portal", async (c) => {
   const session = await requirePublicAccessSession(c, { mutate: true });
   const license = await getLicense(c, session.session.license_id);
@@ -3256,9 +3325,11 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
   const license = await getLicense(c, session.session.license_id);
   const expiredRenewal = isEligibleForExpiredPixRenewal(license);
   const earlyRenewal = isEligibleForEarlyPixRenewal(license);
-  if (!expiredRenewal && !earlyRenewal) {
+  const cardToPix = isEligibleForExpiredCardToPix(license);
+  if (!expiredRenewal && !earlyRenewal && !cardToPix) {
     throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix." });
   }
+  if (cardToPix) await assertExpiredCardToPixReady(c, license);
   const result = await createPublicPixOrder(c, {
     name: license.name,
     contact: license.contact,
@@ -3271,8 +3342,8 @@ app.post("/api/public/access/session/renewal/pix", async (c) => {
       : license.access_type === "semiannual_subscription" || license.access_type === "semiannual_manual" ? "semiannual" : "monthly"),
     planTier: body.planTier || normalizeStoredPlanTier(license.plan_tier || "ouro", "ouro"),
     mercadoPagoDeviceId: body.mercadoPagoDeviceId,
-  }, expiredRenewal
-    ? { reactivationLicenseId: license.id }
+  }, expiredRenewal || cardToPix
+    ? { reactivationLicenseId: license.id, cardToPixVerified: cardToPix }
     : { scheduledRenewalLicenseId: license.id });
   return c.json({ success: true, ...result }, 201);
 });

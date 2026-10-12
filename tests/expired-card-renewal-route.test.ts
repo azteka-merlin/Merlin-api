@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardRenewal, isEligibleForExpiredPixRenewal } from "../src/lib/expired-card-renewal";
+import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardRenewal, isEligibleForExpiredCardToPix, isEligibleForExpiredPixRenewal } from "../src/lib/expired-card-renewal";
 
 describe("expired Stripe renewal route", () => {
   test("allows a canceled recurring card license when expiry is represented as active or expired", () => {
@@ -29,6 +29,19 @@ describe("expired Stripe renewal route", () => {
     expect(isEligibleForExpiredCardRenewal({ ...base, status: "revoked" }, now)).toBe(false);
     expect(isEligibleForExpiredCardRenewal({ ...base, expires_at: "2026-10-18T02:59:59.999Z" }, now)).toBe(false);
     expect(isEligibleForExpiredCardRenewal({ ...base, billing_status: "active" }, now)).toBe(false);
+  });
+
+  test("card-to-Pix is offered only after expiry and a canceled or scheduled-to-cancel card subscription", () => {
+    const now = new Date("2026-09-18").getTime();
+    const base = { status: "active", expires_at: "2026-09-03T02:59:59.999Z",
+      billing_status: "canceled", stripe_customer_id: "cus_test", stripe_subscription_id: "sub_test",
+      access_type: "semiannual_subscription" };
+    expect(isEligibleForExpiredCardToPix(base, now)).toBe(true);
+    expect(isEligibleForExpiredCardToPix({ ...base, billing_status: "active", billing_cancel_at_period_end: 1 }, now)).toBe(true);
+    expect(isEligibleForExpiredCardToPix({ ...base, expires_at: "2026-10-03T02:59:59.999Z" }, now)).toBe(false);
+    expect(isEligibleForExpiredCardToPix({ ...base, status: "revoked" }, now)).toBe(false);
+    expect(isEligibleForExpiredCardToPix({ ...base, billing_status: "past_due" }, now)).toBe(false);
+    expect(isEligibleForExpiredCardToPix({ ...base, stripe_subscription_id: null }, now)).toBe(false);
   });
 
   test("allows an expired Pix renewal with either persisted entitlement status, including manual annual Pix", () => {

@@ -8,16 +8,18 @@ import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { getPublicAppOrigin } from "./public-origin";
 import { compareRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
-import { isEligibleForEarlyPixRenewal } from "./expired-card-renewal";
+import { isEligibleForEarlyPixRenewal, isEligibleForExpiredCardToPix } from "./expired-card-renewal";
 import { toDateOnly } from "./licenses";
 import {
   cancelScheduledSubscriptionPlanChange,
+  classifyPlanChange,
   createSubscriptionPlanChange,
   previewImmediatePlanChangeCharge,
   previewSubscriptionPlanChange,
   listPublicBillingPlanPrices,
   type BillingPeriod,
 } from "./subscription-plan-change";
+import { createPrepaidCardChangeCheckout, getPrepaidCardContext, previewPrepaidCardChange, settleOpenPrepaidCardCheckouts } from "./prepaid-card-change";
 
 const PROVIDER_STRIPE = "stripe";
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
@@ -185,7 +187,7 @@ function accessKind(license: LicenseAccessRow) {
 }
 
 async function getSubscription(c: AppContext, license: LicenseAccessRow) {
-  if (!license.customer_id) return null;
+  if (!license.customer_id || !license.stripe_subscription_id) return null;
   return c.env.merlin_db
     .prepare(
       `
@@ -194,11 +196,12 @@ async function getSubscription(c: AppContext, license: LicenseAccessRow) {
         WHERE customer_id = ?
           AND license_id = ?
           AND provider = ?
+          AND provider_subscription_id = ?
         ORDER BY updated_at DESC, id DESC
         LIMIT 1
       `,
     )
-    .bind(license.customer_id, license.id, PROVIDER_STRIPE)
+    .bind(license.customer_id, license.id, PROVIDER_STRIPE, license.stripe_subscription_id)
     .first<SubscriptionAccessRow>();
 }
 
@@ -272,10 +275,16 @@ async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, 
     const enabled = billing.billingEnabled && billing.publicSignupEnabled && periodEnabled
       && (!pixOnlyRenewal || billing.pixEnabled && pixPeriodEnabled && isPixRuntimeAvailable(c));
     const available = Boolean(row && enabled && !current);
+    const cardToPix = isEligibleForExpiredCardToPix(license) && billing.billingEnabled
+      && billing.publicSignupEnabled && billing.pixEnabled && isPixRuntimeAvailable(c)
+      && prices.some((entry) => entry.paymentMethod === "pix" && (
+        entry.billingPeriod === "monthly" ? billing.monthlyEnabled && billing.pixMonthlyEnabled
+          : entry.billingPeriod === "semiannual" ? billing.semiannualEnabled && billing.pixSemiannualEnabled
+            : billing.annualEnabled && billing.pixAnnualEnabled));
     return {
-      available,
+      available: available || cardToPix,
       card: available && !pixOnlyRenewal,
-      pix: available && pixOnlyRenewal,
+      pix: available && pixOnlyRenewal || cardToPix,
       earlyPix: Boolean(row && pixOnlyRenewal && enabled && isEligibleForEarlyPixRenewal(license)),
       price: available && row ? {
         amountCents: row.amountCents, currency: row.currency,
@@ -296,10 +305,12 @@ async function getRenewalAvailability(c: AppContext, license: LicenseAccessRow, 
     && planEnabled
     && Boolean(price?.active)
     && Boolean(priceId);
+  const cardToPix = isEligibleForExpiredCardToPix(license) && available
+    && billing.pixEnabled && pixEnabled && isPixRuntimeAvailable(c);
   return {
     available,
     card: available && !pixOnlyRenewal,
-    pix: available && pixOnlyRenewal && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled,
+    pix: available && pixOnlyRenewal && isPixRuntimeAvailable(c) && billing.pixEnabled && pixEnabled || cardToPix,
     earlyPix: pixOnlyRenewal
       && isEligibleForEarlyPixRenewal(license)
       && isPixRuntimeAvailable(c)
@@ -454,6 +465,20 @@ export async function previewPublicAccessPlanChangeForLicense(
   if (!targetEnabled) {
     throw new HTTPException(409, { message: "O periodo de destino nao esta disponivel neste momento." });
   }
+  const prepaidContext = await getPrepaidCardContext(c, licenseId);
+  if (prepaidContext && classifyPlanChange(prepaidContext.currentTier, prepaidContext.currentPeriod,
+    input.targetTier, input.targetPeriod).timing === "immediate") {
+    const prepaid = await previewPrepaidCardChange(c, { licenseId, ...input });
+    return {
+      currentTier: prepaid.currentTier, currentPeriod: prepaid.currentPeriod,
+      targetTier: prepaid.targetTier, targetPeriod: prepaid.targetPeriod,
+      targetPriceId: prepaid.targetPriceId, targetAmountCents: prepaid.targetAmountCents,
+      targetCurrency: prepaid.targetCurrency, changeType: prepaid.changeType,
+      timing: "immediate" as const, requiresPaymentConfirmation: true,
+      amountDueNowCents: prepaid.amountDueNowCents, prorationDate: null,
+      unusedCreditCents: prepaid.unusedCreditCents, nextRenewalAt: prepaid.nextRenewalAt,
+    };
+  }
   const preview = await previewSubscriptionPlanChange(c, { licenseId, targetTier: input.targetTier, targetPeriod: input.targetPeriod });
   if (!preview.requiresPaymentConfirmation) {
     return { ...preview, amountDueNowCents: null, prorationDate: null };
@@ -493,6 +518,7 @@ export async function createPublicAccessPlanChangeForLicense(
     targetPeriod: input.targetPeriod,
   });
   if (preview.timing === "period_end") {
+    if (await getPrepaidCardContext(c, license.id)) await settleOpenPrepaidCardCheckouts(c, license.id);
     return createSubscriptionPlanChange(c, {
       licenseId: license.id,
       targetTier: input.targetTier,
@@ -501,6 +527,12 @@ export async function createPublicAccessPlanChangeForLicense(
   }
 
   await ensureNoPublicAccessPlanChange(c, license.id);
+  if (await getPrepaidCardContext(c, license.id)) {
+    return createPrepaidCardChangeCheckout(c, {
+      licenseId: license.id, targetTier: input.targetTier, targetPeriod: input.targetPeriod,
+      returnPath: options.returnPath || "/download",
+    });
+  }
 
   if (!license.customer_id || !license.stripe_customer_id || !license.stripe_subscription_id) {
     throw new HTTPException(409, { message: "Esta assinatura nao esta elegivel para troca de plano." });

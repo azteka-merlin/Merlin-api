@@ -12,7 +12,8 @@ function setup(paymentStatus = "paid") {
     CREATE TABLE licenses (
       id INTEGER PRIMARY KEY, expires_at TEXT, billing_current_period_start TEXT,
       billing_current_period_end TEXT, plan_tier TEXT, access_type TEXT,
-      status TEXT, billing_status TEXT, billing_cancel_at_period_end INTEGER, updated_at TEXT
+      status TEXT, source TEXT, stripe_subscription_id TEXT, billing_status TEXT,
+      billing_cancel_at_period_end INTEGER, updated_at TEXT
     );
     CREATE TABLE checkout_sessions (
       id INTEGER PRIMARY KEY, customer_id INTEGER, provider TEXT, provider_session_id TEXT,
@@ -28,8 +29,8 @@ function setup(paymentStatus = "paid") {
     );
   `);
   sqlite.prepare(`INSERT INTO licenses
-    (id, expires_at, billing_current_period_end, plan_tier, access_type, status, billing_status)
-    VALUES (7, ?, ?, 'ouro', 'monthly_subscription', 'active', 'active')`
+    (id, expires_at, billing_current_period_end, plan_tier, access_type, status, source, billing_status)
+    VALUES (7, ?, ?, 'ouro', 'monthly_subscription', 'active', 'mercadopago_pix', 'active')`
   ).run(originalExpiry, originalExpiry);
   sqlite.prepare(`INSERT INTO checkout_sessions
     (id, provider, plan_tier, plan_type, payment_status, scheduled_renewal_license_id,
@@ -109,6 +110,15 @@ describe("paid Pix renewal entitlement", () => {
     expect(await extendPaidPixRenewal(c, checkout)).toBe(false);
     expect((await applyDuePixScheduledRenewals(c)).applied).toBe(0);
     expect(sqlite.prepare("SELECT expires_at FROM licenses WHERE id = 7").get()).toMatchObject({ expires_at: originalExpiry });
+    sqlite.close();
+  });
+
+  test("a late paid Pix cannot extend a license already migrated to card", async () => {
+    const { sqlite, c, checkout } = setup();
+    sqlite.prepare("UPDATE licenses SET source = 'stripe', stripe_subscription_id = 'sub_card' WHERE id = 7").run();
+    await expect(extendPaidPixRenewal(c, checkout)).rejects.toThrow(/conflicts with current license billing/);
+    expect(sqlite.prepare("SELECT expires_at FROM licenses WHERE id = 7").get())
+      .toMatchObject({ expires_at: originalExpiry });
     sqlite.close();
   });
 

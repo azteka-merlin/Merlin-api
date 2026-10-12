@@ -65,7 +65,11 @@ Novos cadastros gratuitos nascem em Bronze com a restricao marcada. Quando essa 
 
 ## Pix
 
-O Pix e manual. Enquanto um acesso Pix mensal/semestral/anual estiver ativo, nao ha upgrade, downgrade, proracao ou Stripe Portal para ele. Nos ultimos sete dias do periodo, o usuario pode pagar antecipadamente o proximo periodo. Assim que o pagamento e confirmado, a validade da mesma licenca e estendida a partir do vencimento atual, sem aguardar cron; tier e periodicidade novos so passam a valer na fronteira do periodo. Se nao houver pagamento antecipado, apos o vencimento o usuario escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
+O Pix e manual. No Meu acesso, a licenca Pix ativa pode subir de tier e/ou passar para periodo mais longo a qualquer momento. A API calcula credito proporcional do periodo Pix ainda nao usado: no mesmo periodo Pix cobra a diferenca proporcional de tier e preserva o vencimento; ao passar para periodo mais longo cobra o total do novo periodo menos esse credito e inicia o novo periodo na confirmacao. Downgrade Pix segue a janela dos ultimos sete dias e paga antecipadamente o periodo seguinte. Se nao houver pagamento antecipado, apos o vencimento o usuario escolhe tier e periodo e gera um novo Pix para reativar a mesma licenca.
+
+A primeira migracao Pix ativo -> cartao no mesmo tier/periodo apenas coleta o cartao e ancora a primeira cobranca cheia no vencimento ja pago. Com upgrade, o credito Pix nao usado reduz o primeiro pagamento da assinatura e o novo ciclo comeca apos a confirmacao. Nao se usa Stripe Portal nessa migracao. Ela so abre Checkout com mais de 24h30 restantes; Pix vencido pode contratar cartao pelo valor integral. O acesso preserva chave e HWID.
+
+Depois de migrar, a licenca e de cartao. Antes da primeira renovacao cheia, upgrades adicionais usam Checkout Stripe para cobrar o preco do novo periodo menos o credito pre-pago restante; apos a confirmacao, comeca um novo ciclo. Downgrade de tier ou periodo menor agenda a troca para o vencimento atual na assinatura Stripe, sem debito imediato nem reducao antecipada do acesso. Um Checkout pendente deve ser encerrado ou conciliado antes de agendar outra troca. Depois da primeira fatura cheia, nao ha credito anterior e valem apenas as regras cartao -> cartao. Cobrancas pendentes bloqueiam outra operacao financeira na mesma licenca ate conciliacao/encerramento confirmado no provedor.
 
 ## Periodos de cobranca
 
@@ -75,6 +79,7 @@ O Pix e manual. Enquanto um acesso Pix mensal/semestral/anual estiver ativo, nao
 - Semestral so existe com tiers ativos. A migration `0077_semiannual_billing.sql` adiciona flags opt-in; nao habilita producao automaticamente.
 - Downgrade de tier ou encurtamento de periodo fica para o fim do periodo pago. Outras alteracoes elegiveis de cartao usam a confirmacao hospedada da Stripe; o tier alvo nao e liberado antes do pagamento.
 - Precos Pix semestrais/anuais sao independentes do cartao. Pix mensal continua espelhando o cartao mensal.
+- Depois da migracao Pix -> cartao, o metodo da licenca e cartao: downgrade de tier e reducao de periodo podem ser agendados no vencimento atual, mesmo antes da primeira fatura cheia. O Pix anterior so fornece credito proporcional a upgrades imediatos enquanto houver prazo pre-pago; nao define bloqueios nem novas renovacoes. Apos a primeira fatura cheia no cartao, esse credito se encerra e o fluxo cartao -> cartao regular assume integralmente.
 - Consulte `PAYMENTS_AUDIT.md` para o mapa integrado e os limites de validacao.
 
 ## Staging

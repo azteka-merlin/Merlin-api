@@ -6,6 +6,8 @@ import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePa
 import { addBillingPeriod } from "./billing-period";
 import { assertRecentPublicEmailVerification } from "./email-verification";
 import { normalizeStoredPlanTier } from "./plan-tiers";
+import { PIX_PLAN_TRANSITION_OPERATION, parseCardPixTransitionEvidence } from "./pix-plan-management";
+import { applyPrepaidCardChange, parsePrepaidCardEvidence, PREPAID_CARD_CHANGE_OPERATION } from "./prepaid-card-change";
 import { getPublicAppOrigin } from "./public-origin";
 import {
   LIFETIME_EXPIRES_AT,
@@ -36,7 +38,7 @@ type CheckoutRow = {
   provider_subscription_id: string | null;
   plan_tier: string | null;
   plan_type: "monthly" | "semiannual" | "annual" | "lifetime";
-  mode: "subscription" | "payment";
+  mode: "subscription" | "payment" | "setup";
   status: string;
   payment_status: string | null;
   license_id: number | null;
@@ -50,6 +52,8 @@ type CheckoutRow = {
   pending_recovery_pin_hash: string | null;
   pending_recovery_notice_accepted_at: string | null;
   checkout_evidence_json: string | null;
+  renewal_applied_at?: string | null;
+  completed_at?: string | null;
 };
 
 type CustomerRow = {
@@ -138,12 +142,13 @@ async function stripeGet<T>(c: AppContext, path: string) {
   return payload;
 }
 
-async function stripePost<T>(c: AppContext, path: string, params: URLSearchParams) {
+async function stripePost<T>(c: AppContext, path: string, params: URLSearchParams, idempotencyKey?: string) {
   const response = await fetch(`https://api.stripe.com/v1${path}`, {
     method: "POST",
     headers: {
       Authorization: encodeBasicAuth(getStripeSecretKey(c)),
       "Content-Type": "application/x-www-form-urlencoded",
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
     body: params.toString(),
   });
@@ -256,7 +261,18 @@ async function reservePaymentEvent(c: AppContext, event: StripeEvent) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || "");
     if (message.includes("idx_payment_events_provider_event") || message.toLowerCase().includes("unique")) {
-      return false;
+      // A failed delivery, or a worker interrupted while processing it, must
+      // be able to finish the payment on Stripe's next delivery. A fresh
+      // processing lease is left alone so concurrent deliveries cannot race.
+      const retry = await c.env.merlin_db.prepare(`
+        UPDATE payment_events SET processing_status = 'processing', created_at = ?,
+          processed_at = NULL, error_message = NULL
+        WHERE provider = ? AND provider_event_id = ?
+          AND (processing_status = 'failed'
+            OR (processing_status = 'processing' AND created_at < ?))
+      `).bind(now, PROVIDER_STRIPE, event.id,
+        new Date(Date.now() - 5 * 60_000).toISOString()).run();
+      return (retry.meta.changes || 0) > 0;
     }
     throw error;
   }
@@ -367,7 +383,7 @@ async function getCheckoutBySessionId(c: AppContext, sessionId: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, renewal_applied_at, completed_at
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_session_id = ?
@@ -384,10 +400,11 @@ async function getCheckoutBySubscriptionId(c: AppContext, subscriptionId: string
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_subscription_id, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id,
           operation_type, upgrade_license_id, upgrade_subscription_id, upgrade_processed_at,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, renewal_applied_at, completed_at
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_subscription_id = ?
+          AND (operation_type IS NULL OR operation_type <> 'prepaid_card_plan_change')
         ORDER BY id DESC
         LIMIT 1
       `,
@@ -402,7 +419,7 @@ async function getLatestCheckoutByEmail(c: AppContext, emailNormalized: string) 
       `
         SELECT cs.id, cs.customer_id, cs.provider_session_id, cs.provider_price_id, cs.provider_subscription_id, cs.plan_tier, cs.plan_type, cs.mode, cs.status, cs.payment_status, cs.license_id, cs.reactivation_license_id,
           cs.operation_type, cs.upgrade_license_id, cs.upgrade_subscription_id, cs.upgrade_processed_at,
-          cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at, cs.checkout_evidence_json
+          cs.pending_license_key, cs.pending_name, cs.pending_recovery_pin_hash, cs.pending_recovery_notice_accepted_at, cs.checkout_evidence_json, cs.renewal_applied_at
         FROM checkout_sessions cs
         JOIN customers cst ON cst.id = cs.customer_id
         WHERE cs.provider = ?
@@ -881,6 +898,7 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
   const subscriptionId = getStripeId(session.subscription);
   const paymentStatus = getString(session.payment_status) || null;
   const stripeCustomerId = getStripeId(session.customer);
+  const completedAt = checkout.completed_at || new Date().toISOString();
   await c.env.merlin_db
     .prepare(
       `
@@ -889,12 +907,163 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
         WHERE id = ?
       `,
     )
-    .bind(getString(session.status) || "complete", paymentStatus, subscriptionId, new Date().toISOString(), new Date().toISOString(), checkout.id)
+    .bind(getString(session.status) || "complete", paymentStatus, subscriptionId, completedAt, new Date().toISOString(), checkout.id)
     .run();
 
   if (checkout.operation_type === UPGRADE_OPERATION) {
     if (paymentStatus === "paid") {
       await handleLifetimeUpgradeCheckoutCompleted(c, checkout, session);
+    }
+    return;
+  }
+
+  if (checkout.operation_type === PREPAID_CARD_CHANGE_OPERATION) {
+    const evidence = parsePrepaidCardEvidence(checkout.checkout_evidence_json);
+    if (!evidence || !checkout.upgrade_license_id || !stripeCustomerId) {
+      throw new Error(`Invalid prepaid card checkout ${checkout.id}`);
+    }
+    const confirmed = evidence.amountDueNowCents > 0
+      ? paymentStatus === "paid" : paymentStatus === "no_payment_required";
+    if (!confirmed) return;
+    if (checkout.upgrade_processed_at) return;
+    if (getString(session.mode) !== evidence.checkoutMode
+      || (getNumber(session.amount_total) ?? (evidence.checkoutMode === "setup" ? 0 : null)) !== evidence.amountDueNowCents
+      || (evidence.amountDueNowCents > 0 && getString(session.currency)?.toLowerCase() !== "brl")) {
+      throw new Error(`Prepaid card checkout ${checkout.id} amount or currency mismatch`);
+    }
+    const intentId = getStripeId(evidence.checkoutMode === "payment" ? session.payment_intent : session.setup_intent);
+    if (!intentId) throw new Error(`Prepaid card checkout ${checkout.id} has no intent`);
+    const intent = await stripeGet<Record<string, unknown>>(c,
+      `/${evidence.checkoutMode === "payment" ? "payment_intents" : "setup_intents"}/${encodeURIComponent(intentId)}`);
+    if (getString(intent.status) !== "succeeded") throw new Error(`Prepaid card checkout ${checkout.id} is not confirmed`);
+    const paymentMethodId = getStripeId(intent.payment_method);
+    if (!paymentMethodId) throw new Error(`Prepaid card checkout ${checkout.id} has no card`);
+    await applyPrepaidCardChange(c, { checkoutId: checkout.id, sessionId, customerId: checkout.customer_id,
+      stripeCustomerId, licenseId: checkout.upgrade_license_id, evidence, completedAt,
+      paymentMethodId, paymentIntentId: evidence.checkoutMode === "payment" ? intentId : null });
+    return;
+  }
+
+  if (checkout.operation_type === PIX_PLAN_TRANSITION_OPERATION) {
+    const evidence = parseCardPixTransitionEvidence(checkout.checkout_evidence_json);
+    if (!evidence || !checkout.upgrade_license_id || !stripeCustomerId) {
+      throw new Error(`Invalid Pix-to-card checkout ${checkout.id}`);
+    }
+    const paid = paymentStatus === "paid" || (evidence.amountCents === 0 && paymentStatus === "no_payment_required");
+    if (!paid) return;
+    const checkoutMode = getString(session.mode) || evidence.checkoutCollectionMode || "subscription";
+    if ((getNumber(session.amount_total) ?? (checkoutMode === "setup" ? 0 : null)) !== evidence.amountCents
+      || (evidence.amountCents > 0 && getString(session.currency)?.toLowerCase() !== "brl")) {
+      throw new Error(`Pix-to-card checkout ${checkout.id} amount or currency mismatch`);
+    }
+    if (checkout.upgrade_processed_at) return;
+
+    let nextRenewalAt = evidence.nextRenewalAt;
+    let paidPeriodStart: string | null = null;
+    if (evidence.timing === "reactivation" || (evidence.timing === "immediate" && checkoutMode === "subscription")) {
+      if (!subscriptionId) throw new Error(`Pix-to-card paid checkout ${checkout.id} has no subscription`);
+      const subscription = await stripeGet<Record<string, unknown>>(c,
+        `/subscriptions/${encodeURIComponent(subscriptionId)}`);
+      const items = getObject(subscription.items)?.data;
+      const firstItem = Array.isArray(items) ? getObject(items[0]) : null;
+      const periodEnd = getNumber(subscription.current_period_end) || getNumber(firstItem?.current_period_end);
+      const periodStart = getNumber(subscription.current_period_start) || getNumber(firstItem?.current_period_start);
+      if (!periodEnd || !periodStart || getString(subscription.status) !== "active") {
+        throw new Error(`Pix-to-card paid checkout ${checkout.id} has no confirmed billing period`);
+      }
+      nextRenewalAt = new Date(periodEnd * 1000).toISOString();
+      paidPeriodStart = new Date(periodStart * 1000).toISOString();
+    }
+
+    let effectiveSubscriptionId = subscriptionId;
+    if (checkoutMode === "payment" || checkoutMode === "setup") {
+      const intentId = checkoutMode === "payment" ? getStripeId(session.payment_intent) : getStripeId(session.setup_intent);
+      if (!intentId) throw new Error(`Pix-to-card checkout ${checkout.id} has no card intent`);
+      const intent = await stripeGet<Record<string, unknown>>(c,
+        `/${checkoutMode === "payment" ? "payment_intents" : "setup_intents"}/${encodeURIComponent(intentId)}`);
+      const paymentMethodId = getStripeId(intent.payment_method);
+      if (!paymentMethodId || getString(intent.status) !== "succeeded") {
+        throw new Error(`Pix-to-card checkout ${checkout.id} has no confirmed card`);
+      }
+      const params = new URLSearchParams();
+      params.set("customer", stripeCustomerId);
+      params.set("items[0][price]", checkout.provider_price_id || "");
+      params.set("default_payment_method", paymentMethodId);
+      params.set("payment_settings[save_default_payment_method]", "on_subscription");
+      params.set("trial_end", String(Math.max(
+        Math.floor(Date.parse(nextRenewalAt) / 1000), Math.floor(Date.now() / 1000) + 60,
+      )));
+      params.set("metadata[merlin_license_id]", String(checkout.upgrade_license_id));
+      params.set("metadata[merlin_operation]", PIX_PLAN_TRANSITION_OPERATION);
+      const created = await stripePost<{ id?: string }>(c, "/subscriptions", params,
+        `merlin_pix_card:${sessionId}:subscription`);
+      effectiveSubscriptionId = created.id || null;
+    }
+    if (!effectiveSubscriptionId) throw new Error(`Pix-to-card checkout ${checkout.id} has no subscription`);
+
+    if (nextRenewalAt !== evidence.nextRenewalAt) {
+      await c.env.merlin_db.prepare(`UPDATE checkout_sessions SET checkout_evidence_json = ?, updated_at = ? WHERE id = ?`)
+        .bind(JSON.stringify({ ...evidence, nextRenewalAt }), new Date().toISOString(), checkout.id).run();
+    }
+
+    const now = new Date().toISOString();
+    const targetAppliesNow = ["immediate", "early_renewal", "reactivation"].includes(evidence.timing);
+    const nextTier = targetAppliesNow ? evidence.targetTier : evidence.currentTier;
+    const nextPeriod = targetAppliesNow ? evidence.targetPeriod : evidence.currentPeriod;
+    const nextAccessType = nextPeriod === "annual" ? "annual_subscription"
+      : nextPeriod === "semiannual" ? "semiannual_subscription" : "monthly_subscription";
+    const nextExpiresAt = targetAppliesNow ? nextRenewalAt : evidence.currentPeriodEnd;
+    const nextStart = paidPeriodStart || (evidence.timing === "reactivation" ? completedAt
+      : evidence.timing === "early_renewal" ? evidence.currentPeriodEnd
+        : targetAppliesNow && evidence.targetPeriod !== evidence.currentPeriod
+          ? completedAt : evidence.currentPeriodStart);
+    const updated = await c.env.merlin_db.prepare(`
+      UPDATE licenses SET status = 'active', source = 'stripe', plan_tier = ?, access_type = ?, expires_at = ?,
+        stripe_customer_id = ?, stripe_subscription_id = ?, stripe_checkout_session_id = ?,
+        billing_current_period_start = ?, billing_current_period_end = ?, billing_cancel_at_period_end = 0,
+        billing_status = 'active', updated_at = ?
+      WHERE id = ? AND status IN ('active', 'expired') AND source = 'mercadopago_pix'
+        AND stripe_subscription_id IS NULL AND plan_tier = ? AND expires_at = ?
+    `).bind(nextTier, nextAccessType, nextExpiresAt, stripeCustomerId, effectiveSubscriptionId, sessionId,
+      nextStart, nextExpiresAt, now, checkout.upgrade_license_id, evidence.currentTier, evidence.currentPeriodEnd).run();
+    if (!updated.meta.changes) {
+      // Webhook retries must finish after a successful license write even if a
+      // later checkout write failed. Never accept a different subscription.
+      const alreadyApplied = await c.env.merlin_db.prepare(`
+        SELECT id FROM licenses WHERE id = ? AND source = 'stripe'
+          AND stripe_subscription_id = ? AND stripe_checkout_session_id = ?
+          AND plan_tier = ? AND access_type = ? AND expires_at = ? LIMIT 1
+      `).bind(checkout.upgrade_license_id, effectiveSubscriptionId, sessionId, nextTier,
+        nextAccessType, nextExpiresAt).first<{ id: number }>();
+      if (!alreadyApplied) throw new Error(`Pix-to-card checkout ${checkout.id} no longer matches original license`);
+    }
+    await c.env.merlin_db.prepare(`
+      UPDATE checkout_sessions SET license_id = ?, provider_subscription_id = ?, upgrade_processed_at = ?,
+        renewal_applied_at = ?, payment_status = ?, updated_at = ?
+      WHERE id = ? AND upgrade_processed_at IS NULL
+    `).bind(checkout.upgrade_license_id, effectiveSubscriptionId, now, evidence.timing === "period_end" ? null : now,
+      paymentStatus, now, checkout.id).run();
+    await configureStripeSubscriptionForRenewals(c, effectiveSubscriptionId);
+    await saveSubscription(c, {
+      customerId: checkout.customer_id,
+      licenseId: checkout.upgrade_license_id,
+      subscriptionId: effectiveSubscriptionId,
+      status: paidPeriodStart ? "active" : "trialing",
+      currentPeriodEnd: nextRenewalAt,
+      cancelAtPeriodEnd: false,
+    });
+    if (evidence.amountCents > 0) {
+      await savePayment(c, {
+        customerId: checkout.customer_id,
+        licenseId: checkout.upgrade_license_id,
+        paymentId: getStripeId(session.invoice) || sessionId,
+        checkoutSessionId: sessionId,
+        subscriptionId: effectiveSubscriptionId,
+        amountCents: evidence.amountCents,
+        currency: "brl",
+        status: "paid",
+        paymentType: "subscription",
+      });
     }
     return;
   }
@@ -985,20 +1154,44 @@ function getInvoiceSubscriptionId(invoice: Record<string, unknown>) {
     || getString(getObject(invoice.subscription_details)?.subscription);
 }
 
-function getInvoicePeriodEnd(invoice: Record<string, unknown>) {
+function getInvoiceSubscriptionPeriod(invoice: Record<string, unknown>) {
   const lines = getObject(invoice.lines);
   const lineItems = Array.isArray(lines?.data) ? lines.data : [];
-  const firstLine = getObject(lineItems[0]);
-  const period = getObject(firstLine?.period);
-  return unixToIso(period?.end);
+  const subscriptionId = getInvoiceSubscriptionId(invoice);
+  for (const rawLine of lineItems) {
+    const line = getObject(rawLine);
+    const parent = getObject(line?.parent);
+    const details = getObject(parent?.subscription_item_details);
+    const isSubscriptionLine = parent?.type === "subscription_item_details"
+      || line?.type === "subscription";
+    if (!isSubscriptionLine || details?.proration === true || line?.proration === true) continue;
+    const lineSubscription = getStripeId(details?.subscription) || getStripeId(line?.subscription);
+    if (lineSubscription && subscriptionId && lineSubscription !== subscriptionId) continue;
+    const period = getObject(line?.period);
+    const start = unixToIso(period?.start);
+    const end = unixToIso(period?.end);
+    if (start && end && Date.parse(end) > Date.parse(start)) return { start, end };
+  }
+  // Older Stripe API versions and legacy fixtures can omit line classification.
+  // A single, unclassified line is unambiguous; multiple lines are not.
+  if (lineItems.length === 1) {
+    const only = getObject(lineItems[0]);
+    if (only && !only.type && !getObject(only.parent) && only.proration !== true) {
+      const period = getObject(only.period);
+      const start = unixToIso(period?.start);
+      const end = unixToIso(period?.end);
+      if (start && end && Date.parse(end) > Date.parse(start)) return { start, end };
+    }
+  }
+  return null;
+}
+
+function getInvoicePeriodEnd(invoice: Record<string, unknown>) {
+  return getInvoiceSubscriptionPeriod(invoice)?.end || null;
 }
 
 function getInvoicePeriodStart(invoice: Record<string, unknown>) {
-  const lines = getObject(invoice.lines);
-  const lineItems = Array.isArray(lines?.data) ? lines.data : [];
-  const firstLine = getObject(lineItems[0]);
-  const period = getObject(firstLine?.period);
-  return unixToIso(period?.start);
+  return getInvoiceSubscriptionPeriod(invoice)?.start || null;
 }
 
 async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>) {
@@ -1012,8 +1205,65 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     return;
   }
 
+  if (checkout.license_id) {
+    // An old subscription can still send a delayed/replayed invoice after its
+    // license has been reactivated with Pix (or moved to a new subscription).
+    // Only the subscription currently attached to the license may renew it.
+    const currentLicense = await c.env.merlin_db.prepare(`
+      SELECT source, stripe_subscription_id FROM licenses WHERE id = ? LIMIT 1
+    `).bind(checkout.license_id).first<{ source: string | null; stripe_subscription_id: string | null }>();
+    if (currentLicense && (currentLicense.source !== "stripe" || currentLicense.stripe_subscription_id !== subscriptionId)) {
+      return;
+    }
+  }
+
+  if (checkout.operation_type === PIX_PLAN_TRANSITION_OPERATION) {
+    // The initial invoice only contains the one-time adjustment (or is zero
+    // for payment-method-only migration). Entitlement changes in the Checkout
+    // completion handler, never from an out-of-order initial invoice.
+    // Updating a prepaid trial can emit a zero-value subscription_update invoice.
+    // It is not a renewal and must not advance the license or consume its credit.
+    if (getString(invoice.billing_reason) !== "subscription_cycle" || !checkout.upgrade_processed_at) return;
+    const evidence = parseCardPixTransitionEvidence(checkout.checkout_evidence_json);
+    const periodEnd = getInvoicePeriodEnd(invoice);
+    const periodStart = getInvoicePeriodStart(invoice);
+    if (!evidence || !checkout.license_id || !periodEnd || !periodStart) {
+      throw new Error(`Invalid Pix-to-card renewal invoice for checkout ${checkout.id}`);
+    }
+    if (Date.parse(periodEnd) <= Date.parse(evidence.nextRenewalAt)) return;
+    const now = new Date().toISOString();
+    const firstDeferredChange = evidence.timing === "period_end" && !checkout.renewal_applied_at;
+    await c.env.merlin_db.prepare(`
+      UPDATE licenses SET expires_at = ?, billing_status = 'active',
+        billing_current_period_start = ?, billing_current_period_end = ?,
+        plan_tier = CASE WHEN ? THEN ? ELSE plan_tier END,
+        access_type = CASE WHEN ? THEN ? ELSE access_type END,
+        updated_at = ?
+      WHERE id = ? AND stripe_subscription_id = ?
+    `).bind(periodEnd, periodStart, periodEnd, firstDeferredChange ? 1 : 0, evidence.targetTier,
+      firstDeferredChange ? 1 : 0,
+      evidence.targetPeriod === "annual" ? "annual_subscription"
+        : evidence.targetPeriod === "semiannual" ? "semiannual_subscription" : "monthly_subscription",
+      now, checkout.license_id, subscriptionId).run();
+    if (firstDeferredChange) {
+      await c.env.merlin_db.prepare(`UPDATE checkout_sessions SET renewal_applied_at = ?, updated_at = ? WHERE id = ? AND renewal_applied_at IS NULL`)
+        .bind(now, now, checkout.id).run();
+    }
+    await saveSubscription(c, { customerId: checkout.customer_id, licenseId: checkout.license_id,
+      subscriptionId, status: "active", currentPeriodEnd: periodEnd, cancelAtPeriodEnd: false });
+    await savePayment(c, { customerId: checkout.customer_id, licenseId: checkout.license_id,
+      paymentId: getString(invoice.id), checkoutSessionId: checkout.provider_session_id, subscriptionId,
+      amountCents: getNumber(invoice.amount_paid) ?? getNumber(invoice.total) ?? 0,
+      currency: getString(invoice.currency) || "brl", status: "paid", paymentType: "subscription" });
+    await syncInvoicePlanChangeFromStripe(c, invoice);
+    return;
+  }
+
   const periodEnd = getInvoicePeriodEnd(invoice);
   const periodStart = getInvoicePeriodStart(invoice);
+  if (!periodEnd || !periodStart) {
+    throw new Error(`Invoice ${getString(invoice.id) || "unknown"} has no unambiguous subscription period`);
+  }
   const expiresAt = dateOrLifetime(periodEnd);
   const stripeCustomerId = getStripeId(invoice.customer);
   const license = await activateLicenseFromCheckout(c, checkout, {
@@ -1052,7 +1302,7 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     paymentId: getString(invoice.id),
     checkoutSessionId: checkout.provider_session_id,
     subscriptionId,
-    amountCents: getNumber(invoice.amount_paid) || getNumber(invoice.total) || 0,
+    amountCents: getNumber(invoice.amount_paid) ?? getNumber(invoice.total) ?? 0,
     currency: getString(invoice.currency) || "brl",
     status: "paid",
     paymentType: "subscription",
@@ -1101,19 +1351,38 @@ async function updateSubscriptionStatus(c: AppContext, subscription: Record<stri
   await syncSubscriptionPlanFromStripe(c, subscription, { paymentConfirmed: false });
 }
 
+async function isUnpaidPlanChangeInvoice(c: AppContext, invoice: Record<string, unknown>, subscriptionId: string) {
+  if (getString(invoice.billing_reason) !== "subscription_update") return false;
+  const invoiceId = getString(invoice.id);
+  if (!invoiceId) return false;
+  const pending = await c.env.merlin_db.prepare(`
+    SELECT spc.id FROM subscription_plan_changes spc
+    JOIN licenses l ON l.id = spc.license_id
+    WHERE spc.stripe_subscription_id = ?
+      AND (spc.stripe_invoice_id = ? OR spc.stripe_invoice_id IS NULL)
+      AND spc.status IN ('pending_payment', 'payment_failed', 'payment_action_required')
+      AND l.stripe_subscription_id = ? AND l.expires_at > ?
+    LIMIT 1
+  `).bind(subscriptionId, invoiceId, subscriptionId, new Date().toISOString()).first<{ id: number }>();
+  return Boolean(pending);
+}
+
 async function handleInvoiceFailed(c: AppContext, invoice: Record<string, unknown>) {
   const subscriptionId = getInvoiceSubscriptionId(invoice);
   if (!subscriptionId) {
     return;
   }
-  await c.env.merlin_db
-    .prepare(`UPDATE licenses SET billing_status = 'past_due', updated_at = ? WHERE stripe_subscription_id = ?`)
-    .bind(new Date().toISOString(), subscriptionId)
-    .run();
-  await c.env.merlin_db
-    .prepare(`UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
-    .bind(new Date().toISOString(), PROVIDER_STRIPE, subscriptionId)
-    .run();
+  const isPlanChangeInvoice = await isUnpaidPlanChangeInvoice(c, invoice, subscriptionId);
+  if (!isPlanChangeInvoice) {
+    await c.env.merlin_db
+      .prepare(`UPDATE licenses SET billing_status = 'past_due', updated_at = ? WHERE stripe_subscription_id = ?`)
+      .bind(new Date().toISOString(), subscriptionId)
+      .run();
+    await c.env.merlin_db
+      .prepare(`UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
+      .bind(new Date().toISOString(), PROVIDER_STRIPE, subscriptionId)
+      .run();
+  }
   await markPlanChangePaymentProblem(c, invoice, "payment_failed");
 
   c.executionCtx.waitUntil(sendStripeInvoicePaymentFailedNotification(c, {
@@ -1131,14 +1400,17 @@ async function handleInvoicePaymentActionRequired(c: AppContext, invoice: Record
     return;
   }
   const now = new Date().toISOString();
-  await c.env.merlin_db
-    .prepare(`UPDATE licenses SET billing_status = 'action_required', updated_at = ? WHERE stripe_subscription_id = ?`)
-    .bind(now, subscriptionId)
-    .run();
-  await c.env.merlin_db
-    .prepare(`UPDATE subscriptions SET status = 'action_required', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
-    .bind(now, PROVIDER_STRIPE, subscriptionId)
-    .run();
+  const isPlanChangeInvoice = await isUnpaidPlanChangeInvoice(c, invoice, subscriptionId);
+  if (!isPlanChangeInvoice) {
+    await c.env.merlin_db
+      .prepare(`UPDATE licenses SET billing_status = 'action_required', updated_at = ? WHERE stripe_subscription_id = ?`)
+      .bind(now, subscriptionId)
+      .run();
+    await c.env.merlin_db
+      .prepare(`UPDATE subscriptions SET status = 'action_required', updated_at = ? WHERE provider = ? AND provider_subscription_id = ?`)
+      .bind(now, PROVIDER_STRIPE, subscriptionId)
+      .run();
+  }
   await markPlanChangePaymentProblem(c, invoice, "payment_action_required");
 
   c.executionCtx.waitUntil(sendStripeInvoicePaymentActionRequiredNotification(c, {
@@ -1213,6 +1485,7 @@ async function applyChargeBillingState(
                 AND provider_payment_id IN (${placeholders})
                 AND license_id IS NOT NULL
             )
+              AND source = 'stripe'
           `,
         )
         .bind(input.revokedReason || "Pagamento revertido pela Stripe.", input.revokedOrigin || "stripe_refund", input.revokedEventId || null, input.billingStatus, now, PROVIDER_STRIPE, ...paymentIds)
@@ -1235,6 +1508,7 @@ async function applyChargeBillingState(
                 AND provider_payment_id IN (${placeholders})
                 AND license_id IS NOT NULL
             )
+              AND source = 'stripe'
           `,
         )
         .bind(input.billingStatus, now, PROVIDER_STRIPE, ...paymentIds)
@@ -1253,6 +1527,7 @@ async function applyChargeBillingState(
                 AND provider_payment_id IN (${placeholders})
                 AND license_id IS NOT NULL
             )
+              AND source = 'stripe'
           `,
         )
         .bind(input.billingStatus, now, PROVIDER_STRIPE, ...paymentIds)
@@ -1542,6 +1817,15 @@ export async function processStripeWebhookEvent(c: AppContext, event: StripeEven
       await handleChargeRefunded(c, object);
     } else if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
       await updateSubscriptionStatus(c, object);
+    } else if (event.type === "customer.subscription.pending_update_expired") {
+      const subscriptionId = getString(object.id);
+      if (subscriptionId) {
+        await c.env.merlin_db.prepare(`
+          UPDATE subscription_plan_changes SET status = 'failed', failure_reason = 'pending_update_expired', updated_at = ?
+          WHERE stripe_subscription_id = ? AND change_type = 'prepaid_first_card_invoice'
+            AND status IN ('pending_payment', 'payment_action_required', 'payment_failed')
+        `).bind(new Date().toISOString(), subscriptionId).run();
+      }
     } else if (event.type === "subscription_schedule.released") {
       await markSubscriptionScheduleEvent(c, object, "released");
     } else if (event.type === "subscription_schedule.canceled") {

@@ -5,6 +5,7 @@ type ExpiredCardRenewalLicense = {
   stripe_customer_id?: string | null;
   stripe_subscription_id?: string | null;
   access_type?: string | null;
+  billing_cancel_at_period_end?: number | null;
 };
 
 function isRecurringPixAccess(accessType?: string | null) {
@@ -42,6 +43,23 @@ export function isEligibleForExpiredPixRenewal(
   const isRecurring = isRecurringPixAccess(license.access_type);
 
   return hasExpired && hasRenewableStatus && isPixAccess && isRecurring;
+}
+
+// UI availability is deliberately conservative. The order-creation route
+// also verifies the subscription and outstanding invoices with Stripe.
+export function isEligibleForExpiredCardToPix(
+  license: ExpiredCardRenewalLicense,
+  now = Date.now(),
+) {
+  const expiresAt = Date.parse(license.expires_at);
+  const hasExpired = Number.isFinite(expiresAt) && expiresAt < now;
+  const hasRenewableStatus = license.status === "active" || license.status === "expired";
+  const isCardAccess = Boolean(license.stripe_customer_id && license.stripe_subscription_id);
+  const isRecurring = ["monthly_subscription", "semiannual_subscription", "annual_subscription"]
+    .includes(license.access_type || "");
+
+  return hasExpired && hasRenewableStatus && isCardAccess && isRecurring
+    && (license.billing_status === "canceled" || license.billing_cancel_at_period_end === 1);
 }
 
 // Pix may be paid ahead of time during the final seven days of an access period.

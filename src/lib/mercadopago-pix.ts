@@ -8,9 +8,11 @@ import { addBillingPeriod } from "./billing-period";
 import { assertRecentPublicEmailVerification, consumePublicEmailVerification } from "./email-verification";
 import { generateLicenseKey } from "./licenses";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
+import { reconcilePriorPixPlanTransitions, PIX_PLAN_TRANSITION_OPERATION, type PixPlanTransition } from "./pix-plan-management";
 import { LIFETIME_EXPIRES_AT } from "./public-access-management";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 import { getBillingPlanPrice } from "./subscription-plan-change";
+import { assertExpiredCardToPixReady } from "./card-to-pix";
 
 const PROVIDER_MP = "mercadopago";
 const PIX_MODE = "pix";
@@ -56,6 +58,9 @@ type PixCheckoutRow = {
   payment_status: string | null;
   license_id: number | null;
   reactivation_license_id: number | null;
+  upgrade_license_id?: number | null;
+  operation_type?: string | null;
+  upgrade_processed_at?: string | null;
   scheduled_renewal_license_id: number | null;
   renewal_effective_at: string | null;
   renewal_applied_at: string | null;
@@ -64,6 +69,7 @@ type PixCheckoutRow = {
   pending_recovery_pin_hash: string | null;
   pending_recovery_notice_accepted_at: string | null;
   checkout_evidence_json: string | null;
+  completed_at: string | null;
   processed_at: string | null;
 };
 
@@ -418,9 +424,6 @@ function extractPixPayment(order: MercadoPagoOrder) {
 function mapProviderStatus(order: MercadoPagoOrder, checkout?: Pick<PixCheckoutRow, "provider_session_expires_at"> | null) {
   const status = getOrderStatus(order);
   const detail = getOrderStatusDetail(order);
-  const expiredLocally = checkout?.provider_session_expires_at
-    ? new Date(checkout.provider_session_expires_at).getTime() <= Date.now()
-    : false;
 
   if (status === "processed" && detail === "accredited") {
     return "paid" as const;
@@ -428,7 +431,8 @@ function mapProviderStatus(order: MercadoPagoOrder, checkout?: Pick<PixCheckoutR
   if (status === "processed") {
     return "paid" as const;
   }
-  if (status === "expired" || status === "cancelled" || status === "canceled" || expiredLocally) {
+  // An elapsed local QR timer is not proof that the provider rejected payment.
+  if (status === "expired" || status === "cancelled" || status === "canceled") {
     return "expired" as const;
   }
   if (status === "failed" || status === "rejected") {
@@ -659,24 +663,19 @@ async function getOrCreateInternalCustomer(c: AppContext, input: { email: string
 }
 
 async function findPendingPixCheckout(c: AppContext, customerId: number) {
-  const now = new Date().toISOString();
   return c.env.merlin_db
     .prepare(
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
           provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
-          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, completed_at, processed_at
         FROM checkout_sessions
         WHERE customer_id = ?
           AND provider = ?
           AND license_id IS NULL
           AND (
-            (
-              status = 'open'
-              AND provider_session_expires_at IS NOT NULL
-              AND provider_session_expires_at > ?
-            )
+            status = 'open'
             OR payment_status = 'paid'
             OR status IN ('completed', 'processing')
           )
@@ -684,29 +683,41 @@ async function findPendingPixCheckout(c: AppContext, customerId: number) {
         LIMIT 1
       `,
     )
-    .bind(customerId, PROVIDER_MP, now)
+    .bind(customerId, PROVIDER_MP)
     .first<PixCheckoutRow>();
 }
 
 async function expireStalePixCheckouts(c: AppContext, customerId: number) {
   const now = new Date().toISOString();
-  await c.env.merlin_db
-    .prepare(
-      `
-        UPDATE checkout_sessions
-        SET status = 'expired',
-            payment_status = COALESCE(payment_status, 'expired'),
-            updated_at = ?
-        WHERE customer_id = ?
-          AND provider = ?
-          AND license_id IS NULL
-          AND status = 'open'
-          AND provider_session_expires_at IS NOT NULL
-          AND provider_session_expires_at <= ?
-      `,
-    )
-    .bind(now, customerId, PROVIDER_MP, now)
-    .run();
+  const stale = await c.env.merlin_db.prepare(`
+    SELECT provider_external_reference, provider_session_id FROM checkout_sessions
+    WHERE customer_id = ? AND provider = ? AND license_id IS NULL
+      AND status = 'open' AND provider_session_expires_at <= ?
+  `).bind(customerId, PROVIDER_MP, now).all<{ provider_external_reference: string; provider_session_id: string }>();
+  for (const row of stale.results || []) {
+    if (!row.provider_session_id || row.provider_session_id === row.provider_external_reference) {
+      throw new HTTPException(409, { message: "Um Pix anterior ainda precisa ser conciliado antes de abrir outra cobranca." });
+    }
+    const checkout = await getPixCheckoutByReference(c, row.provider_external_reference);
+    if (checkout) {
+      const refreshed = await refreshPixCheckoutStatus(c, checkout);
+      if (refreshed?.payment_status === "paid") throw new HTTPException(409, {
+        message: "O Pix anterior foi pago. Atualize seu acesso antes de abrir outra cobranca.",
+      });
+    }
+  }
+}
+
+export async function reconcilePixCheckoutById(c: AppContext, checkoutId: number) {
+  const row = await c.env.merlin_db.prepare(`
+    SELECT provider_external_reference FROM checkout_sessions WHERE id = ? AND provider = ?
+  `).bind(checkoutId, PROVIDER_MP).first<{ provider_external_reference: string | null }>();
+  if (!row?.provider_external_reference) throw new Error(`Pix checkout ${checkoutId} cannot be reconciled`);
+  const checkout = await getPixCheckoutByReference(c, row.provider_external_reference);
+  if (!checkout || !checkout.provider_session_id || checkout.provider_session_id === row.provider_external_reference) {
+    throw new HTTPException(409, { message: "Um Pix anterior ainda precisa ser conciliado." });
+  }
+  return refreshPixCheckoutStatus(c, checkout);
 }
 
 async function getPixCheckoutByReference(c: AppContext, reference: string) {
@@ -715,8 +726,8 @@ async function getPixCheckoutByReference(c: AppContext, reference: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
-          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, operation_type, upgrade_license_id, upgrade_processed_at, pending_license_key,
+          pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, completed_at, processed_at
         FROM checkout_sessions
         WHERE provider = ?
           AND provider_external_reference = ?
@@ -733,7 +744,7 @@ async function getPixCheckoutBySessionId(c: AppContext, sessionId: string) {
       `
         SELECT id, customer_id, provider_session_id, provider_price_id, provider_payment_id, provider_external_reference,
           provider_qr_code, provider_qr_code_base64, provider_ticket_url, provider_raw_status, provider_status_detail,
-          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, pending_license_key,
+          provider_session_expires_at, provider_environment, plan_tier, plan_type, mode, status, payment_status, license_id, reactivation_license_id, scheduled_renewal_license_id, renewal_effective_at, renewal_applied_at, operation_type, upgrade_license_id, upgrade_processed_at, pending_license_key,
           pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, checkout_evidence_json, processed_at
         FROM checkout_sessions
         WHERE provider = ? AND provider_session_id = ?
@@ -771,6 +782,62 @@ async function getCustomer(c: AppContext, customerId: number) {
 }
 
 async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
+  if (checkout.operation_type === PIX_PLAN_TRANSITION_OPERATION) {
+    if (!checkout.upgrade_license_id) throw new Error(`Pix transition ${checkout.id} has no license`);
+    const evidence = JSON.parse(checkout.checkout_evidence_json || "null") as {
+      currentTier?: string; currentPeriodEnd?: string; currentPeriodStart?: string;
+      targetFullPriceCents?: number; timing?: string;
+    } | null;
+    if (!evidence || evidence.timing !== "immediate" || !evidence.currentPeriodEnd
+      || !evidence.currentPeriodStart || !evidence.currentTier || !evidence.targetFullPriceCents) {
+      throw new Error(`Pix transition ${checkout.id} has invalid evidence`);
+    }
+    if (checkout.upgrade_processed_at && checkout.license_id) {
+      const applied = await getLicenseById(c, checkout.license_id);
+      if (applied) return applied;
+    }
+    const now = checkout.completed_at || new Date().toISOString();
+    const currentPeriod = evidence.currentPeriodEnd === evidence.currentPeriodStart
+      ? null : evidence.currentPeriodEnd;
+    if (!currentPeriod) throw new Error(`Pix transition ${checkout.id} has invalid original period`);
+    const periodChanged = checkout.plan_type !== (evidence as { currentPeriod?: string }).currentPeriod;
+    const nextEnd = periodChanged ? addBillingPeriod(now, checkout.plan_type) : evidence.currentPeriodEnd;
+    const nextStart = periodChanged ? now : evidence.currentPeriodStart;
+    const accessType = checkout.plan_type === "annual" ? "annual_manual"
+      : checkout.plan_type === "semiannual" ? "semiannual_manual" : "monthly_subscription";
+    const updated = await c.env.merlin_db.prepare(`
+      UPDATE licenses SET plan_tier = ?, access_type = ?, expires_at = ?,
+        billing_current_period_start = ?, billing_current_period_end = ?, billing_cancel_at_period_end = 1,
+        billing_status = 'active', updated_at = ?
+      WHERE id = ? AND status = 'active' AND source = 'mercadopago_pix'
+        AND stripe_subscription_id IS NULL AND stripe_customer_id IS NULL
+        AND plan_tier = ? AND expires_at = ?
+    `).bind(
+      normalizeStoredPlanTier(checkout.plan_tier, "ouro"), accessType, nextEnd,
+      nextStart, nextEnd, now, checkout.upgrade_license_id, evidence.currentTier, evidence.currentPeriodEnd,
+    ).run();
+    if (!updated.meta.changes) {
+      // A retry can arrive after the license write but before the checkout was
+      // marked processed. Only resume when the resulting license is exactly the
+      // one this paid order intended to produce.
+      const alreadyApplied = await c.env.merlin_db.prepare(`
+        SELECT id FROM licenses WHERE id = ? AND source = 'mercadopago_pix'
+          AND plan_tier = ? AND access_type = ? AND expires_at = ?
+          AND billing_current_period_start = ? AND stripe_subscription_id IS NULL
+        LIMIT 1
+      `).bind(checkout.upgrade_license_id, normalizeStoredPlanTier(checkout.plan_tier, "ouro"),
+        accessType, nextEnd, nextStart).first<{ id: number }>();
+      if (!alreadyApplied) throw new Error(`Pix transition ${checkout.id} no longer matches its original license`);
+    }
+    await c.env.merlin_db.prepare(`
+      UPDATE checkout_sessions SET license_id = ?, status = 'completed', payment_status = 'paid',
+        completed_at = COALESCE(completed_at, ?), processed_at = ?, upgrade_processed_at = ?, updated_at = ?
+      WHERE id = ? AND upgrade_processed_at IS NULL
+    `).bind(checkout.upgrade_license_id, now, now, now, now, checkout.id).run();
+    const applied = await getLicenseById(c, checkout.upgrade_license_id);
+    if (!applied) throw new Error(`Pix transition license ${checkout.upgrade_license_id} not found`);
+    return applied;
+  }
   if (checkout.scheduled_renewal_license_id) {
     const existing = await getLicenseById(c, checkout.scheduled_renewal_license_id);
     if (!existing) {
@@ -833,6 +900,18 @@ async function activatePixLicense(c: AppContext, checkout: PixCheckoutRow) {
     const existing = await getLicenseById(c, checkout.reactivation_license_id);
     if (!existing) {
       throw new Error(`Pix reactivation license ${checkout.reactivation_license_id} not found`);
+    }
+    const checkoutEvidence = JSON.parse(checkout.checkout_evidence_json || "null") as { cardToPixVerified?: boolean } | null;
+    if (checkoutEvidence?.cardToPixVerified) {
+      const cardLicense = await c.env.merlin_db.prepare(`
+        SELECT id, status, expires_at, billing_status, stripe_customer_id,
+          stripe_subscription_id, access_type, billing_cancel_at_period_end
+        FROM licenses WHERE id = ? LIMIT 1
+      `).bind(existing.id).first<Parameters<typeof assertExpiredCardToPixReady>[1]>();
+      if (!cardLicense) throw new Error(`Card-to-Pix license ${existing.id} not found`);
+      // QR creation is not enough: the old card subscription must still be
+      // finished when Mercado Pago reports that this Pix was actually paid.
+      await assertExpiredCardToPixReady(c, cardLicense);
     }
 
     await c.env.merlin_db
@@ -1036,7 +1115,7 @@ async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow,
   const expiresAt = addRenewalPeriod(effectiveAt, checkout.plan_type);
   const planTier = normalizeStoredPlanTier(checkout.plan_tier, "ouro");
   const appliedAt = now.toISOString();
-  await c.env.merlin_db
+  const renewal = await c.env.merlin_db
     .prepare(
       `
         UPDATE licenses
@@ -1051,11 +1130,12 @@ async function applyPixScheduledRenewal(c: AppContext, checkout: PixCheckoutRow,
               ELSE billing_current_period_end END,
             billing_cancel_at_period_end = 1,
             updated_at = ?
-        WHERE id = ?
+        WHERE id = ? AND source = 'mercadopago_pix' AND stripe_subscription_id IS NULL
       `,
     )
     .bind(planTier, accessType, expiresAt, expiresAt, effectiveAt, expiresAt, expiresAt, appliedAt, checkout.scheduled_renewal_license_id)
     .run();
+  if (!renewal.meta.changes) throw new Error(`Paid Pix renewal ${checkout.id} conflicts with current license billing`);
   await c.env.merlin_db
     .prepare(
       `
@@ -1076,15 +1156,16 @@ export async function extendPaidPixRenewal(c: AppContext, checkout: PixCheckoutR
     || checkout.payment_status !== "paid" || checkout.renewal_applied_at) return false;
   const expiresAt = addRenewalPeriod(checkout.renewal_effective_at, checkout.plan_type);
   const updatedAt = now.toISOString();
-  await c.env.merlin_db.prepare(`
+  const extended = await c.env.merlin_db.prepare(`
     UPDATE licenses
     SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END,
         billing_current_period_end = CASE
           WHEN billing_current_period_end IS NULL OR billing_current_period_end < ? THEN ?
           ELSE billing_current_period_end END,
         updated_at = ?
-    WHERE id = ?
+    WHERE id = ? AND source = 'mercadopago_pix' AND stripe_subscription_id IS NULL
   `).bind(expiresAt, expiresAt, expiresAt, expiresAt, updatedAt, checkout.scheduled_renewal_license_id).run();
+  if (!extended.meta.changes) throw new Error(`Paid Pix renewal ${checkout.id} conflicts with current license billing`);
   return true;
 }
 
@@ -1296,6 +1377,8 @@ export async function reconcileMercadoPagoCheckout(c: AppContext, sessionId: str
 type TrustedRenewalOptions = {
   reactivationLicenseId?: number;
   scheduledRenewalLicenseId?: number;
+  immediateTransition?: PixPlanTransition;
+  cardToPixVerified?: boolean;
 };
 
 export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderInput, trustedRenewal?: TrustedRenewalOptions) {
@@ -1331,9 +1414,15 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const email = normalizeEmail(input.contact);
   const existingLicense = await findLicenseByEmailContact(c, email);
+  // An expired Stripe license must pass the authenticated renewal route,
+  // which verifies the ended subscription and unpaid invoices with Stripe.
+  if (existingLicense?.stripe_subscription_id && !trustedRenewal?.cardToPixVerified) {
+    throw new HTTPException(409, { message: "Para pagar por Pix, aguarde o fim da assinatura do cartao e use Meu acesso." });
+  }
   const reactivationLicenseId = trustedRenewal?.reactivationLicenseId || null;
   const scheduledRenewalLicenseId = trustedRenewal?.scheduledRenewalLicenseId || null;
-  if (trustedRenewal && existingLicense?.id !== (reactivationLicenseId || scheduledRenewalLicenseId)) {
+  const transition = trustedRenewal?.immediateTransition;
+  if (trustedRenewal && existingLicense?.id !== (reactivationLicenseId || scheduledRenewalLicenseId || transition?.license.id)) {
     throw new HTTPException(403, { message: "Acesso de renovacao invalido." });
   }
   const canReactivate = Boolean(reactivationLicenseId && existingLicense && canPayAgain(existingLicense));
@@ -1342,6 +1431,20 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   }
   if (scheduledRenewalLicenseId && (!existingLicense || existingLicense.status !== "active")) {
     throw new HTTPException(409, { message: "Esta licenca nao esta elegivel para renovacao Pix antecipada." });
+  }
+  if (transition && (transition.paymentMethod !== "pix" || transition.timing !== "immediate")) {
+    throw new HTTPException(409, { message: "Troca Pix invalida." });
+  }
+  if (existingLicense && String(existingLicense.source || "").includes("mercadopago")) {
+    await reconcilePriorPixPlanTransitions(c, existingLicense.id);
+    const cardCheckout = await c.env.merlin_db.prepare(`
+      SELECT id FROM checkout_sessions WHERE operation_type = ? AND upgrade_license_id = ?
+        AND provider = 'stripe' AND upgrade_processed_at IS NULL
+        AND status NOT IN ('expired', 'failed', 'canceled') LIMIT 1
+    `).bind(PIX_PLAN_TRANSITION_OPERATION, existingLicense.id).first<{ id: number }>();
+    if (cardCheckout) throw new HTTPException(409, {
+      message: "Existe uma troca para cartao em andamento. Conclua ou aguarde o encerramento antes de gerar Pix.",
+    });
   }
   if (scheduledRenewalLicenseId) {
     const scheduled = await c.env.merlin_db
@@ -1359,7 +1462,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       throw new HTTPException(409, { message: "Ja existe uma renovacao Pix confirmada para esta licenca." });
     }
   }
-  if (existingLicense && !canReactivate && !scheduledRenewalLicenseId) {
+  if (existingLicense && !canReactivate && !scheduledRenewalLicenseId && !transition) {
     if (existingLicense.status === "revoked") {
       throw new HTTPException(409, { message: "Esta licenca nao pode ser reativada automaticamente. Fale com o suporte." });
     }
@@ -1394,7 +1497,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   const tierPrice = billing.plansEnabled && selectedTier && input.planType !== "lifetime"
     ? await getBillingPlanPrice(c, "pix", selectedTier, input.planType)
     : null;
-  const priceId = tierPrice
+  const priceId = transition ? `pix:change:${selectedTier}:${input.planType}` : tierPrice
     ? (tierPrice.provider_price_id || syntheticPixPriceId(selectedTier as PlanTier, input.planType))
     : input.planType === "monthly"
     ? billing.monthlyPriceId
@@ -1409,7 +1512,9 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   }
 
   const verificationId = trustedRenewal ? null : await assertRecentPublicEmailVerification(c, email);
-  const price: { amountCents: number; currency: string } | null = tierPrice
+  const price: { amountCents: number; currency: string } | null = transition
+    ? { amountCents: transition.amountDueNowCents, currency: transition.currency }
+    : tierPrice
     ? {
       amountCents: tierPrice.amount_cents ?? 0,
       currency: tierPrice.currency || "brl",
@@ -1436,6 +1541,11 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
   await expireStalePixCheckouts(c, customer.id);
   const pendingCheckout = await findPendingPixCheckout(c, customer.id);
   if (pendingCheckout) {
+    if (transition) throw new HTTPException(409, { message: "Ja existe um Pix em processamento para esta licenca." });
+    if (pendingCheckout.status === "open" && pendingCheckout.provider_session_expires_at
+      && Date.parse(pendingCheckout.provider_session_expires_at) <= Date.now()) {
+      throw new HTTPException(409, { message: "O Pix anterior ainda precisa ser encerrado pelo provedor." });
+    }
     if (
       pendingCheckout.status === "open"
       && pendingCheckout.provider_qr_code
@@ -1458,12 +1568,12 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
 
   const externalReference = `mpix_${crypto.randomUUID()}`;
   const idempotencyKey = `merlin_pix:${externalReference}`;
-  const licenseKey = (canReactivate || scheduledRenewalLicenseId) ? existingLicense?.license_key || "" : generateLicenseKey();
+  const licenseKey = (canReactivate || scheduledRenewalLicenseId || transition) ? existingLicense?.license_key || "" : generateLicenseKey();
   const recoveryPinHash = trustedRenewal
     ? existingLicense?.recovery_pin_hash || null
     : await hashRecoveryPin(c, { licenseKey, recoveryPin: recoveryPin || "" });
   if (!recoveryPinHash) throw new HTTPException(409, { message: "Esta licenca nao possui um PIN de recuperacao." });
-  const checkoutEvidence = buildCheckoutEvidence({
+  const checkoutEvidenceBase = buildCheckoutEvidence({
     emailVerifiedAt,
     planType: input.planType,
     planTier: selectedTierForCheckout,
@@ -1473,17 +1583,31 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     acceptedRecoveryNoticeAt: now,
     environment: runtimeEnvironment,
   });
+  const checkoutEvidence = transition || trustedRenewal?.cardToPixVerified ? JSON.stringify({
+    ...JSON.parse(checkoutEvidenceBase) as Record<string, unknown>,
+    ...(transition ? {
+      currentTier: transition.currentTier,
+      currentPeriod: transition.currentPeriod,
+      currentPeriodStart: transition.license.billing_current_period_start,
+      currentPeriodEnd: transition.license.expires_at,
+      targetFullPriceCents: transition.targetPriceCents,
+      timing: transition.timing,
+      unusedPixCreditCents: transition.unusedPixCreditCents,
+    } : {}),
+    ...(trustedRenewal?.cardToPixVerified ? { cardToPixVerified: true } : {}),
+  }) : checkoutEvidenceBase;
 
-  await c.env.merlin_db
+  try {
+    await c.env.merlin_db
     .prepare(
       `
         INSERT INTO checkout_sessions (
           customer_id, provider, provider_session_id, provider_price_id, plan_tier, plan_type, mode, status,
-          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, reactivation_license_id, scheduled_renewal_license_id,
+          pending_license_key, pending_name, pending_recovery_pin_hash, pending_recovery_notice_accepted_at, reactivation_license_id, scheduled_renewal_license_id, operation_type, upgrade_license_id,
           provider_session_expires_at, payment_status, checkout_ip, checkout_user_agent, checkout_country,
           checkout_evidence_json, idempotency_key, provider_external_reference, provider_environment, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
     .bind(
@@ -1494,12 +1618,14 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       selectedTierForCheckout,
       input.planType,
       checkoutMode(input.planType),
-      canReactivate || scheduledRenewalLicenseId ? null : licenseKey,
+      canReactivate || scheduledRenewalLicenseId || transition ? null : licenseKey,
       name,
       recoveryPinHash,
       now,
       canReactivate ? reactivationLicenseId : null,
       scheduledRenewalLicenseId,
+      transition ? PIX_PLAN_TRANSITION_OPERATION : null,
+      transition?.license.id || null,
       expiresAt,
       getClientIp(c),
       getCheckoutUserAgent(c),
@@ -1512,6 +1638,12 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       now,
     )
     .run();
+  } catch (error) {
+    if (String(error).includes("UNIQUE constraint failed")) {
+      throw new HTTPException(409, { message: "Ja existe uma cobranca em andamento para esta licenca." });
+    }
+    throw error;
+  }
 
   let checkout = await getPixCheckoutByReference(c, externalReference);
   if (!checkout) {
@@ -1559,7 +1691,14 @@ export async function getPublicPixOrderStatus(c: AppContext, paymentIntentId: st
     throw new HTTPException(404, { message: "Pix nao encontrado." });
   }
 
-  const refreshed = await refreshPixCheckoutStatus(c, checkout).catch(() => checkout) || checkout;
+  const refreshed = await refreshPixCheckoutStatus(c, checkout).catch((error) => {
+    console.error("[mercadopago-pix] checkout reconciliation failed", {
+      checkoutId: checkout.id,
+      providerSessionId: checkout.provider_session_id,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return checkout;
+  }) || checkout;
   if (refreshed.license_id) {
     const license = await getLicenseById(c, refreshed.license_id);
     if (license) {

@@ -70,6 +70,18 @@ type StripeSubscriptionLike = {
   } | null;
 };
 
+type StripeScheduleLike = {
+  id: string;
+  status?: string;
+  subscription?: string | Record<string, unknown> | null;
+  current_phase?: { start_date?: number | null; end_date?: number | null } | null;
+  phases?: Array<{
+    start_date?: number | null;
+    end_date?: number | null;
+    items?: Array<{ price?: string | StripePriceLike | null }>;
+  }>;
+};
+
 type StripeInvoiceLike = {
   id?: string;
   subscription?: string | Record<string, unknown> | null;
@@ -211,6 +223,47 @@ async function getLicenseForPlanChange(c: AppContext, licenseId: number) {
     throw new HTTPException(409, { message: "Remova o cancelamento agendado antes de trocar de plano." });
   }
   return license;
+}
+
+async function ensureFirstCardCycleSettled(c: AppContext, license: LicensePlanChangeRow) {
+  const pixMigration = await c.env.merlin_db.prepare(`
+    SELECT checkout_evidence_json FROM checkout_sessions
+    WHERE license_id = ? AND operation_type = 'pix_plan_transition'
+      AND provider_subscription_id = ? AND upgrade_processed_at IS NOT NULL
+    ORDER BY id DESC LIMIT 1
+  `).bind(license.id, license.stripe_subscription_id).first<{ checkout_evidence_json: string | null }>();
+  if (pixMigration) {
+    const paidFirstCardCycle = await c.env.merlin_db.prepare(`
+      SELECT id FROM subscription_plan_changes WHERE license_id = ? AND stripe_subscription_id = ?
+        AND change_type = 'prepaid_first_card_invoice' AND status = 'applied' LIMIT 1
+    `).bind(license.id, license.stripe_subscription_id).first<{ id: number }>();
+    let firstCardRenewalAt = Number.NaN;
+    try {
+      const evidence = JSON.parse(pixMigration.checkout_evidence_json || "null") as { nextRenewalAt?: string; timing?: string; firstInvoiceSubscription?: boolean } | null;
+      firstCardRenewalAt = evidence?.timing === "reactivation" || evidence?.firstInvoiceSubscription || paidFirstCardCycle
+        ? Number.NEGATIVE_INFINITY
+        : Date.parse(evidence?.nextRenewalAt || "");
+    } catch { /* Invalid migration evidence must fail closed. */ }
+    if (firstCardRenewalAt !== Number.NEGATIVE_INFINITY) {
+      const latestPrepaidChange = await c.env.merlin_db.prepare(`
+        SELECT checkout_evidence_json FROM checkout_sessions
+        WHERE license_id = ? AND operation_type = 'prepaid_card_plan_change'
+          AND provider_subscription_id = ? AND upgrade_processed_at IS NOT NULL
+        ORDER BY id DESC LIMIT 1
+      `).bind(license.id, license.stripe_subscription_id)
+        .first<{ checkout_evidence_json: string | null }>();
+      if (latestPrepaidChange) {
+        try {
+          const evidence = JSON.parse(latestPrepaidChange.checkout_evidence_json || "null") as { nextRenewalAt?: string } | null;
+          firstCardRenewalAt = Date.parse(evidence?.nextRenewalAt || "");
+        } catch { firstCardRenewalAt = Number.NaN; }
+      }
+    }
+    const periodStart = Date.parse(license.billing_current_period_start || "");
+    if (Number.isNaN(firstCardRenewalAt) || !Number.isFinite(periodStart) || periodStart < firstCardRenewalAt) {
+      throw new HTTPException(409, { message: "O periodo pre-pago no cartao ainda esta em andamento. Atualize seu acesso antes de tentar novamente." });
+    }
+  }
 }
 
 export async function getCardPlanPrice(c: AppContext, targetTier: PlanTier, targetPeriod: BillingPeriod) {
@@ -463,7 +516,7 @@ function planTiersFromPrices(prices: Awaited<ReturnType<typeof listBillingPlanPr
   return [...new Set(prices.map((price) => price.planTier))] as PlanTier[];
 }
 
-function classifyPlanChange(currentTier: PlanTier, currentPeriod: BillingPeriod, targetTier: PlanTier, targetPeriod: BillingPeriod): {
+export function classifyPlanChange(currentTier: PlanTier, currentPeriod: BillingPeriod, targetTier: PlanTier, targetPeriod: BillingPeriod): {
   changeType: ChangeType;
   timing: ChangeTiming;
 } {
@@ -532,7 +585,7 @@ export async function previewSubscriptionPlanChange(c: AppContext, input: { lice
     throw new HTTPException(409, { message: "A licenca ja esta neste plano." });
   }
   const targetPrice = await getCardPlanPrice(c, input.targetTier, input.targetPeriod);
-  return buildPlanChangePreview({
+  const preview = buildPlanChangePreview({
     currentTier,
     currentPeriod,
     targetTier: input.targetTier,
@@ -541,6 +594,8 @@ export async function previewSubscriptionPlanChange(c: AppContext, input: { lice
     targetAmountCents: targetPrice.amount_cents,
     targetCurrency: targetPrice.currency,
   });
+  if (preview.timing === "immediate") await ensureFirstCardCycleSettled(c, license);
+  return preview;
 }
 
 export async function previewImmediatePlanChangeCharge(c: AppContext, input: {
@@ -549,6 +604,7 @@ export async function previewImmediatePlanChangeCharge(c: AppContext, input: {
   targetAmountCents: number | null;
 }) {
   const license = await getLicenseForPlanChange(c, input.licenseId);
+  await ensureFirstCardCycleSettled(c, license);
   const subscriptionId = license.stripe_subscription_id;
   if (!subscriptionId) {
     throw new HTTPException(409, { message: "Esta licenca nao possui assinatura Stripe para troca de plano." });
@@ -690,12 +746,15 @@ async function createPeriodEndSchedule(c: AppContext, input: {
   if (!periodStart || !periodEnd) {
     throw new HTTPException(409, { message: "Assinatura Stripe nao possui periodo atual valido." });
   }
+  if (input.subscription.status === "trialing" && input.subscription.trial_end !== periodEnd) {
+    throw new HTTPException(409, { message: "O periodo ja pago nao corresponde ao fim do trial na Stripe." });
+  }
 
   const createParams = new URLSearchParams();
   createParams.set("from_subscription", input.subscription.id);
-  let schedule: { id: string };
+  let schedule: StripeScheduleLike;
   try {
-    schedule = await stripePost<{ id: string }>(
+    schedule = await stripePost<StripeScheduleLike>(
       c,
       "/subscription_schedules",
       createParams,
@@ -711,12 +770,66 @@ async function createPeriodEndSchedule(c: AppContext, input: {
     throw error;
   }
 
+  const now = Math.floor(Date.now() / 1000);
+  const currentPhaseIndex = schedule.phases?.findIndex((phase) => {
+    if (typeof schedule.current_phase?.start_date === "number") {
+      return phase.start_date === schedule.current_phase.start_date;
+    }
+    return typeof phase.start_date === "number" && phase.start_date <= now
+      && (typeof phase.end_date !== "number" || now < phase.end_date);
+  }) ?? -1;
+  const currentPhase = currentPhaseIndex >= 0 ? schedule.phases?.[currentPhaseIndex] : null;
+  const phaseStart = schedule.current_phase?.start_date ?? currentPhase?.start_date;
+  const phaseEnd = schedule.current_phase?.end_date ?? currentPhase?.end_date;
+  const mismatch = [
+    schedule.status && schedule.status !== "active" ? "status" : null,
+    schedule.subscription && getStripeId(schedule.subscription) !== input.subscription.id ? "subscription" : null,
+    !schedule.phases?.length ? "phases_missing" : null,
+    currentPhaseIndex < 0 ? "current_phase_missing" : null,
+    !Number.isSafeInteger(phaseStart) || !phaseStart ? "phase_start_missing" : null,
+    typeof phaseStart === "number" && phaseStart >= periodEnd ? "phase_start_after_end" : null,
+    typeof phaseEnd === "number" && phaseEnd !== periodEnd ? "phase_end_mismatch" : null,
+    getStripeId(currentPhase?.items?.[0]?.price) !== item.price.id ? "price" : null,
+  ].filter(Boolean);
+  if (mismatch.length) {
+    console.warn("[subscription-plan-change] Stripe schedule does not match subscription", {
+      mismatch,
+      scheduleStatus: schedule.status || null,
+      phaseCount: schedule.phases?.length ?? null,
+      currentPhaseIndex,
+      currentPhaseEnd: phaseEnd ?? null,
+      phaseStart: phaseStart ?? null,
+      periodStart,
+      periodEnd,
+      trialEnd: input.subscription.trial_end ?? null,
+    });
+    try {
+      await stripePost(
+        c,
+        `/subscription_schedules/${encodeURIComponent(schedule.id)}/release`,
+        new URLSearchParams(),
+        `merlin_schedule_release_after_validation:${schedule.id}`,
+      );
+    } catch (releaseError) {
+      console.error("[subscription-plan-change] Could not release mismatched new schedule", {
+        scheduleId: schedule.id,
+        error: releaseError instanceof Error ? releaseError.message : "unknown",
+      });
+    }
+    throw new HTTPException(409, {
+      message: `Nao foi possivel conferir o agendamento da Stripe (${mismatch.join(", ")}). Nenhuma troca de plano foi aplicada.`,
+    });
+  }
+
   const updateParams = new URLSearchParams();
   updateParams.set("end_behavior", "release");
-  updateParams.set("phases[0][start_date]", String(periodStart));
+  updateParams.set("phases[0][start_date]", String(phaseStart));
   updateParams.set("phases[0][end_date]", String(periodEnd));
   updateParams.set("phases[0][items][0][price]", item.price.id);
   updateParams.set("phases[0][items][0][quantity]", String(item.quantity || 1));
+  if (input.subscription.status === "trialing") {
+    updateParams.set("phases[0][trial_end]", String(periodEnd));
+  }
   updateParams.set("phases[1][start_date]", String(periodEnd));
   updateParams.set("phases[1][items][0][price]", input.targetPriceId);
   updateParams.set("phases[1][items][0][quantity]", String(item.quantity || 1));
@@ -727,7 +840,7 @@ async function createPeriodEndSchedule(c: AppContext, input: {
     c,
     `/subscription_schedules/${encodeURIComponent(schedule.id)}`,
     updateParams,
-    `merlin_schedule_update:${schedule.id}:${input.targetPriceId}`,
+    `merlin_schedule_update:v2:${schedule.id}:${input.targetPriceId}:${phaseStart}`,
   );
 }
 
@@ -761,6 +874,7 @@ export async function createSubscriptionPlanChange(c: AppContext, input: { licen
     targetAmountCents: targetPrice.amount_cents,
     targetCurrency: targetPrice.currency,
   });
+  if (preview.timing === "immediate") await ensureFirstCardCycleSettled(c, license);
 
   const subscription = await stripeGet<StripeSubscriptionLike>(
     c,
@@ -907,7 +1021,7 @@ async function applyPlanChange(c: AppContext, input: {
           updated_at = ?
       WHERE stripe_subscription_id = ?
         AND target_price_id = ?
-        AND status IN ('pending_payment', 'payment_action_required', 'scheduled')
+        AND status IN ('pending_payment', 'payment_action_required', 'payment_failed', 'scheduled')
     `)
     .bind(now, now, input.subscriptionId, input.targetPriceId)
     .run();
@@ -962,13 +1076,14 @@ export async function syncSubscriptionPlanFromStripe(c: AppContext, subscription
     return;
   }
 
+  const period = subscriptionPeriodBounds(typed);
   await applyPlanChange(c, {
     subscriptionId,
     targetPriceId: priceId,
     targetTier,
     targetPeriod,
-    periodStart: unixToIso(typed.current_period_start),
-    periodEnd: unixToIso(typed.current_period_end || typed.cancel_at),
+    periodStart: unixToIso(period.start),
+    periodEnd: unixToIso(period.end),
   });
 }
 

@@ -11,6 +11,7 @@ This project is open source: never add real secrets, personal paths, Cloudflare 
 - Cloudflare account authenticated with Wrangler
 - D1 database configured in `wrangler.jsonc`
 - R2 buckets configured in `wrangler.jsonc`
+- `PUBLIC_APP_ORIGIN` configured separately for production and staging to the public HTTPS origin that serves `/meu-acesso` (not the Worker request URL)
 - `Merlin-admin` next to this repo to build the panel assets
 
 ## Run locally

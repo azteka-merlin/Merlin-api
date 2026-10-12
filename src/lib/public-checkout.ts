@@ -9,6 +9,7 @@ import { getCardPlanPrice } from "./subscription-plan-change";
 import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { getPublicAppOrigin } from "./public-origin";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
+import { assertNoPendingPixReactivation } from "./card-to-pix";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
@@ -50,6 +51,8 @@ type OpenCheckoutRow = {
 type CheckoutSessionByIdempotencyRow = {
   provider_session_id: string;
   provider_session_url: string | null;
+  provider_session_expires_at: string | null;
+  status: string;
 };
 
 export type PublicCheckoutInput = {
@@ -100,6 +103,17 @@ async function stripePost<T>(c: AppContext, path: string, params: URLSearchParam
   if (!response.ok || !payload) {
     throw new HTTPException(502, { message: stripeApiError(payload, "Nao foi possivel criar a sessao na Stripe.") });
   }
+  return payload;
+}
+
+async function stripeGet<T>(c: AppContext, path: string): Promise<T> {
+  const response = await fetch(`${STRIPE_API_BASE_URL}${path}`, {
+    headers: { Authorization: encodeBasicAuth(stripeSecretKey(c)) },
+  });
+  const payload = await response.json().catch(() => null) as T | null;
+  if (!response.ok || !payload) throw new HTTPException(502, {
+    message: "Nao foi possivel conferir o checkout anterior na Stripe.",
+  });
   return payload;
 }
 
@@ -253,7 +267,6 @@ async function getOrCreateStripeCustomer(c: AppContext, customer: CustomerRow, i
 }
 
 async function findPendingCheckout(c: AppContext, customerId: number) {
-  const now = new Date().toISOString();
   return c.env.merlin_db
     .prepare(
       `
@@ -263,12 +276,7 @@ async function findPendingCheckout(c: AppContext, customerId: number) {
           AND provider = ?
           AND license_id IS NULL
           AND (
-            (
-              status = 'open'
-              AND provider_session_url IS NOT NULL
-              AND provider_session_expires_at IS NOT NULL
-              AND provider_session_expires_at > ?
-            )
+            status = 'open'
             OR payment_status = 'paid'
             OR status IN ('complete', 'completed', 'processing')
           )
@@ -276,36 +284,53 @@ async function findPendingCheckout(c: AppContext, customerId: number) {
         LIMIT 1
       `,
     )
-    .bind(customerId, PROVIDER_STRIPE, now)
+    .bind(customerId, PROVIDER_STRIPE)
     .first<OpenCheckoutRow>();
 }
 
 async function expireStaleOpenCheckouts(c: AppContext, customerId: number) {
   const now = new Date().toISOString();
-  await c.env.merlin_db
-    .prepare(
-      `
-        UPDATE checkout_sessions
-        SET status = 'expired',
-            payment_status = COALESCE(payment_status, 'expired'),
-            updated_at = ?
-        WHERE customer_id = ?
-          AND provider = ?
-          AND license_id IS NULL
-          AND status = 'open'
-          AND provider_session_expires_at IS NOT NULL
-          AND provider_session_expires_at <= ?
-      `,
-    )
-    .bind(now, customerId, PROVIDER_STRIPE, now)
-    .run();
+  const stale = await c.env.merlin_db.prepare(`
+    SELECT id, provider_session_id FROM checkout_sessions
+    WHERE customer_id = ? AND provider = ? AND license_id IS NULL
+      AND status = 'open' AND provider_session_expires_at <= ?
+  `).bind(customerId, PROVIDER_STRIPE, now)
+    .all<{ id: number; provider_session_id: string }>();
+  for (const row of stale.results || []) {
+    if (!row.provider_session_id.startsWith("cs_")) throw new HTTPException(409, {
+      message: "Um checkout anterior ainda precisa ser conciliado antes de abrir outro.",
+    });
+    const session = await stripeGet<{ status?: string }>(c,
+      `/checkout/sessions/${encodeURIComponent(row.provider_session_id)}`);
+    if (session.status === "complete") {
+      const { reconcileStripeCheckoutSession } = await import("./stripe-webhook");
+      await reconcileStripeCheckoutSession(c, row.provider_session_id);
+      throw new HTTPException(409, {
+        message: "O checkout anterior foi concluido. Atualize seu acesso antes de abrir outro pagamento.",
+      });
+    }
+    if (session.status === "open") {
+      const expired = await stripePost<{ status?: string }>(c,
+        `/checkout/sessions/${encodeURIComponent(row.provider_session_id)}/expire`, new URLSearchParams(),
+        { idempotencyKey: `merlin_expire:${row.provider_session_id}` });
+      if (expired.status !== "expired") throw new HTTPException(502, {
+        message: "Nao foi possivel encerrar o checkout anterior na Stripe.",
+      });
+    } else if (session.status !== "expired") throw new HTTPException(409, {
+      message: "Um checkout anterior ainda precisa ser conciliado antes de abrir outro.",
+    });
+    await c.env.merlin_db.prepare(`
+      UPDATE checkout_sessions SET status = 'expired', payment_status = 'expired', updated_at = ?
+      WHERE id = ? AND status = 'open' AND license_id IS NULL
+    `).bind(new Date().toISOString(), row.id).run();
+  }
 }
 
 async function findCheckoutByIdempotencyKey(c: AppContext, idempotencyKey: string) {
   return c.env.merlin_db
     .prepare(
       `
-        SELECT provider_session_id, provider_session_url
+        SELECT provider_session_id, provider_session_url, provider_session_expires_at, status
         FROM checkout_sessions
         WHERE provider = ?
           AND idempotency_key = ?
@@ -488,6 +513,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     throw new HTTPException(403, { message: "Acesso de renovacao invalido." });
   }
   const reactivationLicenseId = existingLicense && canPayAgain(existingLicense) ? existingLicense.id : null;
+  if (reactivationLicenseId) await assertNoPendingPixReactivation(c, reactivationLicenseId);
   if (existingLicense && !reactivationLicenseId) {
     if (isActiveSubscriptionCancelingAtPeriodEnd(existingLicense)) {
       throw new HTTPException(409, { message: "Sua assinatura ainda esta ativa ate o fim do periodo pago. Use a opcao Gerenciar assinatura para reativar ou alterar." });
@@ -574,18 +600,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const cardTrialDays = input.planType === "monthly" && !reactivationLicenseId && billing.monthlyCardTrialEnabled
     ? billing.monthlyCardTrialDays
     : null;
-  const session = await createStripeCheckoutSession(c, {
-    customerId: customer.id,
-    stripeCustomerId,
-    email,
-    planType: input.planType,
-    planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
-    priceId,
-    idempotencyKey,
-    trialDays: cardTrialDays,
-    returnToMyAccess: Boolean(trustedRenewal),
-  });
-  const expiresAt = stripeTimestampToIso(session.expires_at);
+  const reservationId = `pending_checkout_${crypto.randomUUID()}`;
   const checkoutIp = getClientIp(c);
   const checkoutCountry = getCheckoutCountry(c);
   const checkoutUserAgent = getCheckoutUserAgent(c);
@@ -636,19 +651,19 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
       .bind(
         customer.id,
         PROVIDER_STRIPE,
-        session.id,
+        reservationId,
         priceId,
         billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
         input.planType,
         checkoutMode(input.planType),
-        session.status || "open",
+        "open",
         reactivationLicenseId ? null : licenseKey,
         name,
         recoveryPinHash,
         now,
         reactivationLicenseId,
-        session.url,
-        expiresAt,
+        null,
+        new Date(Date.now() + CHECKOUT_SESSION_TTL_SECONDS * 1000).toISOString(),
         "unpaid",
         checkoutIp,
         checkoutUserAgent,
@@ -660,16 +675,49 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
       )
       .run();
   } catch (error) {
+    if (!String(error).includes("UNIQUE constraint failed")) throw error;
     const existingCheckout = await findCheckoutByIdempotencyKey(c, idempotencyKey);
-    if (!existingCheckout?.provider_session_url) {
-      throw error;
-    }
+    if (!existingCheckout?.provider_session_url || existingCheckout.status !== "open"
+      || !existingCheckout.provider_session_expires_at
+      || Date.parse(existingCheckout.provider_session_expires_at) <= Date.now()) throw new HTTPException(409, {
+      message: "Ja existe uma cobranca em andamento para este acesso. Aguarde a confirmacao antes de tentar novamente.",
+    });
     if (verificationId) await consumePublicEmailVerification(c, verificationId);
     return {
       checkoutUrl: existingCheckout.provider_session_url,
       checkoutSessionId: existingCheckout.provider_session_id,
       reused: true,
     };
+  }
+
+  let session: StripeCheckoutSession;
+  try {
+    session = await createStripeCheckoutSession(c, {
+      customerId: customer.id,
+      stripeCustomerId,
+      email,
+      planType: input.planType,
+      planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
+      priceId,
+      idempotencyKey,
+      trialDays: cardTrialDays,
+      returnToMyAccess: Boolean(trustedRenewal),
+    });
+    const updated = await c.env.merlin_db.prepare(`
+      UPDATE checkout_sessions SET provider_session_id = ?, provider_session_url = ?,
+        provider_session_expires_at = ?, status = ?, updated_at = ?
+      WHERE provider = ? AND provider_session_id = ? AND status = 'open'
+    `).bind(session.id, session.url, stripeTimestampToIso(session.expires_at),
+      session.status || "open", new Date().toISOString(), PROVIDER_STRIPE, reservationId).run();
+    if (!updated.meta.changes) throw new Error(`Stripe Checkout ${session.id} was not linked to reservation`);
+  } catch (error) {
+    // A provider request may have succeeded before the network or D1 failed.
+    // Keep the reservation so another payable session cannot be issued.
+    console.error("[public-checkout] Stripe session requires reconciliation", {
+      customerId: customer.id, reactivationLicenseId, reservationId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   }
 
   if (verificationId) await consumePublicEmailVerification(c, verificationId);

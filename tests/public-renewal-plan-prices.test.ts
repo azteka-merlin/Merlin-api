@@ -88,4 +88,19 @@ describe("renewal parity across all tiered billing periods", () => {
     settings({ billingEnabled: false });
     expect(await getPublicAccessDetailsForLicense(c, 1)).toMatchObject({ access: { renewal: { earlyPix: false } } });
   });
+
+  test("expired canceled card access offers card renewal and Pix migration without changing its payment origin", async () => {
+    vi.mocked(getLicense).mockResolvedValue({ id: 1, customer_id: null, status: "expired",
+      expires_at: "2020-01-01T00:00:00Z", plan_tier: "bronze", access_type: "monthly_subscription",
+      source: "stripe", billing_status: "canceled", stripe_customer_id: "cus_fixture",
+      stripe_subscription_id: "sub_fixture" } as Awaited<ReturnType<typeof getLicense>>);
+    vi.mocked(listPublicBillingPlanPrices).mockResolvedValue([
+      { planTier: "bronze", billingPeriod: "monthly", paymentMethod: "card", amountCents: 1490, currency: "brl", active: true },
+      { planTier: "prata", billingPeriod: "monthly", paymentMethod: "pix", amountCents: 1990, currency: "brl", active: true },
+    ]);
+    expect(await getPublicAccessDetailsForLicense(c, 1)).toMatchObject({ access: {
+      subscription: { paymentMethod: "card", canManage: false },
+      renewal: { available: true, card: true, pix: true },
+    } });
+  });
 });

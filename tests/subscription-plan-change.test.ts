@@ -42,6 +42,7 @@ class FakeD1Database {
   prices: Row[] = [];
   licenses: Row[] = [];
   changes: Row[] = [];
+  checkouts: Row[] = [];
   nextChangeId = 1;
 
   prepare(sql: string) {
@@ -62,6 +63,17 @@ class FakeD1Database {
     }
     if (normalized.includes("FROM licenses") && normalized.includes("WHERE id = ?")) {
       return this.licenses.filter((license) => license.id === values[0]).slice(0, 1);
+    }
+    if (normalized.includes("FROM checkout_sessions") && normalized.includes("operation_type = 'pix_plan_transition'")) {
+      return this.checkouts.filter((checkout) => checkout.operation_type !== "prepaid_card_plan_change"
+        && checkout.license_id === values[0]
+        && checkout.provider_subscription_id === values[1] && checkout.upgrade_processed_at).slice(0, 1);
+    }
+    if (normalized.includes("FROM checkout_sessions") && normalized.includes("operation_type = 'prepaid_card_plan_change'")) {
+      return this.checkouts.filter((checkout) => checkout.operation_type === "prepaid_card_plan_change"
+        && checkout.license_id === values[0]
+        && checkout.provider_subscription_id === values[1] && checkout.upgrade_processed_at)
+        .sort((a, b) => b.id - a.id).slice(0, 1);
     }
     if (normalized.includes("FROM billing_plan_prices") && normalized.includes("payment_method = ?") && normalized.includes("plan_tier = ?")) {
       const [, method, tier, period] = values;
@@ -278,7 +290,7 @@ function stripeSubscription(priceId = "price_bronze_monthly", options: { topLeve
   };
 }
 
-function mockStripe(input: { subscriptionPriceId?: string; updatedPriceId?: string; invoicePaid?: boolean; topLevelPeriod?: boolean; subscriptionStatus?: string; invoiceAmountCents?: number; periodStart?: number; periodEnd?: number } = {}) {
+function mockStripe(input: { subscriptionPriceId?: string; updatedPriceId?: string; invoicePaid?: boolean; topLevelPeriod?: boolean; subscriptionStatus?: string; invoiceAmountCents?: number; periodStart?: number; periodEnd?: number; schedulePhaseStart?: number } = {}) {
   const calls: Array<{ url: string; body: string; method: string }> = [];
   vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit = {}) => {
     calls.push({ url, body: String(init.body || ""), method: init.method || "GET" });
@@ -306,9 +318,21 @@ function mockStripe(input: { subscriptionPriceId?: string; updatedPriceId?: stri
       });
     }
     if (url.endsWith("/subscription_schedules") && init.method === "POST") {
-      return jsonResponse({ id: "sched_123" });
+      return jsonResponse({ id: "sched_123", status: "active", subscription: "sub_123",
+        current_phase: { start_date: input.schedulePhaseStart ?? 1785456000,
+          end_date: input.periodEnd ?? 1788220800 },
+        phases: [{ start_date: input.schedulePhaseStart ?? 1785456000,
+          end_date: input.periodEnd ?? 1788220800,
+          items: [{ price: input.subscriptionPriceId || input.updatedPriceId || "price_bronze_monthly" }] }] });
     }
     if (url.includes("/subscription_schedules/sched_123") && init.method === "POST") {
+      if (url.endsWith("/release")) return jsonResponse({ id: "sched_123", status: "released" });
+      const phaseStart = new URLSearchParams(String(init.body || "")).get("phases[0][start_date]");
+      if (phaseStart !== String(input.schedulePhaseStart ?? 1785456000)) {
+        return new Response(JSON.stringify({ error: { message: "You can not modify the start date of the current phase." } }), {
+          status: 400, headers: { "content-type": "application/json" },
+        });
+      }
       return jsonResponse({ id: "sched_123" });
     }
     return jsonResponse({});
@@ -481,6 +505,36 @@ describe("subscription plan changes", () => {
       .rejects.toThrow("Price ID do plano de destino");
   });
 
+  test("does not end a previously paid Pix period through the regular Stripe plan-change path", async () => {
+    const db = seedDb({ plan_tier: "bronze", access_type: "monthly_subscription",
+      billing_current_period_start: "2030-01-01T00:00:00.000Z" });
+    db.checkouts.push({ license_id: 1, provider_subscription_id: db.licenses[0].stripe_subscription_id,
+      upgrade_processed_at: "2030-01-10T00:00:00.000Z",
+      checkout_evidence_json: JSON.stringify({ nextRenewalAt: "2030-02-01T00:00:00.000Z" }) });
+    await expect(previewSubscriptionPlanChange(createContext(db), { licenseId: 1, targetTier: "prata", targetPeriod: "monthly" }))
+      .rejects.toThrow("O periodo pre-pago no cartao ainda esta em andamento");
+  });
+
+  test("keeps the regular Stripe path closed until the latest prepaid card period has renewed", async () => {
+    const db = seedDb({ plan_tier: "prata", access_type: "annual_subscription",
+      billing_current_period_start: "2030-02-01T00:00:00.000Z" });
+    db.checkouts.push({ id: 10, operation_type: "pix_plan_transition", license_id: 1,
+      provider_subscription_id: db.licenses[0].stripe_subscription_id,
+      upgrade_processed_at: "2030-01-10T00:00:00.000Z",
+      checkout_evidence_json: JSON.stringify({ nextRenewalAt: "2030-02-01T00:00:00.000Z" }) });
+    db.checkouts.push({ id: 11, operation_type: "prepaid_card_plan_change", license_id: 1,
+      provider_subscription_id: db.licenses[0].stripe_subscription_id,
+      upgrade_processed_at: "2030-01-20T00:00:00.000Z",
+      checkout_evidence_json: JSON.stringify({ nextRenewalAt: "2031-01-20T00:00:00.000Z" }) });
+    await expect(previewSubscriptionPlanChange(createContext(db), {
+      licenseId: 1, targetTier: "ouro", targetPeriod: "annual",
+    })).rejects.toThrow("O periodo pre-pago no cartao ainda esta em andamento");
+    db.licenses[0].billing_current_period_start = "2031-01-20T00:00:00.000Z";
+    await expect(previewSubscriptionPlanChange(createContext(db), {
+      licenseId: 1, targetTier: "ouro", targetPeriod: "annual",
+    })).resolves.toMatchObject({ targetTier: "ouro" });
+  });
+
   test("creates pending upgrade without releasing the target tier before payment", async () => {
     const db = seedDb({ plan_tier: "bronze", access_type: "monthly_subscription" });
     const stripeCalls = mockStripe({ subscriptionPriceId: "price_bronze_monthly", invoicePaid: false });
@@ -563,7 +617,7 @@ describe("subscription plan changes", () => {
 
     expect(result).toMatchObject({ status: "scheduled", timing: "period_end", changeType: "interval_change", scheduleId: "sched_123" });
     const scheduleUpdate = stripeCalls.find((call) => call.url.includes("/subscription_schedules/sched_123"));
-    expect(scheduleUpdate?.body).toContain("phases%5B0%5D%5Bstart_date%5D=1785542400");
+    expect(scheduleUpdate?.body).toContain("phases%5B0%5D%5Bstart_date%5D=1785456000");
     expect(scheduleUpdate?.body).toContain("phases%5B0%5D%5Bend_date%5D=1788220800");
     expect(scheduleUpdate?.body).toContain("phases%5B1%5D%5Bbilling_cycle_anchor%5D=phase_start");
   });
