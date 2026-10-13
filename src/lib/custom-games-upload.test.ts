@@ -65,4 +65,82 @@ describe("hybrid folder manifest", () => {
     expect(manifest.totalSizeBytes).toBe(9);
     expect(manifest.bundles[0].files[0].path).toBe("Game/small.dat");
   });
+
+  it("validates thousands of legacy objects with paginated R2 listings", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const files = Array.from({ length: 2501 }, (_, index) => ({
+      path: `Game/file-${index}.dat`,
+      key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      sizeBytes: 1, sha256: "a".repeat(64),
+    }));
+    const list = vi.fn(async (options: { prefix: string; limit: number; cursor?: string }) => {
+      expect(options.prefix).toBe(`${gameId}/files/`);
+      expect(options.limit).toBe(1000);
+      const start = Number(options.cursor || 0);
+      const end = Math.min(start + 1000, files.length);
+      return { objects: files.slice(start, end).map(file => ({ key: file.key, size: 1, etag: "etag" })),
+        truncated: end < files.length, cursor: end < files.length ? String(end) : undefined };
+    });
+    const head = vi.fn();
+    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: { list, head, put } } as unknown as AppBindings;
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/folder/complete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        gameId, manifestId: "00000000-0000-4000-8000-000000000003", files,
+      }),
+    }, env);
+    expect(response.status).toBe(201);
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(head).not.toHaveBeenCalled();
+    expect(JSON.parse(put.mock.calls[0]![1] as string).files).toHaveLength(2501);
+  });
+
+  it.each(["missing", "wrong size"])("does not publish a manifest with a %s object", async problem => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const files = Array.from({ length: 129 }, (_, index) => ({
+      path: `Game/file-${index}.dat`,
+      key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      sizeBytes: 1, sha256: "a".repeat(64),
+    }));
+    const listed = files.slice(problem === "missing" ? 1 : 0).map((file, index) => ({
+      key: file.key, size: problem === "wrong size" && index === 0 ? 2 : 1, etag: "etag",
+    }));
+    const put = vi.fn();
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: { list: vi.fn(async () => ({ objects: listed, truncated: false })), put } } as unknown as AppBindings;
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/folder/complete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        gameId, manifestId: "00000000-0000-4000-8000-000000000003", files,
+      }),
+    }, env);
+    expect(response.status).toBe(409);
+    expect(put).not.toHaveBeenCalled();
+  });
+});
+
+describe("legacy folder cleanup", () => {
+  it("deletes thousands of R2 objects in batches of at most 1,000", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const manifestKey = `${gameId}/manifests/00000000-0000-4000-8000-000000000003.json`;
+    const files = Array.from({ length: 2001 }, (_, index) => ({
+      key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    }));
+    const deleted: Array<string | string[]> = [];
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: {
+      get: vi.fn(async () => ({ json: async () => ({ files, bundles: [] }) })),
+      delete: vi.fn(async (keys: string | string[]) => { deleted.push(keys); }),
+    }, merlin_db: { prepare: vi.fn(() => ({ bind: () => ({
+      first: async () => ({ id: gameId, archive_key: manifestKey, package_type: "folder", image_key: "" }),
+      run: async () => ({}),
+    }) })) } } as unknown as AppBindings;
+    const response = await app.request(`http://localhost/panel-api/custom-games/${gameId}`, { method: "DELETE" }, env);
+    expect(response.status).toBe(200);
+    expect(deleted.filter(Array.isArray).map(keys => keys.length)).toEqual([1000, 1000, 1]);
+    expect(deleted.at(-1)).toBe(manifestKey);
+  });
 });

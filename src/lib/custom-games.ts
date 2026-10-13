@@ -168,19 +168,47 @@ async function mapConcurrent<T, R>(items: T[], limit: number, mapper: (item: T, 
   return results;
 }
 
+async function inspectFolderObjects(bucket: R2Bucket, gameId: string,
+  objects: { key: string; sizeBytes: number }[]): Promise<(R2Object | null)[]> {
+  // A few objects are cheaper to check directly. Older folder uploads can have
+  // thousands; R2's strongly consistent, paginated listing avoids one HEAD per file.
+  if (objects.length <= 128) {
+    return mapConcurrent(objects, 6, file => file.sizeBytes === 0 ? Promise.resolve(null) : bucket.head(file.key));
+  }
+  const remaining = new Set(objects.filter(file => file.sizeBytes > 0).map(file => file.key));
+  const found = new Map<string, R2Object>();
+  let cursor: string | undefined;
+  for (let pageNumber = 0; remaining.size && pageNumber < 1000; pageNumber++) {
+    const page = await bucket.list({ prefix: `${gameId}/files/`, limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const object of page.objects) {
+      if (remaining.delete(object.key)) found.set(object.key, object);
+    }
+    if (!page.truncated) break;
+    if (!page.cursor || page.cursor === cursor) fail("Não foi possível concluir a conferência dos arquivos.", 409);
+    cursor = page.cursor;
+  }
+  return objects.map(file => file.sizeBytes === 0 ? null : found.get(file.key) || null);
+}
+
 async function deletePackage(c: AppContext, packageType: "zip" | "folder", key: string) {
   if (!key || DRAFT_KEY_PATTERN.test(key)) return;
   if (packageType === "zip") return c.env.CUSTOM_GAMES.delete(key);
   const object = await c.env.CUSTOM_GAMES.get(key);
   if (!object) return;
+  let manifest: FolderManifest | null = null;
   try {
-    const manifest = await object.json<FolderManifest>();
+    manifest = await object.json<FolderManifest>();
+  } catch { /* Delete the manifest even if its contents are malformed. */ }
+  if (manifest) {
     const keys = [...(Array.isArray(manifest.files) ? manifest.files : []),
       ...(Array.isArray(manifest.bundles) ? manifest.bundles : [])]
       .filter(file => typeof file?.key === "string" && GAME_FILE_KEY_PATTERN.test(file.key))
       .map(file => file.key);
-    await mapConcurrent([...new Set(keys)], 32, fileKey => c.env.CUSTOM_GAMES.delete(fileKey));
-  } catch { /* Delete the manifest even if its contents are malformed. */ }
+    const unique = [...new Set(keys)];
+    const batches = Array.from({ length: Math.ceil(unique.length / 1000) }, (_, index) =>
+      unique.slice(index * 1000, (index + 1) * 1000));
+    await mapConcurrent(batches, 6, batch => c.env.CUSTOM_GAMES.delete(batch));
+  }
   await c.env.CUSTOM_GAMES.delete(key);
 }
 
@@ -450,7 +478,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     }
     if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE) fail("A pasta precisa ter conteúdo e não pode ultrapassar 200 GiB.");
     const objects = [...validated, ...validatedBundles];
-    const heads = await mapConcurrent(objects, 32, file => file.sizeBytes === 0 ? Promise.resolve(null) : c.env.CUSTOM_GAMES.head(file.key));
+    const heads = await inspectFolderObjects(c.env.CUSTOM_GAMES, gameId, objects);
     if (heads.some((head, index) => objects[index]!.sizeBytes !== 0 && (!head || head.size !== objects[index]!.sizeBytes))) {
       fail("Um ou mais arquivos enviados estão incompletos.", 409);
     }
