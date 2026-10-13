@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
+import { belongsToGame, readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
 import type { AppContext } from "../types";
 
 describe("custom game install contracts", () => {
+  it("groups new objects under their game without rejecting legacy keys", () => {
+    const id = "00000000-0000-4000-8000-000000000001";
+    const other = "00000000-0000-4000-8000-000000000002";
+    expect(belongsToGame(`${id}/archives/${other}.zip`, id)).toBe(true);
+    expect(belongsToGame(`${other}/archives/${id}.zip`, id)).toBe(false);
+    expect(belongsToGame(`archives/${other}.zip`, id)).toBe(true);
+  });
   it("accepts up to 20,000 folder files and rejects larger manifests", () => {
     expect(validFolderFileCount([])).toBe(false);
     expect(validFolderFileCount(new Array(11_000))).toBe(true);
@@ -61,5 +68,9 @@ describe("custom game install contracts", () => {
       CUSTOM_GAMES: { head: async () => ({ size: 123 }) },
     } } as unknown as AppContext;
     await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
+    missingPackage.set("archiveKey", `${id}/archives/00000000-0000-4000-8000-000000000002.zip`);
+    await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
+    missingPackage.set("archiveKey", "00000000-0000-4000-8000-000000000002/archives/00000000-0000-4000-8000-000000000002.zip");
+    await expect(readGameForm(withPackage, id)).rejects.toThrow("pertence a outro jogo");
   });
 });

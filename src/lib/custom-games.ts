@@ -14,9 +14,11 @@ const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 const MAX_RANGE_SIZE = 64 * 1024 * 1024;
 const MAX_FOLDER_RANGE_SIZE = 256 * 1024 * 1024;
 const MAX_FOLDER_MANIFEST_SIZE = 12 * 1024 * 1024;
-const ARCHIVE_KEY_PATTERN = /^archives\/[0-9a-f-]{36}\.zip$/;
-const MANIFEST_KEY_PATTERN = /^manifests\/[0-9a-f-]{36}\.json$/;
-const GAME_FILE_KEY_PATTERN = /^game-files\/[0-9a-f-]{36}$/;
+const UUID = "[0-9a-f-]{36}";
+const GAME_ID_PATTERN = new RegExp(`^${UUID}$`);
+const ARCHIVE_KEY_PATTERN = new RegExp(`^(?:archives/${UUID}|${UUID}/archives/${UUID})\\.zip$`);
+const MANIFEST_KEY_PATTERN = new RegExp(`^(?:manifests/${UUID}|${UUID}/manifests/${UUID})\\.json$`);
+const GAME_FILE_KEY_PATTERN = new RegExp(`^(?:game-files/${UUID}|${UUID}/files/${UUID})$`);
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const DRAFT_KEY_PATTERN = /^draft\/[0-9a-f-]{36}$/;
 const FOLDER_MANIFEST_CACHE_MS = 60_000;
@@ -54,6 +56,16 @@ function validGameFileKey(value: unknown): string {
   const key = String(value || "");
   if (!GAME_FILE_KEY_PATTERN.test(key)) fail("Arquivo do jogo inválido.");
   return key;
+}
+
+function validGameId(value: unknown): string {
+  const id = String(value || "");
+  if (!GAME_ID_PATTERN.test(id)) fail("Identificador do jogo inválido.");
+  return id;
+}
+
+export function belongsToGame(key: string, gameId: string): boolean {
+  return !GAME_ID_PATTERN.test(key.slice(0, 36)) || key.startsWith(`${gameId}/`);
 }
 
 export function validateGameFilePath(value: unknown): string {
@@ -211,6 +223,7 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
   if (packageType !== "zip" && packageType !== "folder") fail("Formato de jogo inválido.");
   const suppliedKey = String(form.get("archiveKey") || "");
   const archiveKey = suppliedKey ? validPackageKey(suppliedKey, packageType) : `draft/${id}`;
+  if (suppliedKey && !belongsToGame(archiveKey, id)) fail("O pacote pertence a outro jogo.");
   let archiveSize = 0;
   if (suppliedKey) {
     if (packageType === "zip") {
@@ -234,7 +247,7 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
     const isWebp = mime === "image/webp" && String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
       String.fromCharCode(...bytes.slice(8, 12)) === "WEBP";
     if (!isPng && !isJpeg && !isWebp) fail("O arquivo de imagem não corresponde ao formato declarado.");
-    imageKey = `images/${crypto.randomUUID()}.${mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg"}`;
+    imageKey = `${id}/images/${crypto.randomUUID()}.${mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg"}`;
     await c.env.CUSTOM_GAMES.put(imageKey, bytes, { httpMetadata: { contentType: mime, cacheControl: "public, max-age=86400" } });
   }
   if (published && !imageKey) fail("Selecione uma imagem do jogo antes de publicar.");
@@ -254,7 +267,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games/upload/initiate", async c => {
     await requireAdminSession(c, { mutate: true });
-    const body = await c.req.json<{ filename?: string; sizeBytes?: number; packageType?: "zip" | "folder" }>();
+    const body = await c.req.json<{ gameId?: string; filename?: string; sizeBytes?: number; packageType?: "zip" | "folder" }>();
+    const gameId = validGameId(body.gameId);
     const size = Number(body.sizeBytes);
     const packageType = body.packageType || "zip";
     const valid = packageType === "zip"
@@ -263,7 +277,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (!valid || !Number.isSafeInteger(size) || size < 1) {
       fail(packageType === "zip" ? "Selecione um ZIP de até 30 GB." : "Arquivo do jogo inválido ou acima de 30 GB.");
     }
-    const key = packageType === "zip" ? `archives/${crypto.randomUUID()}.zip` : `game-files/${crypto.randomUUID()}`;
+    const key = packageType === "zip" ? `${gameId}/archives/${crypto.randomUUID()}.zip` : `${gameId}/files/${crypto.randomUUID()}`;
     const upload = await c.env.CUSTOM_GAMES.createMultipartUpload(key, {
       httpMetadata: { contentType: packageType === "zip" ? "application/zip" : "application/octet-stream", cacheControl: "private, no-store" },
     });
@@ -336,7 +350,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games/upload/folder/complete", async c => {
     await requireAdminSession(c, { mutate: true });
-    const body = await c.req.json<{ files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[] }>();
+    const body = await c.req.json<{ gameId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[] }>();
+    const gameId = validGameId(body.gameId);
     const files = body.files;
     if (!validFolderFileCount(files)) fail("Quantidade de arquivos inválida.");
     const paths = new Set<string>();
@@ -345,6 +360,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     const validated = files.map(file => {
       const relativePath = validateGameFilePath(file.path);
       const key = validGameFileKey(file.key);
+      if (!key.startsWith(`${gameId}/files/`)) fail("Arquivo pertence a outro jogo.");
       if (objectKeys.has(key)) fail("A pasta contém um arquivo duplicado.");
       objectKeys.add(key);
       const sizeBytes = Number(file.sizeBytes);
@@ -355,7 +371,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       if (paths.has(normalized)) fail("A pasta contém caminhos duplicados.");
       paths.add(normalized);
       totalSizeBytes += sizeBytes;
-      return { id: key.slice("game-files/".length), path: relativePath, key, sizeBytes, sha256 };
+      return { id: key.slice(key.lastIndexOf("/") + 1), path: relativePath, key, sizeBytes, sha256 };
     });
     for (const relativePath of paths) {
       const parts = relativePath.split("/");
@@ -373,7 +389,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       files: validated.map((file, index) => ({ ...file, etag: heads[index]?.etag })),
       totalSizeBytes,
     };
-    const key = `manifests/${crypto.randomUUID()}.json`;
+    const key = `${gameId}/manifests/${crypto.randomUUID()}.json`;
     await c.env.CUSTOM_GAMES.put(key, JSON.stringify(manifest), {
       httpMetadata: { contentType: "application/json", cacheControl: "private, no-store" },
     });
@@ -394,7 +410,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games", async c => {
     await requireAdminSession(c, { mutate: true });
-    const id = crypto.randomUUID();
+    const id = validGameId((await c.req.raw.clone().formData()).get("gameId"));
     const data = await readGameForm(c, id);
     await c.env.merlin_db.prepare(`INSERT INTO custom_games
       (id,name,install_name,admin_note,admin_notes_json,image_key,image_position_x,image_position_y,image_zoom,archive_key,archive_size,package_type,executable_path,published)
