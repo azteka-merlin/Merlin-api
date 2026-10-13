@@ -189,7 +189,7 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
   const published = form.get("published") === "true";
   const name = String(form.get("name") || "").trim();
   if ((published && !name) || name.length > 120) fail("Informe um nome de até 120 caracteres.");
-  const installName = name ? validateInstallName(name) : `draft-${id}`;
+  const installName = published ? validateInstallName(name) : `draft-${id}`;
   const note = String(form.get("adminNote") || "").trim();
   if (note.length > 5000) fail("A anotação deve ter até 5.000 caracteres.");
   let notes: Record<string, string>;

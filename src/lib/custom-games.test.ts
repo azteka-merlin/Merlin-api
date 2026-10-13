@@ -46,6 +46,9 @@ describe("custom game install contracts", () => {
     const draft = await readGameForm(context(new FormData()), id);
     expect(draft).toMatchObject({ name: "", installName: `draft-${id}`, archiveKey: `draft/${id}`,
       archiveSize: 0, imageKey: "", published: 0 });
+    const namedDraft = new FormData();
+    namedDraft.set("name", "CON");
+    expect((await readGameForm(context(namedDraft), id)).installName).toBe(`draft-${id}`);
     const unnamed = new FormData();
     unnamed.set("published", "true");
     await expect(readGameForm(context(unnamed), id)).rejects.toThrow("Informe um nome");
