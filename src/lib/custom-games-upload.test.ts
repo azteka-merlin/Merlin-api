@@ -41,3 +41,28 @@ describe("direct custom-game file upload", () => {
     expect(vi.mocked(requireAdminSession)).toHaveBeenCalledWith(expect.anything(), { mutate: true, touch: false });
   });
 });
+
+describe("hybrid folder manifest", () => {
+  it("checks only the stored objects and records bundled members for the Launcher", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const bundleKey = `${gameId}/files/00000000-0000-4000-8000-000000000002`;
+    const head = vi.fn(async (objectKey: string) => ({ size: objectKey === key ? 5 : 128, etag: "etag" }));
+    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: { head, put } } as unknown as AppBindings;
+    const body = { gameId, manifestId: "00000000-0000-4000-8000-000000000003",
+      files: [{ path: "Game/large.dat", key, sizeBytes: 5, sha256: "a".repeat(64) }],
+      bundles: [{ key: bundleKey, sizeBytes: 128, sha256: "b".repeat(64),
+        files: [{ path: "Game/small.dat", sizeBytes: 4, sha256: "c".repeat(64) }] }] };
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/folder/complete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    }, env);
+    expect(response.status).toBe(201);
+    expect(head).toHaveBeenCalledTimes(2);
+    const manifest = JSON.parse(put.mock.calls[0]![1] as string);
+    expect(manifest.version).toBe(3);
+    expect(manifest.totalSizeBytes).toBe(9);
+    expect(manifest.bundles[0].files[0].path).toBe("Game/small.dat");
+  });
+});
