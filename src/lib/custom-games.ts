@@ -285,24 +285,28 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.post("/panel-api/custom-games/upload/file", async c => {
-    await requireAdminSession(c, { mutate: true });
+    // Every folder can contain thousands of files. Validate the session on
+    // each request without rewriting its D1 row for every individual file.
+    await requireAdminSession(c, { mutate: true, touch: false });
     const size = Number(c.req.header("content-length"));
     if (!Number.isSafeInteger(size) || size < 1 || size > MAX_DIRECT_FILE_SIZE || !c.req.raw.body) {
       fail("Arquivo direto inválido. Use multipart para arquivos acima de 32 MB.");
     }
     const key = validGameFileKey(c.req.query("key"));
-    const existing = await c.env.CUSTOM_GAMES.head(key);
-    // The response to a successful PUT can be lost. Retrying the same file/key
-    // must not force the administrator to restart an entire folder upload.
-    if (existing) {
-      if (existing.size !== size) fail("A chave de upload já foi usada para outro tamanho.", 409);
-      return c.json({ success: true, key, sizeBytes: existing.size, etag: existing.etag });
+    if (c.req.header("x-upload-retry") === "1") {
+      // A successful PUT can lose its HTTP response. Only retries need a HEAD.
+      const existing = await c.env.CUSTOM_GAMES.head(key);
+      if (existing) {
+        if (existing.size !== size) fail("A chave de upload já foi usada para outro tamanho.", 409);
+        return c.json({ success: true, key, sizeBytes: existing.size, etag: existing.etag });
+      }
     }
-    await c.env.CUSTOM_GAMES.put(key, c.req.raw.body, {
+    const object = await c.env.CUSTOM_GAMES.put(key, c.req.raw.body, {
+      onlyIf: new Headers({ "If-None-Match": "*" }),
       httpMetadata: { contentType: "application/octet-stream", cacheControl: "private, no-store" },
     });
-    const object = await c.env.CUSTOM_GAMES.head(key);
-    if (!object || object.size !== size) {
+    if (!object) fail("A chave de upload já foi usada. Gere outra e tente novamente.", 409);
+    if (object.size !== size) {
       await c.env.CUSTOM_GAMES.delete(key);
       fail("O tamanho do arquivo enviado não confere.", 409);
     }
@@ -310,7 +314,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.post("/panel-api/custom-games/upload/part", async c => {
-    await requireAdminSession(c, { mutate: true });
+    await requireAdminSession(c, { mutate: true, touch: false });
     const key = String(c.req.query("key") || "");
     if (!ARCHIVE_KEY_PATTERN.test(key) && !GAME_FILE_KEY_PATTERN.test(key)) fail("Arquivo de upload inválido.");
     const uploadId = String(c.req.query("uploadId") || "");

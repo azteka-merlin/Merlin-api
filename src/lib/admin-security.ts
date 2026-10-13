@@ -769,8 +769,8 @@ export async function readAdminSessionByToken(c: AppContext, token: string, opti
   } satisfies AuthSessionResult;
 }
 
-export async function requireAdminSession(c: AppContext, options?: { mutate?: boolean; rotate?: boolean }) {
-  const sessionResult = await readAdminSession(c, { touch: true, rotate: options?.rotate });
+export async function requireAdminSession(c: AppContext, options?: { mutate?: boolean; rotate?: boolean; touch?: boolean }) {
+  const sessionResult = await readAdminSession(c, { touch: options?.touch !== false, rotate: options?.rotate });
   if (!sessionResult) {
     clearAdminSessionCookie(c);
     throw new HTTPException(401, { message: "Sessao expirada. Faca login novamente." });
