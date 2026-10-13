@@ -20,6 +20,9 @@
 	"observability": {
 		"enabled": true
 	},
+	"limits": {
+		"subrequests": 25000
+	},
 	"upload_source_maps": true,
 	"keep_vars": true,
 	"compatibility_flags": [
@@ -136,6 +139,9 @@
 	"env": {
 		"staging": {
 			"name": "your-merlin-api-worker-stage",
+			"limits": {
+				"subrequests": 25000
+			},
 			"vars": {
 				"ENVIRONMENT": "staging",
 				"PUBLIC_APP_ORIGIN": "https://your-staging-public-domain.example.com",

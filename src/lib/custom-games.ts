@@ -8,7 +8,7 @@ const PART_SIZE = 64 * 1024 * 1024;
 const MAX_ARCHIVE_SIZE = 30 * 1024 * 1024 * 1024;
 const MAX_GAME_SIZE = 200 * 1024 * 1024 * 1024;
 const MAX_GAME_FILE_SIZE = 30 * 1024 * 1024 * 1024;
-const MAX_GAME_FILES = 10000;
+const MAX_GAME_FILES = 20000;
 const MAX_DIRECT_FILE_SIZE = 32 * 1024 * 1024;
 const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 const MAX_RANGE_SIZE = 64 * 1024 * 1024;
@@ -20,6 +20,10 @@ const GAME_FILE_KEY_PATTERN = /^game-files\/[0-9a-f-]{36}$/;
 const FOLDER_MANIFEST_CACHE_MS = 60_000;
 const FOLDER_MANIFEST_CACHE_SIZE = 4;
 const folderManifestCache = new Map<string, { expiresAt: number; manifest: FolderManifest }>();
+
+export function validFolderFileCount(files: unknown): files is unknown[] {
+  return Array.isArray(files) && files.length >= 1 && files.length <= MAX_GAME_FILES;
+}
 
 type GameRow = {
   id: string; name: string; install_name: string; admin_note: string; admin_notes_json: string;
@@ -76,8 +80,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
   let manifest: FolderManifest;
   try { manifest = await object.json<FolderManifest>(); }
   catch { fail("Manifesto do jogo inválido."); }
-  if (![1, 2].includes(manifest.version) || !Array.isArray(manifest.files) || manifest.files.length < 1 ||
-      manifest.files.length > MAX_GAME_FILES) fail("Manifesto do jogo inválido.");
+  if (![1, 2].includes(manifest.version) || !validFolderFileCount(manifest.files)) fail("Manifesto do jogo inválido.");
   let totalSizeBytes = 0;
   const paths = new Set<string>();
   for (const file of manifest.files) {
@@ -327,7 +330,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c, { mutate: true });
     const body = await c.req.json<{ files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[] }>();
     const files = body.files;
-    if (!Array.isArray(files) || files.length < 1 || files.length > MAX_GAME_FILES) fail("Quantidade de arquivos inválida.");
+    if (!validFolderFileCount(files)) fail("Quantidade de arquivos inválida.");
     const paths = new Set<string>();
     const objectKeys = new Set<string>();
     let totalSizeBytes = 0;

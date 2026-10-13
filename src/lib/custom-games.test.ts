@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
+import { validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
 
 describe("custom game install contracts", () => {
+  it("accepts up to 20,000 folder files and rejects larger manifests", () => {
+    expect(validFolderFileCount([])).toBe(false);
+    expect(validFolderFileCount(new Array(11_000))).toBe(true);
+    expect(validFolderFileCount(new Array(20_000))).toBe(true);
+    expect(validFolderFileCount(new Array(20_001))).toBe(false);
+  });
   it("keeps a recognizable fixed Games folder name without Windows separators", () => {
     expect(validateInstallName("The Adventures of Elliot")).toBe("The Adventures of Elliot");
     expect(validateInstallName("Alan Wake: 2 / Edition")).toBe("Alan Wake 2 Edition");
