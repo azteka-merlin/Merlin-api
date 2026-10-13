@@ -9,6 +9,9 @@ const MAX_ARCHIVE_SIZE = 30 * 1024 * 1024 * 1024;
 const MAX_GAME_SIZE = 200 * 1024 * 1024 * 1024;
 const MAX_GAME_FILE_SIZE = 30 * 1024 * 1024 * 1024;
 const MAX_GAME_FILES = 20000;
+const MAX_GAME_BUNDLES = 2500;
+const MAX_NEW_BUNDLE_SIZE = 200 * 1024 * 1024;
+const MAX_BUNDLE_MEMBER_SIZE = 200 * 1024 * 1024;
 const MAX_DIRECT_FILE_SIZE = 32 * 1024 * 1024;
 const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 const MAX_RANGE_SIZE = 64 * 1024 * 1024;
@@ -98,7 +101,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
   catch { fail("Manifesto do jogo inválido."); }
   if (!manifest || ![1, 2, 3].includes(manifest.version) || !Array.isArray(manifest.files) ||
       (manifest.version === 3 ? !Array.isArray(manifest.bundles) : Boolean(manifest.bundles)) ||
-      (manifest.bundles?.length || 0) > 100) fail("Manifesto do jogo inválido.");
+      (manifest.bundles?.length || 0) > MAX_GAME_BUNDLES) fail("Manifesto do jogo inválido.");
   const memberCount = manifest.files.length + (manifest.bundles || []).reduce((sum, bundle) =>
     sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0);
   if (memberCount < 1 || memberCount > MAX_GAME_FILES) fail("Manifesto do jogo inválido.");
@@ -131,7 +134,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
     for (const member of bundle.files) {
       member.path = validateGameFilePath(member.path);
       member.sha256 = validateSha256(member.sha256);
-      if (!Number.isSafeInteger(member.sizeBytes) || member.sizeBytes < 0 || member.sizeBytes >= 1024 ** 2 ||
+      if (!Number.isSafeInteger(member.sizeBytes) || member.sizeBytes < 0 || member.sizeBytes > MAX_BUNDLE_MEMBER_SIZE ||
           (member.sizeBytes === 0 && member.sha256 !== EMPTY_SHA256)) fail("Manifesto do jogo inválido.");
       const normalized = member.path.toLocaleLowerCase("en-US");
       if (paths.has(normalized)) fail("Manifesto contém caminhos duplicados.");
@@ -426,7 +429,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (!GAME_ID_PATTERN.test(manifestId)) fail("Identificador do pacote inválido.");
     const files = body.files;
     const bundles = body.bundles || [];
-    if (!Array.isArray(files) || !Array.isArray(bundles) || bundles.length > 100 ||
+    if (!Array.isArray(files) || !Array.isArray(bundles) || bundles.length > MAX_GAME_BUNDLES ||
         files.length + bundles.reduce((sum, bundle) => sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0) < 1 ||
         files.length + bundles.reduce((sum, bundle) => sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0) > MAX_GAME_FILES) fail("Quantidade de arquivos inválida.");
     const paths = new Set<string>();
@@ -454,13 +457,13 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       if (!key.startsWith(`${gameId}/files/`) || objectKeys.has(key)) fail("Pacote duplicado ou de outro jogo.");
       objectKeys.add(key);
       const sizeBytes = Number(bundle.sizeBytes);
-      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > 1024 ** 3 ||
+      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > MAX_NEW_BUNDLE_SIZE ||
           !Array.isArray(bundle.files) || bundle.files.length < 1 || bundle.files.length > 3000) fail("Pacote de arquivos inválido.");
       const members = bundle.files.map(member => {
         const path = validateGameFilePath(member.path);
         const memberSize = Number(member.sizeBytes);
         const sha256 = validateSha256(member.sha256);
-        if (!Number.isSafeInteger(memberSize) || memberSize < 0 || memberSize >= 1024 ** 2 ||
+        if (!Number.isSafeInteger(memberSize) || memberSize < 0 || memberSize > MAX_BUNDLE_MEMBER_SIZE ||
             (memberSize === 0 && sha256 !== EMPTY_SHA256)) fail("Arquivo do pacote inválido.");
         const normalized = path.toLocaleLowerCase("en-US");
         if (paths.has(normalized)) fail("A pasta contém caminhos duplicados.");

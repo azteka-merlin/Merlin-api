@@ -66,6 +66,30 @@ describe("hybrid folder manifest", () => {
     expect(manifest.bundles[0].files[0].path).toBe("Game/small.dat");
   });
 
+  it("accepts more than 100 packages with members larger than 1 MiB", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const memberSize = 2 * 1024 * 1024;
+    const bundles = Array.from({ length: 101 }, (_, index) => ({
+      key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      sizeBytes: memberSize + 1024,
+      sha256: "b".repeat(64),
+      files: [{ path: `Game/file-${index}.dat`, sizeBytes: memberSize, sha256: "c".repeat(64) }],
+    }));
+    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: {
+      head: vi.fn(async () => ({ size: memberSize + 1024, etag: "etag" })), put,
+    } } as unknown as AppBindings;
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/folder/complete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        gameId, manifestId: "00000000-0000-4000-8000-000000000003", files: [], bundles,
+      }),
+    }, env);
+    expect(response.status).toBe(201);
+    expect(JSON.parse(put.mock.calls[0]![1] as string).bundles).toHaveLength(101);
+  });
+
   it("validates thousands of legacy objects with paginated R2 listings", async () => {
     const gameId = "00000000-0000-4000-8000-000000000000";
     const files = Array.from({ length: 2501 }, (_, index) => ({
