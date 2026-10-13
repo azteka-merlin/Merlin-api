@@ -291,7 +291,13 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       fail("Arquivo direto inválido. Use multipart para arquivos acima de 32 MB.");
     }
     const key = validGameFileKey(c.req.query("key"));
-    if (await c.env.CUSTOM_GAMES.head(key)) fail("A chave de upload já foi usada. Gere outra e tente novamente.", 409);
+    const existing = await c.env.CUSTOM_GAMES.head(key);
+    // The response to a successful PUT can be lost. Retrying the same file/key
+    // must not force the administrator to restart an entire folder upload.
+    if (existing) {
+      if (existing.size !== size) fail("A chave de upload já foi usada para outro tamanho.", 409);
+      return c.json({ success: true, key, sizeBytes: existing.size, etag: existing.etag });
+    }
     await c.env.CUSTOM_GAMES.put(key, c.req.raw.body, {
       httpMetadata: { contentType: "application/octet-stream", cacheControl: "private, no-store" },
     });
@@ -350,8 +356,10 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games/upload/folder/complete", async c => {
     await requireAdminSession(c, { mutate: true });
-    const body = await c.req.json<{ gameId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[] }>();
+    const body = await c.req.json<{ gameId?: string; manifestId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[] }>();
     const gameId = validGameId(body.gameId);
+    const manifestId = String(body.manifestId || crypto.randomUUID());
+    if (!GAME_ID_PATTERN.test(manifestId)) fail("Identificador do pacote inválido.");
     const files = body.files;
     if (!validFolderFileCount(files)) fail("Quantidade de arquivos inválida.");
     const paths = new Set<string>();
@@ -389,7 +397,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       files: validated.map((file, index) => ({ ...file, etag: heads[index]?.etag })),
       totalSizeBytes,
     };
-    const key = `${gameId}/manifests/${crypto.randomUUID()}.json`;
+    const key = `${gameId}/manifests/${manifestId}.json`;
     await c.env.CUSTOM_GAMES.put(key, JSON.stringify(manifest), {
       httpMetadata: { contentType: "application/json", cacheControl: "private, no-store" },
     });
