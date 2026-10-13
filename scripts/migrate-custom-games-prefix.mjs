@@ -8,7 +8,7 @@ const endpoint = "https://7ad4971c1414af1203494d55ab660307.r2.cloudflarestorage.
 const bucket = "custom-games";
 const profile = "merlin-r2";
 const uuid = /^[0-9a-f-]{36}$/;
-const awsBase = ["--endpoint-url", endpoint, "--profile", profile];
+const awsBase = ["--endpoint-url", endpoint, "--profile", profile, "--cli-read-timeout", "300", "--cli-connect-timeout", "30"];
 const knownObjects = new Map();
 const knownPrefixes = new Set();
 
@@ -57,7 +57,7 @@ function copyVerified(oldKey, newKey, expectedSize) {
   let target = head(newKey, true);
   if (target && target.ContentLength !== expectedSize) throw new Error(`Existing target size mismatch: ${newKey}`);
   if (!target && apply) {
-    if (expectedSize <= 5 * 1024 ** 3) {
+    if (expectedSize < 8 * 1024 ** 2) {
       aws(["s3api", "copy-object", "--bucket", bucket, "--key", newKey, "--copy-source", `${bucket}/${oldKey}`]);
     } else {
       aws(["s3", "cp", objectUrl(oldKey), objectUrl(newKey), "--no-progress", "--copy-props", "none"]);
@@ -76,7 +76,7 @@ async function copyVerifiedAsync(oldKey, newKey, expectedSize) {
   let target = head(newKey, true);
   if (target && target.ContentLength !== expectedSize) throw new Error(`Existing target size mismatch: ${newKey}`);
   if (!target && apply) {
-    if (expectedSize <= 5 * 1024 ** 3) {
+    if (expectedSize < 8 * 1024 ** 2) {
       await awsAsync(["s3api", "copy-object", "--bucket", bucket, "--key", newKey, "--copy-source", `${bucket}/${oldKey}`]);
     } else {
       await awsAsync(["s3", "cp", objectUrl(oldKey), objectUrl(newKey), "--no-progress", "--copy-props", "none"]);
