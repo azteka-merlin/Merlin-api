@@ -17,6 +17,8 @@ const MAX_FOLDER_MANIFEST_SIZE = 12 * 1024 * 1024;
 const ARCHIVE_KEY_PATTERN = /^archives\/[0-9a-f-]{36}\.zip$/;
 const MANIFEST_KEY_PATTERN = /^manifests\/[0-9a-f-]{36}\.json$/;
 const GAME_FILE_KEY_PATTERN = /^game-files\/[0-9a-f-]{36}$/;
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const DRAFT_KEY_PATTERN = /^draft\/[0-9a-f-]{36}$/;
 const FOLDER_MANIFEST_CACHE_MS = 60_000;
 const FOLDER_MANIFEST_CACHE_SIZE = 4;
 const folderManifestCache = new Map<string, { expiresAt: number; manifest: FolderManifest }>();
@@ -87,9 +89,10 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
     file.path = validateGameFilePath(file.path);
     file.key = validGameFileKey(file.key);
     if (!/^[0-9a-f-]{36}$/i.test(file.id) || !Number.isSafeInteger(file.sizeBytes) ||
-        file.sizeBytes < 1 || file.sizeBytes > MAX_GAME_FILE_SIZE) fail("Manifesto do jogo inválido.");
+        file.sizeBytes < 0 || file.sizeBytes > MAX_GAME_FILE_SIZE) fail("Manifesto do jogo inválido.");
     if (manifest.version === 2 && file.sha256 == null) fail("Manifesto do jogo inválido.");
     if (file.sha256 != null) file.sha256 = validateSha256(file.sha256);
+    if (file.sizeBytes === 0 && file.sha256 !== EMPTY_SHA256) fail("Manifesto do jogo inválido.");
     const normalized = file.path.toLocaleLowerCase("en-US");
     if (paths.has(normalized)) fail("Manifesto contém caminhos duplicados.");
     paths.add(normalized);
@@ -101,7 +104,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
       if (paths.has(parts.slice(0, index).join("/"))) fail("Manifesto contém conflito entre arquivo e pasta.");
     }
   }
-  if (totalSizeBytes > MAX_GAME_SIZE || manifest.totalSizeBytes !== totalSizeBytes) fail("Tamanho do manifesto inválido.");
+  if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE || manifest.totalSizeBytes !== totalSizeBytes) fail("Tamanho do manifesto inválido.");
   const validated: FolderManifest = { version: manifest.version, files: manifest.files, totalSizeBytes };
   if (folderManifestCache.size >= FOLDER_MANIFEST_CACHE_SIZE) {
     const oldest = folderManifestCache.keys().next().value;
@@ -124,6 +127,7 @@ async function mapConcurrent<T, R>(items: T[], limit: number, mapper: (item: T, 
 }
 
 async function deletePackage(c: AppContext, packageType: "zip" | "folder", key: string) {
+  if (!key || DRAFT_KEY_PATTERN.test(key)) return;
   if (packageType === "zip") return c.env.CUSTOM_GAMES.delete(key);
   const object = await c.env.CUSTOM_GAMES.get(key);
   if (!object) return;
@@ -159,10 +163,10 @@ function mapGame(row: GameRow) {
   return {
     id: row.id, name: row.name, installName: row.install_name, adminNote: row.admin_note,
     adminNotes: notes,
-    imageUrl: `/api/custom-games/${row.id}/image?v=${encodeURIComponent(row.image_key)}`,
+    imageUrl: row.image_key ? `/api/custom-games/${row.id}/image?v=${encodeURIComponent(row.image_key)}` : "",
     imageVersion: row.image_key,
     imagePositionX: row.image_position_x, imagePositionY: row.image_position_y, imageZoom: row.image_zoom,
-    archiveKey: row.archive_key, archiveSize: row.archive_size,
+    archiveKey: DRAFT_KEY_PATTERN.test(row.archive_key) ? "" : row.archive_key, archiveSize: row.archive_size,
     packageType: row.package_type || "zip",
     executablePath: row.executable_path, published: Boolean(row.published),
     createdAt: row.created_at, updatedAt: row.updated_at,
@@ -180,11 +184,12 @@ function readNumber(value: string | File | null, fallback: number, min: number, 
   return number;
 }
 
-async function readGameForm(c: AppContext, prior?: GameRow | null) {
+export async function readGameForm(c: AppContext, id: string, prior?: GameRow | null) {
   const form = await c.req.formData();
+  const published = form.get("published") === "true";
   const name = String(form.get("name") || "").trim();
-  if (!name || name.length > 120) fail("Informe um nome de até 120 caracteres.");
-  const installName = validateInstallName(name);
+  if ((published && !name) || name.length > 120) fail("Informe um nome de até 120 caracteres.");
+  const installName = name ? validateInstallName(name) : `draft-${id}`;
   const note = String(form.get("adminNote") || "").trim();
   if (note.length > 5000) fail("A anotação deve ter até 5.000 caracteres.");
   let notes: Record<string, string>;
@@ -204,16 +209,19 @@ async function readGameForm(c: AppContext, prior?: GameRow | null) {
   const imageZoom = readNumber(form.get("imageZoom"), 1, 1, 4);
   const packageType = String(form.get("packageType") || prior?.package_type || "zip") as "zip" | "folder";
   if (packageType !== "zip" && packageType !== "folder") fail("Formato de jogo inválido.");
-  const archiveKey = validPackageKey(form.get("archiveKey") || prior?.archive_key, packageType);
-  let archiveSize: number;
-  if (packageType === "zip") {
-    const archive = await c.env.CUSTOM_GAMES.head(archiveKey);
-    if (!archive || !archive.size || archive.size > MAX_ARCHIVE_SIZE) fail("Envie um ZIP válido antes de salvar.");
-    archiveSize = archive.size;
-  } else {
-    const manifest = await loadFolderManifest(c, archiveKey);
-    archiveSize = manifest.totalSizeBytes;
-  }
+  const suppliedKey = String(form.get("archiveKey") || "");
+  const archiveKey = suppliedKey ? validPackageKey(suppliedKey, packageType) : `draft/${id}`;
+  let archiveSize = 0;
+  if (suppliedKey) {
+    if (packageType === "zip") {
+      const archive = await c.env.CUSTOM_GAMES.head(archiveKey);
+      if (!archive || !archive.size || archive.size > MAX_ARCHIVE_SIZE) fail("Envie um ZIP válido antes de salvar.");
+      archiveSize = archive.size;
+    } else {
+      const manifest = await loadFolderManifest(c, archiveKey);
+      archiveSize = manifest.totalSizeBytes;
+    }
+  } else if (published) fail("Envie o pacote do jogo antes de publicar.");
   const image = form.get("image");
   let imageKey = prior?.image_key || "";
   if (image instanceof File && image.size) {
@@ -229,11 +237,11 @@ async function readGameForm(c: AppContext, prior?: GameRow | null) {
     imageKey = `images/${crypto.randomUUID()}.${mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg"}`;
     await c.env.CUSTOM_GAMES.put(imageKey, bytes, { httpMetadata: { contentType: mime, cacheControl: "public, max-age=86400" } });
   }
-  if (!imageKey) fail("Selecione uma imagem do jogo.");
+  if (published && !imageKey) fail("Selecione uma imagem do jogo antes de publicar.");
   return {
     name, installName, note, notes: JSON.stringify(notes), executablePath, packageType, archiveKey, archiveSize, imageKey,
     imagePositionX, imagePositionY, imageZoom,
-    published: form.get("published") === "true" ? 1 : 0,
+    published: published ? 1 : 0,
   };
 }
 
@@ -340,8 +348,9 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       if (objectKeys.has(key)) fail("A pasta contém um arquivo duplicado.");
       objectKeys.add(key);
       const sizeBytes = Number(file.sizeBytes);
-      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > MAX_GAME_FILE_SIZE) fail("Tamanho de arquivo inválido.");
+      if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || sizeBytes > MAX_GAME_FILE_SIZE) fail("Tamanho de arquivo inválido.");
       const sha256 = validateSha256(file.sha256);
+      if (sizeBytes === 0 && sha256 !== EMPTY_SHA256) fail("Hash do arquivo vazio inválido.");
       const normalized = relativePath.toLocaleLowerCase("en-US");
       if (paths.has(normalized)) fail("A pasta contém caminhos duplicados.");
       paths.add(normalized);
@@ -354,9 +363,9 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
         if (paths.has(parts.slice(0, index).join("/"))) fail("A pasta contém conflito entre arquivo e pasta.");
       }
     }
-    if (totalSizeBytes > MAX_GAME_SIZE) fail("A pasta ultrapassa o limite de 200 GiB.");
-    const heads = await mapConcurrent(validated, 32, file => c.env.CUSTOM_GAMES.head(file.key));
-    if (heads.some((head, index) => !head || !validated[index] || head.size !== validated[index].sizeBytes)) {
+    if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE) fail("A pasta precisa ter conteúdo e não pode ultrapassar 200 GiB.");
+    const heads = await mapConcurrent(validated, 32, file => file.sizeBytes === 0 ? Promise.resolve(null) : c.env.CUSTOM_GAMES.head(file.key));
+    if (heads.some((head, index) => validated[index]!.sizeBytes !== 0 && (!head || head.size !== validated[index]!.sizeBytes))) {
       fail("Um ou mais arquivos enviados estão incompletos.", 409);
     }
     const manifest: FolderManifest = {
@@ -385,8 +394,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games", async c => {
     await requireAdminSession(c, { mutate: true });
-    const data = await readGameForm(c);
     const id = crypto.randomUUID();
+    const data = await readGameForm(c, id);
     await c.env.merlin_db.prepare(`INSERT INTO custom_games
       (id,name,install_name,admin_note,admin_notes_json,image_key,image_position_x,image_position_y,image_zoom,archive_key,archive_size,package_type,executable_path,published)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, data.name, data.installName, data.note, data.notes, data.imageKey,
@@ -399,13 +408,13 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c, { mutate: true });
     const prior = await findGame(c, c.req.param("id"));
     if (!prior) fail("Jogo não encontrado.", 404);
-    const data = await readGameForm(c, prior);
+    const data = await readGameForm(c, prior.id, prior);
     await c.env.merlin_db.prepare(`UPDATE custom_games SET name=?,install_name=?,admin_note=?,admin_notes_json=?,image_key=?,
       image_position_x=?,image_position_y=?,image_zoom=?,archive_key=?,archive_size=?,package_type=?,executable_path=?,
       published=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(data.name, data.installName, data.note, data.notes,
       data.imageKey, data.imagePositionX, data.imagePositionY, data.imageZoom, data.archiveKey,
       data.archiveSize, data.packageType, data.executablePath, data.published, prior.id).run();
-    if (prior.image_key !== data.imageKey) await c.env.CUSTOM_GAMES.delete(prior.image_key);
+    if (prior.image_key && prior.image_key !== data.imageKey) await c.env.CUSTOM_GAMES.delete(prior.image_key);
     if (prior.archive_key !== data.archiveKey || (prior.package_type || "zip") !== data.packageType) {
       await deletePackage(c, prior.package_type || "zip", prior.archive_key);
     }
@@ -417,7 +426,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     const prior = await findGame(c, c.req.param("id"));
     if (!prior) fail("Jogo não encontrado.", 404);
     await c.env.merlin_db.prepare("DELETE FROM custom_games WHERE id=?").bind(prior.id).run();
-    await Promise.all([c.env.CUSTOM_GAMES.delete(prior.image_key), deletePackage(c, prior.package_type || "zip", prior.archive_key)]);
+    await Promise.all([prior.image_key ? c.env.CUSTOM_GAMES.delete(prior.image_key) : Promise.resolve(), deletePackage(c, prior.package_type || "zip", prior.archive_key)]);
     return c.json({ success: true });
   });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
+import { readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
+import type { AppContext } from "../types";
 
 describe("custom game install contracts", () => {
   it("accepts up to 20,000 folder files and rejects larger manifests", () => {
@@ -37,5 +38,25 @@ describe("custom game install contracts", () => {
     for (const value of ["", "a".repeat(63), "g".repeat(64), "a".repeat(65)]) {
       expect(() => validateSha256(value)).toThrow();
     }
+  });
+
+  it("saves an empty draft, but requires a name and package to publish", async () => {
+    const id = "00000000-0000-4000-8000-000000000001";
+    const context = (form: FormData) => ({ req: { formData: async () => form }, env: {} }) as unknown as AppContext;
+    const draft = await readGameForm(context(new FormData()), id);
+    expect(draft).toMatchObject({ name: "", installName: `draft-${id}`, archiveKey: `draft/${id}`,
+      archiveSize: 0, imageKey: "", published: 0 });
+    const unnamed = new FormData();
+    unnamed.set("published", "true");
+    await expect(readGameForm(context(unnamed), id)).rejects.toThrow("Informe um nome");
+    const missingPackage = new FormData();
+    missingPackage.set("name", "Jogo completo depois");
+    missingPackage.set("published", "true");
+    await expect(readGameForm(context(missingPackage), id)).rejects.toThrow("Envie o pacote");
+    missingPackage.set("archiveKey", "archives/00000000-0000-4000-8000-000000000002.zip");
+    const withPackage = { req: { formData: async () => missingPackage }, env: {
+      CUSTOM_GAMES: { head: async () => ({ size: 123 }) },
+    } } as unknown as AppContext;
+    await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
   });
 });
