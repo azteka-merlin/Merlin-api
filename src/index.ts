@@ -16,6 +16,7 @@ import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
 import { PublicEmailVerificationStartRoute, PublicEmailVerificationVerifyRoute } from "./endpoints/public-email-verification";
 import { VersionRoute } from "./endpoints/version";
+import { cleanupExpiredGameUploads, customGamesR2Origin } from "./lib/custom-game-upload-sessions";
 import {
   clearAdminSessionCookie,
   getClientIp,
@@ -226,12 +227,18 @@ app.use("*", async (c, next) => {
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
   const isVotingRoute = c.req.path === "/votacao" || c.req.path.startsWith("/votacao/");
-  const csp = isSwaggerRoute
+  let csp = isSwaggerRoute
     ? "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob: https://fastly.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     : isVotingRoute
       ? "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https://shared.fastly.steamstatic.com; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
     : "default-src 'self'; script-src 'self' https://www.mercadopago.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
+  // The Admin is an SPA: this policy must also allow uploads after navigating
+  // from its login/dashboard document. Permit only the configured private origin.
+  if (!isSwaggerRoute && !isVotingRoute && c.res.headers.get("content-type")?.includes("text/html")) {
+    const r2Origin = customGamesR2Origin(c.env);
+    if (r2Origin) csp = csp.replace("connect-src 'self';", `connect-src 'self' ${r2Origin};`);
+  }
   const headers = new Headers(c.res.headers);
   headers.set("Content-Security-Policy", csp);
   headers.set("X-Content-Type-Options", "nosniff");
@@ -4229,6 +4236,9 @@ export default {
     const billingHour = new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Sao_Paulo", hour: "2-digit", hourCycle: "h23",
     }).format(scheduledAt);
+    _ctx.waitUntil(cleanupExpiredGameUploads(env.CUSTOM_GAMES).catch(error => {
+      console.error("[CustomGamesUpload] cleanup-failed", { message: error instanceof Error ? error.message : "Unknown error" });
+    }));
     if (billingHour === "09" || billingHour === "19") await runBillingNotificationCron(env, scheduledAt);
     {
       const cronContext = { env, executionCtx: _ctx } as AppContext;

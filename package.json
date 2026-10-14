@@ -21,6 +21,7 @@
         "deploy-stage:panel": "npm run build:panel && npm run deploy-stage"
     },
     "dependencies": {
+        "aws4fetch": "^1.0.20",
         "chanfana": "^3.3.0",
         "hono": "^4.12.12",
         "zod": "^4.3.6"

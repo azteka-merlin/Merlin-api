@@ -3,6 +3,8 @@ import { HTTPException } from "hono/http-exception";
 import type { AppBindings, AppContext } from "../types";
 import { requireAdminSession } from "./admin-security";
 import { requireLauncherLicense } from "./launcher-auth";
+import { beginGameUploadFinalization, completeGameMultipart, finishGameUploadFinalization,
+  registerGameUploadSessionRoutes } from "./custom-game-upload-sessions";
 
 const PART_SIZE = 64 * 1024 * 1024;
 const MAX_ARCHIVE_SIZE = 30 * 1024 * 1024 * 1024;
@@ -321,6 +323,7 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
 }
 
 export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) {
+  registerGameUploadSessionRoutes(app);
   app.get("/panel-api/custom-games", async c => {
     await requireAdminSession(c);
     const rows = await c.env.merlin_db.prepare("SELECT * FROM custom_games ORDER BY created_at DESC").all<GameRow>();
@@ -404,10 +407,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
           !/^[A-Za-z0-9"_-]{1,128}$/.test(part.etag))) {
       fail("Partes do arquivo inválidas.");
     }
-    await c.env.CUSTOM_GAMES.resumeMultipartUpload(key, body.uploadId).complete(parts);
-    const object = await c.env.CUSTOM_GAMES.head(key);
-    if (object?.size !== sizeBytes) fail("Tamanho do ZIP não corresponde ao arquivo enviado.", 409);
-    return c.json({ success: true, key, sizeBytes });
+    const object = await completeGameMultipart(c.env.CUSTOM_GAMES, key, body.uploadId, parts, sizeBytes);
+    return c.json({ success: true, key, sizeBytes, etag: object.etag });
   });
 
   app.post("/panel-api/custom-games/upload/abort", async c => {
@@ -421,8 +422,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.post("/panel-api/custom-games/upload/folder/complete", async c => {
-    await requireAdminSession(c, { mutate: true });
-    const body = await c.req.json<{ gameId?: string; manifestId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[];
+    const admin = await requireAdminSession(c, { mutate: true });
+    const body = await c.req.json<{ gameId?: string; manifestId?: string; sessionId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[];
       bundles?: { key?: string; sizeBytes?: number; sha256?: string; files?: { path?: string; sizeBytes?: number; sha256?: string }[] }[] }>();
     const gameId = validGameId(body.gameId);
     const manifestId = String(body.manifestId || crypto.randomUUID());
@@ -485,6 +486,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (heads.some((head, index) => objects[index]!.sizeBytes !== 0 && (!head || head.size !== objects[index]!.sizeBytes))) {
       fail("Um ou mais arquivos enviados estão incompletos.", 409);
     }
+    const session = body.sessionId ? await beginGameUploadFinalization(c, body.sessionId,
+      admin.session.admin_user_id, gameId, manifestId, objects) : null;
     const manifest: FolderManifest = {
       version: 3,
       files: validated.map((file, index) => ({ ...file, etag: heads[index]?.etag })),
@@ -495,6 +498,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await c.env.CUSTOM_GAMES.put(key, JSON.stringify(manifest), {
       httpMetadata: { contentType: "application/json", cacheControl: "private, no-store" },
     });
+    if (session) await finishGameUploadFinalization(c, session, key);
     return c.json({ success: true, key, sizeBytes: totalSizeBytes, fileCount: validated.length, packageType: "folder" }, 201);
   });
 

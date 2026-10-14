@@ -1,0 +1,11 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://api-merlin.com"],
+      "AllowedMethods": ["PUT", "HEAD"],
+      "AllowedHeaders": ["content-type", "content-md5", "x-amz-content-sha256"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

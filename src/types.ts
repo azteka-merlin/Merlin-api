@@ -29,6 +29,10 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   MERLIN_WORKER_TOKEN?: string;
   LICENSE_FILE_AES_KEY_BASE64?: string;
   STEAM_ACCOUNT_ID?: string;
+  CUSTOM_GAMES_R2_ACCOUNT_ID?: string;
+  CUSTOM_GAMES_R2_ACCESS_KEY_ID?: string;
+  CUSTOM_GAMES_R2_SECRET_ACCESS_KEY?: string;
+  CUSTOM_GAMES_R2_BUCKET?: string;
 }
 
 export type AppContext = Context<{ Bindings: AppBindings }>;
