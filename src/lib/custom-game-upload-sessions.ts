@@ -65,6 +65,27 @@ async function checkpoint(c: AppContext, session: GameUploadSession, clientId: s
   if (!stored) fail("Objeto desta sessão não encontrado.", 404);
   return stored;
 }
+function isMissingMultipartPartError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\(10025\)|InvalidPart|não reconheceu uma ou mais partes/i.test(message);
+}
+async function restartGameMultipart(bucket: R2Bucket, session: GameUploadSession,
+  entry: GameUploadCheckpoint, stored: Stored<GameUploadCheckpoint>) {
+  await bucket.resumeMultipartUpload(entry.key, entry.uploadId!).abort().catch(() => {});
+  const upload = await bucket.createMultipartUpload(entry.key, {
+    customMetadata: { uploadSessionId: session.id, clientId: entry.clientId },
+    httpMetadata: { contentType: "application/octet-stream", cacheControl: "private, no-store" },
+  });
+  const replacement: GameUploadCheckpoint = { ...entry, uploadId: upload.uploadId, completed: false,
+    state: "uploading", etag: undefined };
+  try {
+    await replace(bucket, checkpointKey(session.id, entry.clientId), replacement, stored.etag);
+  } catch (error) {
+    await bucket.resumeMultipartUpload(entry.key, upload.uploadId).abort().catch(() => {});
+    throw error;
+  }
+  return replacement;
+}
 async function checkpoints(bucket: R2Bucket, sessionId: string) {
   const result: GameUploadCheckpoint[] = [];
   let cursor: string | undefined;
@@ -108,7 +129,13 @@ export async function completeGameMultipart(bucket: R2Bucket, key: string, uploa
     try { object = await bucket.resumeMultipartUpload(key, uploadId).complete(parts); }
     catch (error) {
       object = await bucket.head(key);
-      if (!object) throw error;
+      if (!object) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/\(10025\)|InvalidPart/i.test(message)) {
+          fail("O R2 não reconheceu uma ou mais partes deste arquivo. Mantenha a pasta selecionada e tente enviar novamente.", 409);
+        }
+        throw error;
+      }
     }
     object ||= await bucket.head(key);
   }
@@ -117,9 +144,15 @@ export async function completeGameMultipart(bucket: R2Bucket, key: string, uploa
 }
 
 function validateParts(value: unknown, sizeBytes: number) {
-  if (!Array.isArray(value) || value.length !== Math.ceil(sizeBytes / PART_SIZE) || value.some((part, index) =>
-    !part || part.partNumber !== index + 1 || typeof part.etag !== "string" || !/^[A-Za-z0-9"_-]{1,128}$/.test(part.etag))) fail("Partes do arquivo inválidas.");
-  return value as { partNumber: number; etag: string }[];
+  if (!Array.isArray(value) || value.length !== Math.ceil(sizeBytes / PART_SIZE)) fail("Partes do arquivo inválidas.");
+  return value.map((part, index) => {
+    if (!part || part.partNumber !== index + 1 || typeof part.etag !== "string") fail("Partes do arquivo inválidas.");
+    // Presigned S3 UploadPart returns an HTTP ETag with surrounding quotes,
+    // while the Workers R2 API expects the opaque R2UploadedPart.etag value.
+    const etag = part.etag.startsWith('"') && part.etag.endsWith('"') ? part.etag.slice(1, -1) : part.etag;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(etag)) fail("Partes do arquivo inválidas.");
+    return { partNumber: part.partNumber, etag };
+  });
 }
 
 export async function beginGameUploadFinalization(c: AppContext, sessionId: string, adminId: number,
@@ -324,7 +357,23 @@ export function registerGameUploadSessionRoutes(app: Hono<{ Bindings: AppBinding
     if (!entry.uploadId) fail("Arquivo ainda não preparado.", 409);
     const parts = validateParts(body.parts, entry.sizeBytes);
     const started = Date.now();
-    const object = await completeGameMultipart(c.env.CUSTOM_GAMES, entry.key, entry.uploadId, parts, entry.sizeBytes);
+    let object;
+    try {
+      object = await completeGameMultipart(c.env.CUSTOM_GAMES, entry.key, entry.uploadId, parts, entry.sizeBytes);
+    } catch (error) {
+      if (!isMissingMultipartPartError(error)) throw error;
+      const current = await checkpoint(c, session, entry.clientId);
+      if (current.value.completed && current.value.sha256 === checksum) return c.json({ success: true, ...current.value });
+      const replacement = current.value.uploadId === entry.uploadId
+        ? await restartGameMultipart(c.env.CUSTOM_GAMES, session, entry, current)
+        : current.value;
+      console.warn("[CustomGamesUpload] multipart-parts-reset", {
+        sessionId: session.id, clientId: entry.clientId, partCount: parts.length,
+      });
+      return c.json({ success: false, code: "multipart_parts_reset",
+        error: "Uma parte deste arquivo não foi reconhecida pelo R2. Reenviando somente este arquivo.",
+        uploadId: replacement.uploadId }, 409);
+    }
     const completed: GameUploadCheckpoint = { ...entry, sha256: checksum, completed: true, state: "completed", etag: object.etag };
     try { await replace(c.env.CUSTOM_GAMES, checkpointKey(session.id, entry.clientId), completed, stored.etag); }
     catch (error) {

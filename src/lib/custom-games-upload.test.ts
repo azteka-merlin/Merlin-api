@@ -3,12 +3,65 @@ import { Hono } from "hono";
 import type { AppBindings } from "../types";
 
 vi.mock("./admin-security", () => ({ requireAdminSession: vi.fn().mockResolvedValue({}) }));
-vi.mock("./launcher-auth", () => ({ requireLauncherLicense: vi.fn().mockResolvedValue({}) }));
+vi.mock("./launcher-auth", () => ({
+  requireLauncherLicense: vi.fn().mockResolvedValue({}),
+  requireGoldLauncherLicense: vi.fn().mockResolvedValue({ planTier: "ouro" }),
+}));
 
 import { registerCustomGamesRoutes } from "./custom-games";
 import { requireAdminSession } from "./admin-security";
 
 const key = "00000000-0000-4000-8000-000000000000/files/00000000-0000-4000-8000-000000000001";
+
+describe("large ZIP multipart uploads", () => {
+  it("accepts 100 GiB archives and allows the corresponding 1,600th part", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const uploadPart = vi.fn(async (partNumber: number) => ({ partNumber, etag: "etag" }));
+    const createMultipartUpload = vi.fn(async () => ({ uploadId: "upload-1" }));
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const env = { CUSTOM_GAMES: {
+      createMultipartUpload,
+      resumeMultipartUpload: vi.fn(() => ({ uploadPart })),
+    } } as unknown as AppBindings;
+
+    const init = await app.request("http://localhost/panel-api/custom-games/upload/initiate", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ gameId, filename: "game.zip", packageType: "zip", sizeBytes: 100 * 1024 ** 3 }),
+    }, env);
+    expect(init.status).toBe(200);
+    const upload = await init.json() as { key: string; partSize: number };
+    expect(upload.key).toMatch(new RegExp(`^${gameId}/archives/[0-9a-f-]{36}\\.zip$`));
+    expect(upload.partSize).toBe(64 * 1024 * 1024);
+    expect(createMultipartUpload).toHaveBeenCalledWith(upload.key, expect.any(Object));
+    const part = await app.request(`http://localhost/panel-api/custom-games/upload/part?key=${upload.key}&uploadId=upload-1&partNumber=1600`, {
+      method: "POST", headers: { "content-length": "3" }, body: "abc",
+    }, env);
+    expect(part.status).toBe(200);
+    expect(await part.json()).toMatchObject({ partNumber: 1600 });
+    expect(uploadPart).toHaveBeenCalledWith(1600, expect.anything());
+
+    const tooManyParts = await app.request(`http://localhost/panel-api/custom-games/upload/part?key=${upload.key}&uploadId=upload-1&partNumber=1601`, {
+      method: "POST", headers: { "content-length": "3" }, body: "abc",
+    }, env);
+    expect(tooManyParts.status).toBe(400);
+    expect(uploadPart).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects archives larger than 100 GiB", async () => {
+    const app = new Hono<{ Bindings: AppBindings }>();
+    registerCustomGamesRoutes(app);
+    const createMultipartUpload = vi.fn();
+    const env = { CUSTOM_GAMES: { createMultipartUpload } } as unknown as AppBindings;
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/initiate", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ gameId: "00000000-0000-4000-8000-000000000000", filename: "game.zip",
+        packageType: "zip", sizeBytes: 100 * 1024 ** 3 + 1 }),
+    }, env);
+    expect(response.status).toBe(400);
+    expect(createMultipartUpload).not.toHaveBeenCalled();
+  });
+});
 
 describe("direct custom-game file upload", () => {
   it("uses one conditional R2 PUT normally and HEAD only when retrying", async () => {

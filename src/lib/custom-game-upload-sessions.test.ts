@@ -14,6 +14,7 @@ function harness(direct = false) {
   let counter = 0;
   const objects = new Map<string, { bytes: Uint8Array; etag: string; size: number }>();
   const multiparts = new Map<string, { key: string; parts: Map<number, Uint8Array> }>();
+  const completedParts: { partNumber: number; etag: string }[][] = [];
   const bucket = {
     put: vi.fn(async (key: string, value: string | Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
       const prior = objects.get(key);
@@ -44,8 +45,12 @@ function harness(direct = false) {
         upload.parts.set(partNumber, new Uint8Array(await new Response(stream).arrayBuffer()));
         return { partNumber, etag: `part-${partNumber}` };
       },
-      complete: async () => {
+      complete: async (parts: { partNumber: number; etag: string }[]) => {
+        completedParts.push(parts);
         const upload = multiparts.get(uploadId); if (!upload || upload.key !== key) throw Error("missing upload");
+        if (parts.some(part => !upload.parts.has(part.partNumber) || part.etag !== `part-${part.partNumber}`)) {
+          throw Error("completeMultipartUpload: One or more of the specified parts could not be found. (10025)");
+        }
         const bytes = new Uint8Array([...upload.parts.values()].flatMap(part => [...part]));
         objects.set(key, { bytes, etag: `complete-${++counter}`, size: bytes.length }); multiparts.delete(uploadId);
       },
@@ -65,7 +70,7 @@ function harness(direct = false) {
   async function session() {
     return (await request("sessions", { gameId, fingerprint: "a".repeat(64), planVersion: 2 })).body;
   }
-  return { app, env, request, session, bucket, multiparts, objects };
+  return { app, env, request, session, bucket, multiparts, objects, completedParts };
 }
 
 beforeEach(() => {
@@ -102,6 +107,28 @@ describe("persistent custom-game upload sessions", () => {
     expect(result.status).toBe(200);
     expect(result.body.etag).toBe("already-complete");
     expect(h.bucket.resumeMultipartUpload).not.toHaveBeenCalled();
+  });
+
+  it("normalizes quoted ETags returned by direct S3 multipart uploads before R2 Workers completion", async () => {
+    const h = harness(true); const session = await h.session(); const path = `sessions/${session.sessionId}/objects`;
+    const init = (await h.request(`${path}/initiate`, { clientId: "direct", filename: "a.bin", sizeBytes: 4 })).body;
+    h.multiparts.get(init.uploadId)!.parts.set(1, new TextEncoder().encode("test"));
+    const result = await h.request(`${path}/complete`, { clientId: "direct", sizeBytes: 4,
+      sha256: "b".repeat(64), parts: [{ partNumber: 1, etag: '"part-1"' }] });
+    expect(result.status).toBe(200);
+    expect(h.completedParts[0]).toEqual([{ partNumber: 1, etag: "part-1" }]);
+  });
+
+  it("returns a recoverable conflict instead of retryable 500 when an R2 part is actually missing", async () => {
+    const h = harness(); const session = await h.session(); const path = `sessions/${session.sessionId}/objects`;
+    const init = (await h.request(`${path}/initiate`, { clientId: "missing", filename: "a.bin", sizeBytes: 4 })).body;
+    const result = await h.request(`${path}/complete`, { clientId: "missing", sizeBytes: 4,
+      sha256: "b".repeat(64), parts: [{ partNumber: 1, etag: "part-1" }] });
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe("multipart_parts_reset");
+    expect(h.multiparts.has(init.uploadId)).toBe(false);
+    const resumed = await h.request(`sessions/${session.sessionId}`, undefined, "GET");
+    expect(resumed.body.objects[0].uploadId).not.toBe(init.uploadId);
   });
 
   it("isolates sessions by admin, validates resumed folder identity and signs only reserved objects", async () => {

@@ -2,15 +2,16 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { AppBindings, AppContext } from "../types";
 import { requireAdminSession } from "./admin-security";
-import { requireLauncherLicense } from "./launcher-auth";
+import { requireGoldLauncherLicense } from "./launcher-auth";
 import { beginGameUploadFinalization, completeGameMultipart, finishGameUploadFinalization,
   registerGameUploadSessionRoutes } from "./custom-game-upload-sessions";
 
 const PART_SIZE = 64 * 1024 * 1024;
-const MAX_ARCHIVE_SIZE = 30 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_SIZE = 100 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_PARTS = Math.ceil(MAX_ARCHIVE_SIZE / PART_SIZE);
 const MAX_GAME_SIZE = 200 * 1024 * 1024 * 1024;
 const MAX_GAME_FILE_SIZE = 30 * 1024 * 1024 * 1024;
-const MAX_GAME_FILES = 20000;
+const MAX_GAME_FILES = 100000;
 const MAX_GAME_BUNDLES = 2500;
 const MAX_NEW_BUNDLE_SIZE = 200 * 1024 * 1024;
 const MAX_BUNDLE_MEMBER_SIZE = 200 * 1024 * 1024;
@@ -340,7 +341,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       ? /\.zip$/i.test(String(body.filename || "")) && size <= MAX_ARCHIVE_SIZE
       : packageType === "folder" && size <= MAX_GAME_FILE_SIZE;
     if (!valid || !Number.isSafeInteger(size) || size < 1) {
-      fail(packageType === "zip" ? "Selecione um ZIP de até 30 GB." : "Arquivo do jogo inválido ou acima de 30 GB.");
+      fail(packageType === "zip" ? "Selecione um ZIP de até 100 GiB." : "Arquivo do jogo inválido ou acima de 30 GiB.");
     }
     const key = packageType === "zip" ? `${gameId}/archives/${crypto.randomUUID()}.zip` : `${gameId}/files/${crypto.randomUUID()}`;
     const upload = await c.env.CUSTOM_GAMES.createMultipartUpload(key, {
@@ -385,7 +386,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     const uploadId = String(c.req.query("uploadId") || "");
     const partNumber = Number(c.req.query("partNumber"));
     const contentLength = Number(c.req.header("content-length"));
-    if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 512 ||
+    if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_ARCHIVE_PARTS ||
         !Number.isInteger(contentLength) || contentLength < 1 || contentLength > PART_SIZE) fail("Parte de upload inválida.");
     if (!c.req.raw.body) fail("Parte vazia.");
     const upload = c.env.CUSTOM_GAMES.resumeMultipartUpload(key, uploadId);
@@ -553,7 +554,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.get("/api/custom-games", async c => {
-    await requireLauncherLicense(c);
+    await requireGoldLauncherLicense(c);
     const rows = await c.env.merlin_db.prepare("SELECT * FROM custom_games WHERE published=1 ORDER BY name COLLATE NOCASE")
       .all<GameRow>();
     return c.json({ success: true, games: rows.results.map(mapGame) });
@@ -583,7 +584,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.get("/api/custom-games/:id/manifest", async c => {
-    await requireLauncherLicense(c);
+    await requireGoldLauncherLicense(c);
     const game = await findGame(c, c.req.param("id"));
     if (!game || !game.published || (game.package_type || "zip") !== "folder") fail("Manifesto não encontrado.", 404);
     const manifest = await loadFolderManifest(c, game.archive_key);
@@ -598,7 +599,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.get("/api/custom-games/:id/files/:fileId", async c => {
-    await requireLauncherLicense(c);
+    await requireGoldLauncherLicense(c);
     const game = await findGame(c, c.req.param("id"));
     const fileId = c.req.param("fileId");
     if (!game || !game.published || (game.package_type || "zip") !== "folder" || !/^[0-9a-f-]{36}$/i.test(fileId)) {
@@ -626,7 +627,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
   });
 
   app.get("/api/custom-games/:id/archive", async c => {
-    await requireLauncherLicense(c);
+    await requireGoldLauncherLicense(c);
     const game = await findGame(c, c.req.param("id"));
     if (!game || !game.published || (game.package_type || "zip") !== "zip") fail("Jogo não encontrado.", 404);
     const match = /^bytes=(\d+)-(\d+)$/.exec(c.req.header("range") || "");

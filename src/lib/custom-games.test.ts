@@ -10,11 +10,13 @@ describe("custom game install contracts", () => {
     expect(belongsToGame(`${other}/archives/${id}.zip`, id)).toBe(false);
     expect(belongsToGame(`archives/${other}.zip`, id)).toBe(true);
   });
-  it("accepts up to 20,000 folder files and rejects larger manifests", () => {
+  it("accepts up to 100,000 folder files and rejects larger manifests", () => {
     expect(validFolderFileCount([])).toBe(false);
     expect(validFolderFileCount(new Array(11_000))).toBe(true);
     expect(validFolderFileCount(new Array(20_000))).toBe(true);
-    expect(validFolderFileCount(new Array(20_001))).toBe(false);
+    expect(validFolderFileCount(new Array(30_000))).toBe(true);
+    expect(validFolderFileCount(new Array(100_000))).toBe(true);
+    expect(validFolderFileCount(new Array(100_001))).toBe(false);
   });
   it("keeps a recognizable fixed Games folder name without Windows separators", () => {
     expect(validateInstallName("The Adventures of Elliot")).toBe("The Adventures of Elliot");

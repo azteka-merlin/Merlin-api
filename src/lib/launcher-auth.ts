@@ -1,5 +1,6 @@
 import { HTTPException } from "hono/http-exception";
 import { verifyAccessToken } from "./auth";
+import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import type { AppContext } from "../types";
 
 export type LauncherLicense = {
@@ -8,6 +9,7 @@ export type LauncherLicense = {
 	name: string;
 	hwid: string;
 	expiresAt: string;
+	planTier: PlanTier;
 };
 
 type LicenseLookup = {
@@ -17,6 +19,7 @@ type LicenseLookup = {
 	hwid: string | null;
 	expires_at: string;
 	status: "active" | "revoked" | "expired";
+	plan_tier: string | null;
 };
 
 export function parseBearerToken(request: Request): string | null {
@@ -45,7 +48,7 @@ export async function requireLauncherLicense(c: AppContext): Promise<LauncherLic
 	const license = await c.env.merlin_db
 		.prepare(
 			`
-				SELECT id, license_key, name, hwid, expires_at, status
+				SELECT id, license_key, name, hwid, expires_at, status, plan_tier
 				FROM licenses
 				WHERE id = ?
 				LIMIT 1
@@ -74,7 +77,16 @@ export async function requireLauncherLicense(c: AppContext): Promise<LauncherLic
 		name: license.name,
 		hwid: license.hwid,
 		expiresAt: license.expires_at,
+		planTier: normalizeStoredPlanTier(license.plan_tier, "ouro"),
 	};
+}
+
+export async function requireGoldLauncherLicense(c: AppContext): Promise<LauncherLicense> {
+	const license = await requireLauncherLicense(c);
+	if (license.planTier !== "ouro") {
+		throw new HTTPException(403, { message: "This feature requires a Gold plan" });
+	}
+	return license;
 }
 
 // Read-only launcher/account actions may identify an expired license, but every
@@ -90,7 +102,7 @@ export async function requireLauncherSearchLicense(c: AppContext): Promise<Launc
 	}
 
 	const license = await c.env.merlin_db
-		.prepare("SELECT id, license_key, name, hwid, expires_at, status FROM licenses WHERE id = ? LIMIT 1")
+		.prepare("SELECT id, license_key, name, hwid, expires_at, status, plan_tier FROM licenses WHERE id = ? LIMIT 1")
 		.bind(payload.sub)
 		.first<LicenseLookup>();
 	if (!license) throw new HTTPException(401, { message: "License not found" });
@@ -101,5 +113,6 @@ export async function requireLauncherSearchLicense(c: AppContext): Promise<Launc
 		throw new HTTPException(401, { message: "HWID mismatch" });
 	}
 
-	return { id: license.id, licenseKey: license.license_key, name: license.name, hwid: license.hwid, expiresAt: license.expires_at };
+	return { id: license.id, licenseKey: license.license_key, name: license.name, hwid: license.hwid,
+		expiresAt: license.expires_at, planTier: normalizeStoredPlanTier(license.plan_tier, "ouro") };
 }
