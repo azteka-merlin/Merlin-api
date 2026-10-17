@@ -124,6 +124,8 @@ import {
 } from "./lib/special-correction";
 import { type AppBindings, type AppContext, CreateLicenseRequest, OverrideUpsertRequest, RenewLicenseRequest, RevokeLicenseRequest, UpdateBronzePremiumActivationCycleRequest } from "./types";
 import { listAdminAuditLogs } from "./lib/admin-audit-service";
+import { getAdminAlert, listAdminAlerts, recordSteamConnectionFailure, updateAdminAlertStatus } from "./lib/admin-alerts";
+import { adminPushConfig, removeAdminPushSubscription, saveAdminPushSubscription, validateAdminPushSubscription } from "./lib/admin-push";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
 import {
   assertPremiumDownloadAccess,
@@ -268,7 +270,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games"] as const;
+const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -766,6 +768,19 @@ async function writePremiumActivityLog(
     });
   } catch (error) {
     console.warn("[premium-activity] failed to write user activity log:", getErrorMessage(error));
+  }
+}
+
+function maybeRecordSteamAlert(
+  c: AppContext,
+  input: { licenseId: number; appId: string; gameName: string | null; worker: Awaited<ReturnType<typeof callMerlinWorker>>; source: string },
+) {
+  try {
+    c.executionCtx.waitUntil(recordSteamConnectionFailure(c, input).catch((error) => {
+      console.error("[admin-alerts] could not record Steam failure", getErrorMessage(error));
+    }));
+  } catch (error) {
+    console.error("[admin-alerts] could not record Steam failure", getErrorMessage(error));
   }
 }
 
@@ -1352,6 +1367,8 @@ app.get("/checkout", (c) => {
 });
 app.get("/download-assets/assets/app.js", (c) => serveNoStoreAsset(c, "/download-assets/assets/app.js"));
 app.get("/download-assets/assets/app.css", (c) => serveNoStoreAsset(c, "/download-assets/assets/app.css"));
+app.get("/admin-alerts/sw.js", (c) => serveNoStoreAsset(c, "/admin-alerts/sw.js"));
+app.get("/admin-alerts/manifest.webmanifest", (c) => serveNoStoreAsset(c, "/admin-alerts/manifest.webmanifest"));
 
 for (const route of pageRoutes) {
   app.get(route, handleProtectedPage);
@@ -1394,6 +1411,67 @@ app.post("/panel-api/auth/logout", async (c) => {
   }
 
   await logoutAdminSession(c);
+  return c.json({ success: true }, 200);
+});
+
+app.get("/panel-api/alerts", async (c) => {
+  await requireAdminSession(c);
+  c.header("Cache-Control", "no-store");
+  return c.json(await listAdminAlerts(c, {
+    status: c.req.query("status"),
+    type: c.req.query("type"),
+    limit: Number(c.req.query("limit") || "50"),
+    offset: Number(c.req.query("offset") || "0"),
+  }), 200);
+});
+
+app.get("/panel-api/alerts/push-config", async (c) => {
+  await requireAdminSession(c);
+  c.header("Cache-Control", "no-store");
+  return c.json(adminPushConfig(c.env), 200);
+});
+
+app.post("/panel-api/alerts/push-subscriptions", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const subscription = validateAdminPushSubscription(await c.req.json());
+  await saveAdminPushSubscription(c, session.session.admin_user_id, subscription);
+  return c.json({ success: true }, 200);
+});
+
+app.delete("/panel-api/alerts/push-subscriptions", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = await c.req.json() as { endpoint?: unknown };
+  if (typeof body?.endpoint !== "string" || body.endpoint.length > 2048) {
+    throw new HTTPException(400, { message: "Endpoint push inválido." });
+  }
+  await removeAdminPushSubscription(c, session.session.admin_user_id, body.endpoint);
+  return c.json({ success: true }, 200);
+});
+
+app.get("/panel-api/alerts/:id", async (c) => {
+  await requireAdminSession(c);
+  const alert = await getAdminAlert(c, c.req.param("id"));
+  if (!alert) throw new HTTPException(404, { message: "Alerta não encontrado." });
+  c.header("Cache-Control", "no-store");
+  return c.json({ alert }, 200);
+});
+
+app.post("/panel-api/alerts/:id/status", async (c) => {
+  const session = await requireAdminSession(c, { mutate: true });
+  const body = await c.req.json() as { status?: unknown };
+  if (body?.status !== "acknowledged" && body?.status !== "resolved") {
+    throw new HTTPException(400, { message: "Status de alerta inválido." });
+  }
+  const changed = await updateAdminAlertStatus(c, c.req.param("id"), body.status, session.session.admin_user_id);
+  if (!changed) throw new HTTPException(409, { message: "O alerta já mudou de status. Atualize a lista." });
+  await writeAdminAuditLog(c, {
+    adminUserId: session.session.admin_user_id,
+    action: `admin_alert_${body.status}`,
+    entityType: "admin_alert",
+    entityId: c.req.param("id"),
+    ipHash: session.session.ip_hash,
+    userAgentHash: session.session.user_agent_hash,
+  });
   return c.json({ success: true }, 200);
 });
 
@@ -3505,6 +3583,13 @@ app.post("/api/premium/activate", async (c) => {
           worker: getPremiumWorkerLogPayload(worker),
         },
       });
+      maybeRecordSteamAlert(c, {
+        licenseId: license.id,
+        appId: body.appId,
+        gameName: reservation.game.name,
+        worker,
+        source: "premium_activation",
+      });
 
       return c.json({
         success: false,
@@ -3640,6 +3725,13 @@ app.post("/api/premium/activate-third-party", async (c) => {
         reservationId,
         worker: getPremiumWorkerLogPayload(worker),
       },
+    });
+    maybeRecordSteamAlert(c, {
+      licenseId: license.id,
+      appId: body.appId,
+      gameName: game.name,
+      worker,
+      source: "premium_third_party_activation",
     });
 
     return c.json({

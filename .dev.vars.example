@@ -7,3 +7,6 @@ HUBCAP_TOKEN=api_key_here_change_me
 SESSION_HASH_SECRET=merlin-local-session-hash-secret-change-me
 RESEND_API_KEY=re_xxxxxxxxx
 EMAIL_FROM=Merlin <onboarding@resend.dev>
+ADMIN_PUSH_VAPID_PUBLIC_KEY=
+ADMIN_PUSH_VAPID_PRIVATE_KEY=
+ADMIN_PUSH_VAPID_SUBJECT=

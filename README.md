@@ -24,6 +24,7 @@ Do not document credentials, tokens, personal paths, private emails, infrastruct
 - `POST /panel-api/auth/login`: admin login.
 - `GET /panel-api/auth/session`: admin session lookup.
 - `POST /panel-api/auth/logout`: admin logout.
+- `GET /panel-api/alerts`: list operational incidents (Admin only; see `docs/ADMIN_ALERTS.md`).
 - `GET /panel-api/licenses`: list licenses.
 - `POST /panel-api/licenses`: create license.
 - `GET /panel-api/licenses/:id`: read license details.

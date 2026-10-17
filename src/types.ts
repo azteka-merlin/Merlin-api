@@ -27,6 +27,9 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   ADMIN_API_TOKEN?: string;
   INTERNAL_ADMIN_AUTH_SECRET?: string;
   MERLIN_WORKER_TOKEN?: string;
+  ADMIN_PUSH_VAPID_PUBLIC_KEY?: string;
+  ADMIN_PUSH_VAPID_PRIVATE_KEY?: string;
+  ADMIN_PUSH_VAPID_SUBJECT?: string;
   LICENSE_FILE_AES_KEY_BASE64?: string;
   STEAM_ACCOUNT_ID?: string;
   CUSTOM_GAMES_R2_ACCOUNT_ID?: string;
