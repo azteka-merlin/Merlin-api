@@ -7,6 +7,17 @@ O launcher 2.3.0 foi publicado no GitHub e no canal de atualização da API.
 A execução dos ZIPs usa Cloudflare Queues; Deflate64 também é suportado no indexador
 e na revisão 2.3.1 do launcher.
 
+Em 20/10/2026 às 09:18 BRT, o canal de atualização da API já informa **2.3.1**.
+O instalador de produção tem 112.197.580 bytes e SHA-256
+`69abce19029d0a55a3bb959d84f62edb466efe928152d42343bcdcfade3cab59`,
+conferido após download pela própria API. As versões anteriores foram arquivadas
+no R2 para retorno operacional.
+
+A fila real já concluiu os quatro jogos por pasta e o ZIP Deflate64 de
+Mortal Kombat: Shaolin Monks, com 16 arquivos e 3.960.857.278 bytes descomprimidos.
+Os outros cinco ZIPs continuam na fila/processamento, sem falhas na consulta desse
+horário. O painel reflete o estado atual; esses números são um registro da ativação.
+
 ## Regra de publicação
 
 O administrador envia **o pacote completo da nova versão**, incluindo `game` nos
@@ -217,8 +228,8 @@ Resultados finais:
 | API — Vitest, incluindo integrações, codec WASM, Workerd e migrações SQLite | 381 testes passaram |
 | Runner — Node | 22 testes passaram |
 | Admin — Node | 34 testes passaram |
-| Launcher — suíte completa Node, incluindo Deflate64 | 286 testes passaram |
-| Total das suítes | **723 testes passaram** |
+| Launcher — suíte completa Node, incluindo Deflate64 | 287 testes passaram |
+| Total das suítes | **724 testes passaram** |
 | API typecheck | Passou |
 | Admin build | Passou; mantém aviso de bundle acima de 500 kB |
 | Diff whitespace nos três projetos | Passou |
@@ -240,7 +251,9 @@ O pipeline do launcher passou a executar a suíte antes de compilar e publicar.
 As falhas iniciais do runner Windows/Node 22 foram corrigidas nas fixtures:
 normalização do TEMP por realpath e uma conexão simulada mantida ativa durante
 o teste de timeout. A execução posterior concluiu os 279 testes da release 2.3.0
-e publicou o instalador. Os sete testes adicionais cobrem o codec Deflate64 da 2.3.1.
+e publicou o instalador. Os oito testes adicionais cobrem o codec Deflate64 da 2.3.1,
+inclusive quatro streams simultâneos. A suíte de 287 passou tanto no Node 22 quanto
+no 24, e o codec empacotado no app.asar foi validado no Electron 33/Node 20 real.
 
 Referências técnicas consultadas: [R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/),
 [D1](https://developers.cloudflare.com/d1/worker-api/d1-database/),
