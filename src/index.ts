@@ -107,7 +107,9 @@ import {
   reconcileStripeLicense,
 } from "./lib/stripe-webhook";
 import { requireLauncherLicense, requireLauncherSearchLicense } from "./lib/launcher-auth";
-import { registerCustomGamesRoutes } from "./lib/custom-games";
+import { registerCustomGamesRoutes, cleanupCustomGamePackages, consumeCustomGameIndexQueue } from "./lib/custom-games";
+import { dispatchPendingIntegrityQueue } from "./lib/custom-game-integrity";
+import type { IntegrityQueueMessage } from "./lib/custom-game-cloudflare-indexer";
 import {
   getCloudGame,
   handleCloudGateway,
@@ -270,7 +272,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games"] as const;
+const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games", "/custom-game-indexing"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -4319,8 +4321,17 @@ app.notFound((c) => {
 
 export default {
   fetch: app.fetch,
+  async queue(batch: MessageBatch<IntegrityQueueMessage>, env: AppBindings, _ctx: ExecutionContext) {
+    await consumeCustomGameIndexQueue(batch, env);
+  },
   async scheduled(controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
     const scheduledAt = new Date(controller.scheduledTime);
+    _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {
+      console.error("[CustomGamesIntegrity] queue-dispatch-failed");
+    }));
+    if (scheduledAt.getUTCMinutes() === 0) _ctx.waitUntil(cleanupCustomGamePackages(env).catch(() => {
+      console.error("[CustomGamesVersions] cleanup-failed");
+    }));
     if (scheduledAt.getUTCMinutes() !== 0) {
       await Promise.all([runCatalogEnrichment(env), runCatalogAvailabilitySync(env)]);
       return;

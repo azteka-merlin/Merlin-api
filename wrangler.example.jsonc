@@ -21,7 +21,8 @@
 		"enabled": true
 	},
 	"limits": {
-		"subrequests": 25000
+		"subrequests": 25000,
+		"cpu_ms": 300000
 	},
 	"upload_source_maps": true,
 	"keep_vars": true,
@@ -102,8 +103,27 @@
 		{
 			"binding": "MERLIN_ACTIVATIONS",
 			"bucket_name": "your-activations-bucket"
+		},
+		{
+			"binding": "CUSTOM_GAMES",
+			"bucket_name": "your-custom-games-bucket"
 		}
 	],
+	"queues": {
+		"producers": [
+			{ "binding": "CUSTOM_GAME_INDEX_QUEUE", "queue": "merlin-game-integrity" }
+		],
+		"consumers": [
+			{
+				"queue": "merlin-game-integrity",
+				"max_batch_size": 1,
+				"max_batch_timeout": 1,
+				"max_concurrency": 2,
+				"max_retries": 3,
+				"dead_letter_queue": "merlin-game-integrity-dead"
+			}
+		]
+	},
 	/**
 	 * Optional.
 	 *
@@ -140,7 +160,23 @@
 		"staging": {
 			"name": "your-merlin-api-worker-stage",
 			"limits": {
-				"subrequests": 25000
+				"subrequests": 25000,
+				"cpu_ms": 300000
+			},
+			"queues": {
+				"producers": [
+					{ "binding": "CUSTOM_GAME_INDEX_QUEUE", "queue": "merlin-game-integrity-staging" }
+				],
+				"consumers": [
+					{
+						"queue": "merlin-game-integrity-staging",
+						"max_batch_size": 1,
+						"max_batch_timeout": 1,
+						"max_concurrency": 2,
+						"max_retries": 3,
+						"dead_letter_queue": "merlin-game-integrity-staging-dead"
+					}
+				]
 			},
 			"vars": {
 				"ENVIRONMENT": "staging",
@@ -217,6 +253,10 @@
 				{
 					"binding": "MERLIN_ACTIVATIONS",
 					"bucket_name": "your-staging-activations-bucket"
+				},
+				{
+					"binding": "CUSTOM_GAMES",
+					"bucket_name": "your-staging-custom-games-bucket"
 				}
 			]
 			/**

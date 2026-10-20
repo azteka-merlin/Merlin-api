@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { belongsToGame, readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256 } from "./custom-games";
+import { belongsToGame, readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256, type GameRow } from "./custom-games";
 import type { AppContext } from "../types";
 
 describe("custom game install contracts", () => {
@@ -69,10 +69,17 @@ describe("custom game install contracts", () => {
     const withPackage = { req: { formData: async () => missingPackage }, env: {
       CUSTOM_GAMES: { head: async () => ({ size: 123 }) },
     } } as unknown as AppContext;
-    await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
+    // Existing unscoped legacy packages remain editable in their own game.
+    await expect(readGameForm(withPackage, id, { archive_key: String(missingPackage.get("archiveKey")), image_key: "" } as GameRow))
+      .rejects.toThrow("Selecione uma imagem");
     missingPackage.set("archiveKey", `${id}/archives/00000000-0000-4000-8000-000000000002.zip`);
     await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
     missingPackage.set("archiveKey", "00000000-0000-4000-8000-000000000002/archives/00000000-0000-4000-8000-000000000002.zip");
     await expect(readGameForm(withPackage, id)).rejects.toThrow("pertence a outro jogo");
+  });
+  it("rejects attaching an unowned legacy package to a different game", async () => {
+    const form = new FormData(); form.set("archiveKey", "archives/00000000-0000-4000-8000-000000000002.zip");
+    const c = { req: { formData: async () => form }, env: { merlin_db: { prepare: () => ({ bind: () => ({ first: async () => null }) }) } } } as unknown as AppContext;
+    await expect(readGameForm(c, "00000000-0000-4000-8000-000000000001")).rejects.toThrow("pacote legado não pertence");
   });
 });

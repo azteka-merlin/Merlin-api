@@ -8,7 +8,7 @@
         "dev": "wrangler dev",
         "start": "wrangler dev",
         "typecheck": "tsc --noEmit",
-        "test": "vitest run",
+        "test": "vitest run && node --test scripts/custom-game-indexer.test.mjs",
         "types": "wrangler types",
         "types:stage": "wrangler types --env staging",
         "cf-typegen": "wrangler types",
@@ -17,6 +17,8 @@
         "d1:migrate:remote": "node scripts/d1-migrate.mjs production",
         "d1:migrate:stage": "node scripts/d1-migrate.mjs staging",
         "catalog:seed-denuvo": "node scripts/import-denuvo-seed.mjs",
+        "custom-games:indexer": "node scripts/custom-game-indexer.mjs",
+        "test:custom-games:indexer": "node --test scripts/custom-game-indexer.test.mjs",
         "deploy:panel": "npm run build:panel && npm run types && npm run deploy",
         "deploy-stage:panel": "npm run build:panel && npm run deploy-stage"
     },
@@ -25,6 +27,8 @@
         "chanfana": "^3.3.0",
         "hono": "^4.12.12",
         "web-push": "^3.6.7",
+        "yauzl": "^3.4.0",
+        "zlib-streams": "1.4.0",
         "zod": "^4.3.6"
     },
     "devDependencies": {

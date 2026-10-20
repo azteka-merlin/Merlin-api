@@ -198,7 +198,7 @@ describe("hybrid folder manifest", () => {
   });
 });
 
-describe("legacy folder cleanup", () => {
+describe("discarding unused folder uploads", () => {
   it("deletes thousands of R2 objects in batches of at most 1,000", async () => {
     const gameId = "00000000-0000-4000-8000-000000000000";
     const manifestKey = `${gameId}/manifests/00000000-0000-4000-8000-000000000003.json`;
@@ -212,10 +212,13 @@ describe("legacy folder cleanup", () => {
       get: vi.fn(async () => ({ json: async () => ({ files, bundles: [] }) })),
       delete: vi.fn(async (keys: string | string[]) => { deleted.push(keys); }),
     }, merlin_db: { prepare: vi.fn(() => ({ bind: () => ({
-      first: async () => ({ id: gameId, archive_key: manifestKey, package_type: "folder", image_key: "" }),
+      first: async () => null,
+      all: async () => ({ results: [] }),
       run: async () => ({}),
     }) })) } } as unknown as AppBindings;
-    const response = await app.request(`http://localhost/panel-api/custom-games/${gameId}`, { method: "DELETE" }, env);
+    const response = await app.request("http://localhost/panel-api/custom-games/upload/discard", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: manifestKey }),
+    }, env);
     expect(response.status).toBe(200);
     expect(deleted.filter(Array.isArray).map(keys => keys.length)).toEqual([1000, 1000, 1]);
     expect(deleted.at(-1)).toBe(manifestKey);
