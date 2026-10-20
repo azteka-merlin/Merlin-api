@@ -5,18 +5,18 @@ import type { AppBindings } from "../types";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("custom game update metadata", () => {
-  it("keeps legacy game edits compatible and protects game for ports", () => {
+  it("keeps legacy game edits compatible without making game an unconditional protected path", () => {
     expect(readCustomGameMetadata(new FormData(), null, validateGameFilePath)).toEqual({
       origin: "native", repositoryUrl: "", discordUrl: "", protectedPaths: [], versionLabel: "", trackedReleaseTag: "",
     });
     const form = new FormData(); form.set("origin", "port"); form.set("protectedPaths", '["user","USER"]');
-    expect(readCustomGameMetadata(form, null, validateGameFilePath).protectedPaths).toEqual(["game", "USER"]);
-    expect(metadataFromRow({ origin: "port", protected_paths_json: "[]" }).protectedPaths).toEqual(["game"]);
+    expect(readCustomGameMetadata(form, null, validateGameFilePath).protectedPaths).toEqual(["USER"]);
+    expect(metadataFromRow({ origin: "port", protected_paths_json: "[]" }).protectedPaths).toEqual([]);
   });
   it("preserves metadata on old admin form submissions", () => {
     expect(readCustomGameMetadata(new FormData(), { origin: "port", repository_url: "https://github.com/owner/project",
       discord_url: "https://discord.gg/community", protected_paths_json: '["game","user"]', version_label: "1", tracked_release_tag: "v1" },
-    validateGameFilePath)).toMatchObject({ origin: "port", protectedPaths: ["game", "user"], trackedReleaseTag: "v1" });
+    validateGameFilePath)).toMatchObject({ origin: "port", protectedPaths: ["user"], trackedReleaseTag: "v1" });
   });
   it("rejects invalid origins, traversal, unsupported links and credential URLs", () => {
     const form = new FormData(); form.set("origin", "other");

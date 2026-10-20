@@ -44,7 +44,7 @@ export function metadataFromRow(row?: MetadataRow | null): CustomGameMetadata {
   try { const paths = JSON.parse(row?.protected_paths_json || "[]"); if (Array.isArray(paths)) protectedPaths = paths; } catch { /* legacy */ }
   const origin = row?.origin === "port" ? "port" : "native";
   return { origin, repositoryUrl: row?.repository_url || "", discordUrl: row?.discord_url || "",
-    protectedPaths: origin === "port" ? [...new Set(["game", ...protectedPaths])] : protectedPaths,
+    protectedPaths: origin === "port" ? protectedPaths.filter(path => typeof path === "string" && path.toLowerCase() !== "game") : protectedPaths,
     versionLabel: row?.version_label || "", trackedReleaseTag: row?.tracked_release_tag || "" };
 }
 export function readCustomGameMetadata(form: FormData, prior: MetadataRow | null | undefined,
@@ -60,8 +60,7 @@ export function readCustomGameMetadata(form: FormData, prior: MetadataRow | null
     fail("Informe até 64 caminhos protegidos relativos ao jogo.");
   const protectedPaths = [...new Map(paths.map(path => {
     const normalized = validatePath(path); return [normalized.toLowerCase(), normalized];
-  })).values()];
-  if (origin === "port" && !protectedPaths.some(path => path.toLowerCase() === "game")) protectedPaths.unshift("game");
+  })).values()].filter(path => origin !== "port" || path.toLowerCase() !== "game");
   return { origin, protectedPaths,
     repositoryUrl: origin === "port" ? normalizeRepositoryUrl(form.has("repositoryUrl") ? form.get("repositoryUrl") : previous.repositoryUrl) : "",
     discordUrl: origin === "port" ? normalizeDiscordUrl(form.has("discordUrl") ? form.get("discordUrl") : previous.discordUrl) : "",

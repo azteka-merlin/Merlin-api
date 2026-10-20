@@ -94,7 +94,7 @@ describe("publishing complete game packages safely", () => {
     expect(h.bucket.delete).not.toHaveBeenCalled();
     const modern = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
     const legacy = await (await h.app.request("http://localhost/api/custom-games", {}, h.env)).json() as any;
-    expect(modern.games[0]).toMatchObject({ archiveKey: newKey, origin: "port", protectedPaths: ["game"], versionLabel: "2" });
+    expect(modern.games[0]).toMatchObject({ archiveKey: newKey, origin: "port", protectedPaths: [], versionLabel: "2" });
     expect(legacy.games[0].archiveKey).toBe(oldKey);
     expect(await (await h.app.request(`http://localhost/api/custom-games/${id}/archive`, { headers: { range: "bytes=4-7" } }, h.env)).text()).toBe("BBBB");
   });
@@ -108,7 +108,7 @@ describe("publishing complete game packages safely", () => {
   it("metadata-only edits update the active snapshot without changing content version", async () => {
     const h = harness(); await h.session(); expect((await h.publish(oldKey)).status).toBe(200);
     const result = h.db.prepare("SELECT origin,protected_paths_json,executable_path,status FROM custom_game_versions WHERE game_id=? AND archive_key=?").get(id, oldKey);
-    expect(result).toMatchObject({ origin: "port", protected_paths_json: '["game"]', executable_path: "new.exe", status: "active" });
+    expect(result).toMatchObject({ origin: "port", protected_paths_json: '[]', executable_path: "new.exe", status: "active" });
   });
   it("concurrent publications retire every superseded version", async () => {
     const h = harness(); await h.session();

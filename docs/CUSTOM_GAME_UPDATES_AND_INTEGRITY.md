@@ -20,13 +20,15 @@ horário. O painel reflete o estado atual; esses números são um registro da at
 
 ## Regra de publicação
 
-O administrador envia **o pacote completo da nova versão**, incluindo `game` nos
-ports, conforme a decisão confirmada nesta conversa. Pode usar ZIP ou upload
-de pasta. O cliente calcula a diferença; não é necessário separar um patch.
+O administrador envia um pacote ZIP ou pasta para a nova versão. Em ports, se o
+pacote trouxer `game`, seus arquivos catalogados também participam da atualização;
+se não trouxer, a instalação existente de `game` permanece intacta. O cliente
+calcula a diferença; não é necessário separar um patch.
 
 O cadastro agora informa origem (`native` ou `port`), versão de exibição e caminhos
 preservados. Ports podem informar repositório GitHub, convite Discord e a tag da
-release utilizada. A pasta `game` é sempre preservada em atualizações de ports.
+release utilizada. Saves e outros caminhos preservados continuam protegidos;
+arquivos extras fora dos manifestos não são apagados.
 Cadastros antigos começam como nativos; a origem pode ser corrigida no painel.
 
 Salvar um pacote novo registra sua identidade imutável e publica a referência
