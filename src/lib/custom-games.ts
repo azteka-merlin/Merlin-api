@@ -8,7 +8,7 @@ import { beginGameUploadFinalization, completeGameMultipart, finishGameUploadFin
 import { metadataFromRow, readCustomGameMetadata, portReleaseStatus, type MetadataRow } from "./custom-game-metadata";
 import { ensureGameVersion, gameVersionInsertStatement, getLegacyGamePackage, resolveGamePackage,
   registerGameVersionRoutes, findGameVersion, cleanupRetiredGameVersions } from "./custom-game-versions";
-import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, integrityJobKey } from "./custom-game-integrity";
+import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, integrityManifestKey, integrityJobKey, integrityJobId, readJob, writeJob } from "./custom-game-integrity";
 import { consumeCloudflareIntegrityBatch, type IntegrityQueueMessage } from "./custom-game-cloudflare-indexer";
 import { folderManifestObjectKeys, putImmutableFolderManifest, referencedGameFileKeys } from "./custom-game-package-lifecycle";
 
@@ -49,6 +49,8 @@ export type GameRow = MetadataRow & {
   deleted_at?: string | null;
   storage_revision?: number;
   published: number; created_at: string; updated_at: string;
+  pending_archive_key?: string | null; pending_source_etag?: string | null;
+  pending_data_json?: string | null; pending_base_archive_key?: string | null; pending_created_at?: string | null;
 };
 
 type FolderFile = { id: string; path: string; key: string; sizeBytes: number; etag?: string; sha256?: string };
@@ -275,6 +277,7 @@ async function publishBatch(c: AppContext, statements: D1PreparedStatement[]) {
     if (message.includes("custom_game_deleted")) fail("Este jogo foi removido enquanto você editava.", 404);
     if (message.includes("custom_game_version_unavailable")) fail("Este pacote já entrou na limpeza. Envie a versão novamente.", 409);
     if (message.includes("custom_game_storage_changed")) fail("O armazenamento deste jogo mudou durante a publicação. Atualize a página e tente novamente.", 409);
+    if (message.includes("custom_game_pending_changed")) fail("O ZIP pendente mudou ou já foi publicado. Atualize a página e tente novamente.", 409);
     throw error;
   }
 }
@@ -298,7 +301,11 @@ const integrityDependencies = {
     const game = await findGame(c, gameId);
     const version = await findGameVersion(c.env, gameId, archiveKey);
     if (game?.archive_key === archiveKey && !game.deleted_at && !version) return true;
-    return Boolean(version && ["active", "retired"].includes(version.status));
+    if (version) return ["active", "retired"].includes(version.status);
+    // Newly uploaded ZIPs are indexed before they become a published version.
+    // The key is scoped to the game and the index job pins its R2 ETag.
+    if (!ARCHIVE_KEY_PATTERN.test(archiveKey) || !archiveKey.startsWith(`${gameId}/`) || game?.deleted_at) return false;
+    return Boolean(await c.env.CUSTOM_GAMES.head(archiveKey));
   },
 };
 
@@ -329,7 +336,8 @@ function readNumber(value: string | File | null, fallback: number, min: number, 
   return number;
 }
 
-export async function readGameForm(c: AppContext, id: string, prior?: GameRow | null) {
+export async function readGameForm(c: AppContext, id: string, prior?: GameRow | null,
+  { allowPendingZip = false }: { allowPendingZip?: boolean } = {}) {
   const form = await c.req.formData();
   const metadata = readCustomGameMetadata(form, prior, validateGameFilePath);
   const published = form.get("published") === "true";
@@ -368,6 +376,15 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
       const archive = await c.env.CUSTOM_GAMES.head(archiveKey);
       if (!archive || !archive.size || archive.size > MAX_ARCHIVE_SIZE) fail("Envie um ZIP válido antes de salvar.");
       archiveSize = archive.size;
+      // A public ZIP must already have its per-file hashes and byte offsets.
+      // Keep the currently published package untouched while a replacement is indexed.
+      if (published && !allowPendingZip && (!prior?.published || prior.archive_key !== archiveKey || prior.package_type !== "zip")) {
+        const manifest = await getIntegrityManifest(c, { id, archive_key: archiveKey,
+          archive_size: archiveSize, package_type: "zip" }, integrityDependencies);
+        if (!manifest || manifest.sourceEtag !== archive.etag || manifest.sourceSize !== archive.size) {
+          fail("O ZIP ainda está sendo indexado. Aguarde a conclusão antes de publicar.", 409);
+        }
+      }
     } else {
       const manifest = await loadFolderManifest(c, archiveKey);
       archiveSize = manifest.totalSizeBytes;
@@ -403,6 +420,106 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
   };
 }
 
+type GameFormData = Awaited<ReturnType<typeof readGameForm>>;
+
+function pendingGameData(row: GameRow): GameFormData | null {
+  if (!row.pending_archive_key || !row.pending_data_json) return null;
+  try {
+    const data = JSON.parse(row.pending_data_json) as GameFormData;
+    return data?.archiveKey === row.pending_archive_key && data.packageType === "zip" ? data : null;
+  } catch { return null; }
+}
+
+async function pendingGameStatus(c: AppContext, row: GameRow) {
+  const data = pendingGameData(row);
+  if (!data) return null;
+  const [source, sidecar, job] = await Promise.all([
+    c.env.CUSTOM_GAMES.head(data.archiveKey),
+    c.env.CUSTOM_GAMES.head(await integrityManifestKey(row.id, data.archiveKey)),
+    readJob(c.env, await integrityJobId(row.id, data.archiveKey)),
+  ]);
+  const sourceMatches = Boolean(source && source.etag === row.pending_source_etag && source.size === data.archiveSize);
+  const ready = sourceMatches && sidecar?.customMetadata?.sourceEtag === row.pending_source_etag;
+  const indexStatus = ready ? "ready" : !sourceMatches ? "failed"
+    : job?.job.status === "failed" || job?.job.status === "cancelled" ? "failed"
+      : job?.job.status === "processing" ? "processing" : "queued";
+  let notes: Record<string, string> = {};
+  try { notes = JSON.parse(data.notes || "{}"); } catch { /* Keep the form editable. */ }
+  return { archiveKey: data.archiveKey, archiveSize: data.archiveSize, name: data.name, adminNote: data.note,
+    adminNotes: notes, executablePath: data.executablePath, imageKey: data.imageKey,
+    imageVersion: data.imageKey, imagePositionX: data.imagePositionX, imagePositionY: data.imagePositionY,
+    imageZoom: data.imageZoom, origin: data.origin, repositoryUrl: data.repositoryUrl,
+    discordUrl: data.discordUrl, protectedPaths: data.protectedPaths, versionLabel: data.versionLabel,
+    trackedReleaseTag: data.trackedReleaseTag, publishRequested: Boolean(data.published),
+    indexStatus, error: indexStatus === "failed" ? job?.job.error || "O ZIP enviado não está disponível." : null,
+    processedBytes: job?.job.processedBytes || 0, totalBytes: job?.job.totalBytes || data.archiveSize,
+    processedFiles: job?.job.processedFiles || 0, totalFiles: job?.job.totalFiles || 0,
+    createdAt: row.pending_created_at };
+}
+
+async function applyGameUpdate(c: AppContext, prior: GameRow, data: GameFormData, clearPending = false) {
+  const changed = prior.archive_key !== data.archiveKey || (prior.package_type || "zip") !== data.packageType;
+  const pendingReset = clearPending ? ",pending_archive_key=NULL,pending_source_etag=?,pending_data_json=NULL,pending_base_archive_key=NULL,pending_created_at=NULL" : "";
+  const statements = [
+    ...(!prior.archive_key.startsWith("draft/") ? [gameVersionInsertStatement(c.env, mapGame(prior))] : []),
+    ...(!data.archiveKey.startsWith("draft/") ? [gameVersionInsertStatement(c.env, packageSnapshot(prior.id, data))] : []),
+    c.env.merlin_db.prepare(`UPDATE custom_games SET name=?,install_name=?,admin_note=?,admin_notes_json=?,image_key=?,
+      image_position_x=?,image_position_y=?,image_zoom=?,archive_key=?,archive_size=?,package_type=?,executable_path=?,
+      published=?,origin=?,repository_url=?,discord_url=?,protected_paths_json=?,version_label=?,tracked_release_tag=?,storage_revision=?,updated_at=CURRENT_TIMESTAMP${pendingReset} WHERE id=?`).bind(data.name, data.installName, data.note, data.notes,
+      data.imageKey, data.imagePositionX, data.imagePositionY, data.imageZoom, data.archiveKey,
+      data.archiveSize, data.packageType, data.executablePath, data.published, data.origin, data.repositoryUrl,
+      data.discordUrl, JSON.stringify(data.protectedPaths), data.versionLabel, data.trackedReleaseTag,
+      prior.storage_revision || 0, ...(clearPending ? [prior.pending_source_etag] : []), prior.id),
+    c.env.merlin_db.prepare(`UPDATE custom_game_versions SET executable_path=?,origin=?,protected_paths_json=?,version_label=?,
+      status='active',retired_at=NULL,delete_after=NULL WHERE game_id=? AND archive_key=? AND status IN ('active','retired')`).bind(data.executablePath, data.origin,
+        JSON.stringify(data.protectedPaths), data.versionLabel, prior.id, data.archiveKey),
+    c.env.merlin_db.prepare(`UPDATE custom_game_versions SET status='retired',retired_at=?,delete_after=? WHERE game_id=? AND archive_key!=? AND status='active'`)
+      .bind(new Date().toISOString(), new Date(Date.now() + 86400_000).toISOString(), prior.id, data.archiveKey),
+    ...(clearPending ? [c.env.merlin_db.prepare("UPDATE custom_games SET pending_source_etag=NULL WHERE id=? AND archive_key=?")
+      .bind(prior.id, data.archiveKey)] : []),
+  ];
+  await publishBatch(c, statements);
+  if (changed && !prior.archive_key.startsWith("draft/")) await queuePublishedIntegrity(c, mapGame(prior));
+  if (prior.image_key && prior.image_key !== data.imageKey) await c.env.CUSTOM_GAMES.delete(prior.image_key);
+  if (!data.archiveKey.startsWith("draft/")) await queuePublishedIntegrity(c, packageSnapshot(prior.id, data));
+}
+
+async function discardStagedZip(c: AppContext, gameId: string, key: string, activeKey: string) {
+  if (!key || key === activeKey || !key.startsWith(`${gameId}/archives/`)) return;
+  const record = await readJob(c.env, await integrityJobId(gameId, key));
+  if (record && ["queued", "processing"].includes(record.job.status)) {
+    const cancelled = { ...record.job, status: "cancelled" as const, phase: "cancelled" as const,
+      updatedAt: new Date().toISOString() };
+    delete cancelled.leaseToken; delete cancelled.leaseExpiresAt;
+    await writeJob(c.env, cancelled, record.etag);
+  }
+  await c.env.CUSTOM_GAMES.delete([key, await integrityManifestKey(gameId, key)]);
+}
+
+async function publishStagedZip(c: AppContext, id: string) {
+  const prior = await findGame(c, id);
+  if (!prior || prior.deleted_at) fail("Jogo não encontrado.", 404);
+  const data = pendingGameData(prior);
+  if (!data || !data.published) fail("Este jogo não tem ZIP pronto para publicação.", 409);
+  if (prior.archive_key !== prior.pending_base_archive_key) {
+    fail("O jogo mudou desde o envio do ZIP. Revise a versão pendente.", 409);
+  }
+  const source = await c.env.CUSTOM_GAMES.head(data.archiveKey);
+  if (!source || source.etag !== prior.pending_source_etag || source.size !== data.archiveSize) {
+    fail("O ZIP pendente mudou ou não está mais disponível.", 409);
+  }
+  const manifest = await getIntegrityManifest(c, { id, archive_key: data.archiveKey,
+    archive_size: data.archiveSize, package_type: "zip" }, integrityDependencies);
+  if (!manifest || manifest.sourceEtag !== source.etag || manifest.sourceSize !== source.size) {
+    fail("O ZIP ainda está sendo indexado. Aguarde antes de publicar.", 409);
+  }
+  if (!data.name || !data.imageKey || !data.installName || !data.archiveKey) {
+    fail("Complete o cadastro do jogo antes de publicar.", 409);
+  }
+  await applyGameUpdate(c, prior, data, true);
+  return { id, name: data.name };
+}
+
 export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) {
   registerGameUploadSessionRoutes(app);
   registerGameVersionRoutes(app, { findGame });
@@ -411,6 +528,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c);
     const rows = await c.env.merlin_db.prepare("SELECT * FROM custom_games WHERE deleted_at IS NULL ORDER BY created_at DESC").all<GameRow>();
     const games = await mapConcurrent(rows.results, 4, async row => ({ ...mapGame(row),
+      ...(row.pending_archive_key ? { pendingPackage: await pendingGameStatus(c, row) } : {}),
       ...await portReleaseStatus(c.env, metadataFromRow(row)) }));
     return c.json({ success: true, games });
   });
@@ -493,7 +611,27 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
       fail("Partes do arquivo inválidas.");
     }
     const object = await completeGameMultipart(c.env.CUSTOM_GAMES, key, body.uploadId, parts, sizeBytes);
+    if (isArchive) {
+      const gameId = key.split("/")[0]!;
+      if (GAME_ID_PATTERN.test(gameId)) {
+        await enqueueGameIntegrity(c, { id: gameId, archive_key: key, archive_size: object.size,
+          package_type: "zip" }, integrityDependencies);
+      }
+    }
     return c.json({ success: true, key, sizeBytes, etag: object.etag });
+  });
+
+  app.get("/panel-api/custom-games/upload/indexing", async c => {
+    await requireAdminSession(c);
+    const gameId = validGameId(c.req.query("gameId"));
+    const key = String(c.req.query("archiveKey") || "");
+    if (!ARCHIVE_KEY_PATTERN.test(key) || !key.startsWith(`${gameId}/`)) fail("ZIP inválido.");
+    const record = await readJob(c.env, await integrityJobId(gameId, key));
+    if (!record || record.job.archiveKey !== key) fail("Indexação não encontrada.", 404);
+    return c.json({ success: true, status: record.job.status, phase: record.job.phase,
+      processedBytes: record.job.processedBytes, totalBytes: record.job.totalBytes,
+      processedFiles: record.job.processedFiles, totalFiles: record.job.totalFiles,
+      error: record.job.status === "failed" ? record.job.error : undefined });
   });
 
   app.post("/panel-api/custom-games/upload/abort", async c => {
@@ -598,8 +736,102 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (GAME_FILE_KEY_PATTERN.test(key) && (await referencedGameFileKeys(c.env, [key])).has(key)) {
       fail("Este arquivo ainda pertence a um jogo ou versão reservada para download.", 409);
     }
+    if (ARCHIVE_KEY_PATTERN.test(key) && GAME_ID_PATTERN.test(key.slice(0, 36))) {
+      const record = await readJob(c.env, await integrityJobId(key.slice(0, 36), key));
+      if (record && ["queued", "processing"].includes(record.job.status)) {
+        const cancelled = { ...record.job, status: "cancelled" as const, phase: "cancelled" as const,
+          updatedAt: new Date().toISOString() };
+        delete cancelled.leaseToken; delete cancelled.leaseExpiresAt;
+        if (!await writeJob(c.env, cancelled, record.etag)) {
+          fail("A indexação mudou durante o descarte. Tente novamente.", 409);
+        }
+      }
+    }
     if (MANIFEST_KEY_PATTERN.test(key)) await deletePackage(c, "folder", key);
     else await c.env.CUSTOM_GAMES.delete(key);
+    return c.json({ success: true });
+  });
+
+  app.post("/panel-api/custom-games/stage-zip", async c => {
+    await requireAdminSession(c, { mutate: true });
+    const id = validGameId((await c.req.raw.clone().formData()).get("gameId"));
+    const prior = await findGame(c, id);
+    if (prior?.deleted_at) fail("Este jogo foi removido.", 404);
+    const previous = prior ? pendingGameData(prior) : null;
+    const formPrior = prior && previous ? { ...prior, image_key: previous.imageKey } : prior;
+    const data = await readGameForm(c, id, formPrior, { allowPendingZip: true });
+    if (data.packageType !== "zip" || !data.archiveKey.startsWith(`${id}/archives/`)) {
+      fail("Selecione um ZIP enviado para este jogo.");
+    }
+    if (prior?.published && data.archiveKey === prior.archive_key) {
+      fail("Este ZIP já está publicado. Envie uma versão nova para preparar uma atualização.", 409);
+    }
+    const source = await c.env.CUSTOM_GAMES.head(data.archiveKey);
+    if (!source || source.size !== data.archiveSize) fail("O ZIP enviado não está disponível.", 409);
+    await enqueueGameIntegrity(c, { id, archive_key: data.archiveKey, archive_size: data.archiveSize,
+      package_type: "zip" }, integrityDependencies);
+    if (prior) {
+      const update = await c.env.merlin_db.prepare(`UPDATE custom_games SET pending_archive_key=?,pending_source_etag=?,
+        pending_data_json=?,pending_base_archive_key=?,pending_created_at=?,updated_at=CURRENT_TIMESTAMP
+        WHERE id=? AND archive_key=? AND pending_archive_key IS ?`)
+        .bind(data.archiveKey, source.etag, JSON.stringify(data), prior.archive_key, new Date().toISOString(),
+          id, prior.archive_key, prior.pending_archive_key || null).run();
+      if (!update.meta.changes) fail("Este jogo mudou enquanto você editava. Atualize e tente novamente.", 409);
+    } else {
+      await c.env.merlin_db.prepare(`INSERT INTO custom_games
+        (id,name,install_name,admin_note,admin_notes_json,image_key,image_position_x,image_position_y,image_zoom,
+         archive_key,archive_size,package_type,executable_path,published,origin,repository_url,discord_url,
+         protected_paths_json,version_label,tracked_release_tag,pending_archive_key,pending_source_etag,
+         pending_data_json,pending_base_archive_key,pending_created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+          id, data.name, `draft-${id}`, data.note, data.notes, data.imageKey, data.imagePositionX,
+          data.imagePositionY, data.imageZoom, `draft/${id}`, 0, "zip", data.executablePath, 0,
+          data.origin, data.repositoryUrl, data.discordUrl, JSON.stringify(data.protectedPaths),
+          data.versionLabel, data.trackedReleaseTag, data.archiveKey, source.etag, JSON.stringify(data),
+          `draft/${id}`, new Date().toISOString()).run();
+    }
+    if (previous?.archiveKey && previous.archiveKey !== data.archiveKey) {
+      await discardStagedZip(c, id, previous.archiveKey, prior?.archive_key || "");
+    }
+    if (previous?.imageKey && previous.imageKey !== data.imageKey && previous.imageKey !== prior?.image_key) {
+      await c.env.CUSTOM_GAMES.delete(previous.imageKey);
+    }
+    return c.json({ success: true, id, indexStatus: "queued" }, prior ? 200 : 201);
+  });
+
+  app.post("/panel-api/custom-games/publish-ready", async c => {
+    await requireAdminSession(c, { mutate: true });
+    const body = await c.req.json<{ gameIds?: string[] }>();
+    if (!Array.isArray(body.gameIds) || body.gameIds.length < 1 || body.gameIds.length > 50 ||
+        body.gameIds.some(id => !GAME_ID_PATTERN.test(String(id))) || new Set(body.gameIds).size !== body.gameIds.length) {
+      fail("Selecione até 50 jogos prontos para publicar.");
+    }
+    const published: { id: string; name: string }[] = [];
+    const failed: { id: string; error: string }[] = [];
+    for (const id of body.gameIds) {
+      try { published.push(await publishStagedZip(c, id)); }
+      catch (error) { failed.push({ id, error: error instanceof Error ? error.message : "Falha ao publicar." }); }
+    }
+    return c.json({ success: failed.length === 0, published, failed });
+  });
+
+  app.post("/panel-api/custom-games/:id/publish-ready", async c => {
+    await requireAdminSession(c, { mutate: true });
+    return c.json({ success: true, published: await publishStagedZip(c, validGameId(c.req.param("id"))) });
+  });
+
+  app.post("/panel-api/custom-games/:id/discard-staged-zip", async c => {
+    await requireAdminSession(c, { mutate: true });
+    const prior = await findGame(c, validGameId(c.req.param("id")));
+    if (!prior || prior.deleted_at || !prior.pending_archive_key) fail("ZIP pendente não encontrado.", 404);
+    const staged = pendingGameData(prior);
+    const result = await c.env.merlin_db.prepare(`UPDATE custom_games SET pending_archive_key=NULL,
+      pending_source_etag=NULL,pending_data_json=NULL,pending_base_archive_key=NULL,pending_created_at=NULL,
+      updated_at=CURRENT_TIMESTAMP WHERE id=? AND pending_archive_key=?`)
+      .bind(prior.id, prior.pending_archive_key).run();
+    if (!result.meta.changes) fail("O ZIP pendente mudou. Atualize e tente novamente.", 409);
+    await discardStagedZip(c, prior.id, prior.pending_archive_key, prior.archive_key);
+    if (staged?.imageKey && staged.imageKey !== prior.image_key) await c.env.CUSTOM_GAMES.delete(staged.imageKey);
     return c.json({ success: true });
   });
 
@@ -625,28 +857,9 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c, { mutate: true });
     const prior = await findGame(c, c.req.param("id"));
     if (!prior || prior.deleted_at) fail("Jogo não encontrado.", 404);
+    if (prior.pending_archive_key) fail("Este jogo tem um ZIP pendente. Edite ou publique esse pacote primeiro.", 409);
     const data = await readGameForm(c, prior.id, prior);
-    const changed = prior.archive_key !== data.archiveKey || (prior.package_type || "zip") !== data.packageType;
-    const statements = [
-      ...(!prior.archive_key.startsWith("draft/") ? [gameVersionInsertStatement(c.env, mapGame(prior))] : []),
-      ...(!data.archiveKey.startsWith("draft/") ? [gameVersionInsertStatement(c.env, packageSnapshot(prior.id, data))] : []),
-      c.env.merlin_db.prepare(`UPDATE custom_games SET name=?,install_name=?,admin_note=?,admin_notes_json=?,image_key=?,
-      image_position_x=?,image_position_y=?,image_zoom=?,archive_key=?,archive_size=?,package_type=?,executable_path=?,
-      published=?,origin=?,repository_url=?,discord_url=?,protected_paths_json=?,version_label=?,tracked_release_tag=?,storage_revision=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(data.name, data.installName, data.note, data.notes,
-      data.imageKey, data.imagePositionX, data.imagePositionY, data.imageZoom, data.archiveKey,
-      data.archiveSize, data.packageType, data.executablePath, data.published, data.origin, data.repositoryUrl,
-      data.discordUrl, JSON.stringify(data.protectedPaths), data.versionLabel, data.trackedReleaseTag, prior.storage_revision || 0, prior.id),
-      c.env.merlin_db.prepare(`UPDATE custom_game_versions SET executable_path=?,origin=?,protected_paths_json=?,version_label=?,
-        status='active',retired_at=NULL,delete_after=NULL WHERE game_id=? AND archive_key=? AND status IN ('active','retired')`).bind(data.executablePath, data.origin,
-          JSON.stringify(data.protectedPaths), data.versionLabel, prior.id, data.archiveKey),
-    ];
-    statements.push(c.env.merlin_db.prepare(
-      `UPDATE custom_game_versions SET status='retired',retired_at=?,delete_after=? WHERE game_id=? AND archive_key!=? AND status='active'`)
-      .bind(new Date().toISOString(), new Date(Date.now() + 86400_000).toISOString(), prior.id, data.archiveKey));
-    await publishBatch(c, statements);
-    if (changed && !prior.archive_key.startsWith("draft/")) await queuePublishedIntegrity(c, mapGame(prior));
-    if (prior.image_key && prior.image_key !== data.imageKey) await c.env.CUSTOM_GAMES.delete(prior.image_key);
-    if (!data.archiveKey.startsWith("draft/")) await queuePublishedIntegrity(c, packageSnapshot(prior.id, data));
+    await applyGameUpdate(c, prior, data);
     return c.json({ success: true, id: prior.id });
   });
 
@@ -663,6 +876,11 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
         WHERE game_id=? AND status IN ('active','retired')`).bind(now, new Date(Date.now() + 86400_000).toISOString(), prior.id),
     ]);
     if (prior.image_key) await c.env.CUSTOM_GAMES.delete(prior.image_key);
+    if (prior.pending_archive_key) {
+      const staged = pendingGameData(prior);
+      await discardStagedZip(c, prior.id, prior.pending_archive_key, prior.archive_key);
+      if (staged?.imageKey && staged.imageKey !== prior.image_key) await c.env.CUSTOM_GAMES.delete(staged.imageKey);
+    }
     if (!prior.archive_key.startsWith("draft/")) await queuePublishedIntegrity(c, mapGame(prior));
     return c.json({ success: true });
   });
@@ -692,7 +910,9 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c);
     const game = await findGame(c, c.req.param("id"));
     if (!game) fail("Imagem não encontrada.", 404);
-    const object = await c.env.CUSTOM_GAMES.get(game.image_key);
+    const key = c.req.query("pending") === "1" ? pendingGameData(game)?.imageKey : game.image_key;
+    if (!key) fail("Imagem não encontrada.", 404);
+    const object = await c.env.CUSTOM_GAMES.get(key);
     if (!object) fail("Imagem não encontrada.", 404);
     return new Response(object.body, { status: 200, headers: {
       "content-type": object.httpMetadata?.contentType || "application/octet-stream",

@@ -14,6 +14,43 @@ import { requireAdminSession } from "./admin-security";
 const key = "00000000-0000-4000-8000-000000000000/files/00000000-0000-4000-8000-000000000001";
 
 describe("large ZIP multipart uploads", () => {
+  it("starts indexing the ZIP at upload completion, before any game is published", async () => {
+    const gameId = "00000000-0000-4000-8000-000000000000";
+    const archiveKey = `${gameId}/archives/00000000-0000-4000-8000-000000000002.zip`;
+    const stored = new Map<string, { body: string; etag: string }>();
+    const head = vi.fn(async (objectKey: string) => objectKey === archiveKey
+      ? { size: 4, etag: "archive-etag" } : stored.has(objectKey)
+        ? { size: stored.get(objectKey)!.body.length, etag: stored.get(objectKey)!.etag } : null);
+    const bucket = { head,
+      get: vi.fn(async (objectKey: string) => { const item = stored.get(objectKey); return item
+        ? { size: item.body.length, etag: item.etag, json: async () => JSON.parse(item.body) } : null; }),
+      put: vi.fn(async (objectKey: string, body: string) => { stored.set(objectKey, { body, etag: "job-etag" }); return { etag: "job-etag" }; }),
+      delete: vi.fn(async () => {}),
+    };
+    const env = { CUSTOM_GAMES: bucket, ENVIRONMENT: "staging", merlin_db: {
+      prepare: () => ({ bind: () => ({ first: async () => null }) }),
+    } } as unknown as AppBindings;
+    const app = new Hono<{ Bindings: AppBindings }>(); registerCustomGamesRoutes(app);
+    const completed = await app.request("http://localhost/panel-api/custom-games/upload/complete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: archiveKey, uploadId: "upload-1", sizeBytes: 4,
+        parts: [{ partNumber: 1, etag: "part-etag" }] }),
+    }, env);
+    expect(completed.status).toBe(200);
+    const query = new URLSearchParams({ gameId, archiveKey });
+    const status = await app.request(`http://localhost/panel-api/custom-games/upload/indexing?${query}`, {}, env);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ status: "queued", phase: "queued", totalBytes: 4 });
+    expect(bucket.put).toHaveBeenCalledTimes(1);
+    const discarded = await app.request("http://localhost/panel-api/custom-games/upload/discard", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: archiveKey }),
+    }, env);
+    expect(discarded.status).toBe(200);
+    expect(await (await app.request(`http://localhost/panel-api/custom-games/upload/indexing?${query}`, {}, env)).json())
+      .toMatchObject({ status: "cancelled" });
+    expect(bucket.delete).toHaveBeenCalledWith(archiveKey);
+  });
+
   it("accepts 100 GiB archives and allows the corresponding 1,600th part", async () => {
     const gameId = "00000000-0000-4000-8000-000000000000";
     const uploadPart = vi.fn(async (partNumber: number) => ({ partNumber, etag: "etag" }));

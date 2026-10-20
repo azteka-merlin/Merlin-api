@@ -67,13 +67,13 @@ describe("custom game install contracts", () => {
     await expect(readGameForm(context(missingPackage), id)).rejects.toThrow("Envie o pacote");
     missingPackage.set("archiveKey", "archives/00000000-0000-4000-8000-000000000002.zip");
     const withPackage = { req: { formData: async () => missingPackage }, env: {
-      CUSTOM_GAMES: { head: async () => ({ size: 123 }) },
+      CUSTOM_GAMES: { head: async () => ({ size: 123, etag: "test-etag" }), get: async () => null },
     } } as unknown as AppContext;
     // Existing unscoped legacy packages remain editable in their own game.
     await expect(readGameForm(withPackage, id, { archive_key: String(missingPackage.get("archiveKey")), image_key: "" } as GameRow))
-      .rejects.toThrow("Selecione uma imagem");
+      .rejects.toThrow("ainda está sendo indexado");
     missingPackage.set("archiveKey", `${id}/archives/00000000-0000-4000-8000-000000000002.zip`);
-    await expect(readGameForm(withPackage, id)).rejects.toThrow("Selecione uma imagem");
+    await expect(readGameForm(withPackage, id)).rejects.toThrow("ainda está sendo indexado");
     missingPackage.set("archiveKey", "00000000-0000-4000-8000-000000000002/archives/00000000-0000-4000-8000-000000000002.zip");
     await expect(readGameForm(withPackage, id)).rejects.toThrow("pertence a outro jogo");
   });

@@ -19,14 +19,14 @@ const sha = (data: string) => createHash("sha256").update(data).digest("hex");
 
 function harness() {
   const db = new DatabaseSync(":memory:");
-  for (const file of ["0082_custom_games.sql", "0083_custom_games_folder_packages.sql", "0085_custom_game_versions.sql"])
+  for (const file of ["0082_custom_games.sql", "0083_custom_games_folder_packages.sql", "0085_custom_game_versions.sql", "0086_custom_game_pending_zip.sql"])
     db.exec(readFileSync(new NodeURL(`../../migrations/${file}`, import.meta.url), "utf8"));
   db.prepare(`INSERT INTO custom_games (id,name,install_name,image_key,archive_key,archive_size,executable_path,published)
     VALUES (?,?,?,'image',?,8,'game.exe',1)`).run(id, "Test Game", "Test Game", oldKey);
   type Stored = { data: Uint8Array; etag: string; customMetadata?: Record<string, string>; uploaded?: Date };
   const objects = new Map<string, Stored>();
   const store = (key: string, value: string, etag = sha(value)) => objects.set(key, { data: new TextEncoder().encode(value), etag, uploaded: new Date() });
-  store(oldKey, "AAAABBBB"); store(newKey, "11112222");
+  store(oldKey, "AAAABBBB"); store(newKey, "H".repeat(30) + "2222");
   const hooks = { failUpdate: false, deleteBeforeNextBatch: false };
   function prepare(sql: string) {
     let values: unknown[] = [];
@@ -74,17 +74,132 @@ function harness() {
       headers: { ...protocol, "content-type": "application/json" }, body: JSON.stringify({ archiveKey: key }) }, env);
     expect(response.status).toBe(200); return await response.json() as { leaseId: string };
   }
-  async function publish(key = newKey) {
+  function index(key: string) {
+    const object = objects.get(key)!;
+    const sidecarKey = `${id}/integrity/${sha(id + key)}.json`;
+    store(sidecarKey, JSON.stringify({ version: 1, gameId: id,
+      archiveKey: key, totalSizeBytes: 4, sourceEtag: object.etag, sourceSize: object.data.length,
+      files: [{ path: "game.exe", sizeBytes: 4, sha256: sha("2222"),
+        zip: { offset: 30, compressedSize: 4, method: 0, crc32: 0 } }] }));
+    objects.get(sidecarKey)!.customMetadata = { sourceEtag: object.etag };
+  }
+  async function publish(key = newKey, withIndex = true) {
+    if (key !== oldKey && withIndex) index(key);
     const form = new FormData(); form.set("name", "Test Game"); form.set("published", "true"); form.set("archiveKey", key);
     form.set("packageType", "zip"); form.set("executablePath", "new.exe"); form.set("origin", "port"); form.set("versionLabel", "2");
     return app.request(`http://localhost/panel-api/custom-games/${id}`, { method: "PUT", body: form }, env);
   }
-  return { app, env, db, bucket, objects, store, hooks, session, publish };
+  return { app, env, db, bucket, objects, store, hooks, session, publish, index };
 }
 
 beforeEach(() => vi.mocked(requireGoldLauncherLicense).mockResolvedValue({ id: 132, planTier: "ouro" } as Awaited<ReturnType<typeof requireGoldLauncherLicense>>));
 
 describe("publishing complete game packages safely", () => {
+  it("stages a replacement ZIP, keeps the public package live, and publishes only after index and confirmation", async () => {
+    const h = harness(); const { leaseId } = await h.session();
+    const form = new FormData();
+    form.set("gameId", id); form.set("name", "Test Game"); form.set("published", "true");
+    form.set("archiveKey", newKey); form.set("packageType", "zip"); form.set("executablePath", "new.exe");
+    expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: form }, h.env)).status).toBe(200);
+    expect(h.db.prepare("SELECT archive_key,pending_archive_key FROM custom_games WHERE id=?").get(id))
+      .toMatchObject({ archive_key: oldKey, pending_archive_key: newKey });
+    let admin = await (await h.app.request("http://localhost/panel-api/custom-games", {}, h.env)).json() as any;
+    expect(admin.games[0].pendingPackage).toMatchObject({ archiveKey: newKey, indexStatus: "queued", publishRequested: true });
+    expect((await h.app.request(`http://localhost/panel-api/custom-games/${id}/publish-ready`, { method: "POST" }, h.env)).status).toBe(409);
+    let publicCatalog = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
+    expect(publicCatalog.games[0].archiveKey).toBe(oldKey);
+    h.index(newKey);
+    admin = await (await h.app.request("http://localhost/panel-api/custom-games", {}, h.env)).json() as any;
+    expect(admin.games[0].pendingPackage.indexStatus).toBe("ready");
+    const result = await h.app.request("http://localhost/panel-api/custom-games/publish-ready", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ gameIds: [id] }),
+    }, h.env);
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ published: [{ id, name: "Test Game" }], failed: [] });
+    expect(h.db.prepare("SELECT archive_key,pending_archive_key FROM custom_games WHERE id=?").get(id))
+      .toMatchObject({ archive_key: newKey, pending_archive_key: null });
+    publicCatalog = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
+    expect(publicCatalog.games[0].archiveKey).toBe(newKey);
+    const oldChunk = await h.app.request(`http://localhost/api/custom-games/${id}/archive?archiveKey=${encodeURIComponent(oldKey)}&downloadSessionId=${leaseId}`,
+      { headers: { ...protocol, range: "bytes=4-7" } }, h.env);
+    expect(oldChunk.status).toBe(206); expect(await oldChunk.text()).toBe("BBBB");
+  });
+  it("rejects a replaced staged ZIP and discards a staged package without touching the active ZIP", async () => {
+    const h = harness();
+    const form = new FormData(); form.set("gameId", id); form.set("name", "Test Game"); form.set("published", "true");
+    form.set("archiveKey", newKey); form.set("packageType", "zip");
+    expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: form }, h.env)).status).toBe(200);
+    h.index(newKey); h.store(newKey, "H".repeat(30) + "3333");
+    expect((await h.app.request(`http://localhost/panel-api/custom-games/${id}/publish-ready`, { method: "POST" }, h.env)).status).toBe(409);
+    expect((await h.app.request(`http://localhost/panel-api/custom-games/${id}/discard-staged-zip`, { method: "POST" }, h.env)).status).toBe(200);
+    expect(h.db.prepare("SELECT archive_key,pending_archive_key FROM custom_games WHERE id=?").get(id))
+      .toMatchObject({ archive_key: oldKey, pending_archive_key: null });
+    expect(h.objects.has(oldKey)).toBe(true); expect(h.objects.has(newKey)).toBe(false);
+  });
+  it("publishes a staged ZIP only once when two confirmations race", async () => {
+    const h = harness();
+    const form = new FormData(); form.set("gameId", id); form.set("name", "Test Game"); form.set("published", "true");
+    form.set("archiveKey", newKey); form.set("packageType", "zip");
+    expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: form }, h.env)).status).toBe(200);
+    h.index(newKey);
+    const responses = await Promise.all([1, 2].map(() => h.app.request(
+      `http://localhost/panel-api/custom-games/${id}/publish-ready`, { method: "POST" }, h.env)));
+    expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+    expect(h.db.prepare("SELECT archive_key,pending_archive_key,pending_source_etag FROM custom_games WHERE id=?").get(id))
+      .toMatchObject({ archive_key: newKey, pending_archive_key: null, pending_source_etag: null });
+    expect(h.db.prepare("SELECT COUNT(*) n FROM custom_game_versions WHERE game_id=? AND status='active'").get(id)?.n).toBe(1);
+  });
+  it("keeps a newly uploaded ZIP as a private draft until marked and confirmed for publication", async () => {
+    const h = harness(); h.db.prepare("DELETE FROM custom_games WHERE id=?").run(id);
+    const draft = new FormData(); draft.set("gameId", id); draft.set("name", "New Game");
+    draft.set("published", "false"); draft.set("archiveKey", newKey); draft.set("packageType", "zip");
+    expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: draft }, h.env)).status).toBe(201);
+    expect(h.db.prepare("SELECT archive_key,published,pending_archive_key FROM custom_games WHERE id=?").get(id))
+      .toMatchObject({ archive_key: `draft/${id}`, published: 0, pending_archive_key: newKey });
+    h.index(newKey);
+    let admin = await (await h.app.request("http://localhost/panel-api/custom-games", {}, h.env)).json() as any;
+    expect(admin.games[0].pendingPackage).toMatchObject({ indexStatus: "ready", publishRequested: false });
+    expect((await h.app.request(`http://localhost/panel-api/custom-games/${id}/publish-ready`, { method: "POST" }, h.env)).status).toBe(409);
+    const ready = new FormData(); ready.set("gameId", id); ready.set("name", "New Game");
+    ready.set("published", "true"); ready.set("archiveKey", newKey); ready.set("packageType", "zip");
+    ready.set("image", new File([Uint8Array.of(0x89, 0x50, 0x4e, 0x47)], "cover.png", { type: "image/png" }));
+    expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: ready }, h.env)).status).toBe(200);
+    const catalogBefore = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
+    expect(catalogBefore.games).toEqual([]);
+    expect((await h.app.request(`http://localhost/panel-api/custom-games/${id}/publish-ready`, { method: "POST" }, h.env)).status).toBe(200);
+    const catalogAfter = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
+    expect(catalogAfter.games[0]).toMatchObject({ name: "New Game", archiveKey: newKey });
+  });
+  it("publishes only the ready games in a bulk confirmation and reports other failures", async () => {
+    const h = harness();
+    const secondId = "40000000-0000-4000-8000-000000000010";
+    const secondKey = `${secondId}/archives/40000000-0000-4000-8000-000000000011.zip`;
+    h.db.prepare(`INSERT INTO custom_games (id,name,install_name,image_key,archive_key,archive_size,executable_path,published)
+      VALUES (?,?,?,'image',?,8,'game.exe',1)`).run(secondId, "Second Game", "Second Game", `${secondId}/archives/40000000-0000-4000-8000-000000000012.zip`);
+    h.store(secondKey, "H".repeat(30) + "2222");
+    for (const [gameId, key] of [[id, newKey], [secondId, secondKey]]) {
+      const form = new FormData(); form.set("gameId", gameId!); form.set("name", gameId === id ? "Test Game" : "Second Game");
+      form.set("published", "true"); form.set("archiveKey", key!); form.set("packageType", "zip");
+      expect((await h.app.request("http://localhost/panel-api/custom-games/stage-zip", { method: "POST", body: form }, h.env)).status).toBe(200);
+    }
+    h.index(newKey);
+    const response = await h.app.request("http://localhost/panel-api/custom-games/publish-ready", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ gameIds: [id, secondId] }),
+    }, h.env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ success: false, published: [{ id }], failed: [{ id: secondId }] });
+    expect(h.db.prepare("SELECT archive_key,pending_archive_key FROM custom_games WHERE id=?").get(secondId))
+      .toMatchObject({ pending_archive_key: secondKey });
+  });
+  it("keeps the current public ZIP until the replacement has a matching integrity index", async () => {
+    const h = harness();
+    expect((await h.publish(newKey, false)).status).toBe(409);
+    expect(h.db.prepare("SELECT archive_key FROM custom_games WHERE id=?").get(id)?.archive_key).toBe(oldKey);
+    h.index(newKey);
+    h.store(newKey, "H".repeat(30) + "3333");
+    expect((await h.publish(newKey, false)).status).toBe(409);
+    expect(h.db.prepare("SELECT archive_key FROM custom_games WHERE id=?").get(id)?.archive_key).toBe(oldKey);
+  });
   it("a ZIP download at 50 percent remains on its old version after publication", async () => {
     const h = harness(); const { leaseId } = await h.session();
     const url = `http://localhost/api/custom-games/${id}/archive?archiveKey=${encodeURIComponent(oldKey)}&downloadSessionId=${leaseId}`;
@@ -112,7 +227,7 @@ describe("publishing complete game packages safely", () => {
   });
   it("concurrent publications retire every superseded version", async () => {
     const h = harness(); await h.session();
-    const thirdKey = `${id}/archives/40000000-0000-4000-8000-000000000003.zip`; h.store(thirdKey, "33334444");
+    const thirdKey = `${id}/archives/40000000-0000-4000-8000-000000000003.zip`; h.store(thirdKey, "H".repeat(30) + "2222");
     const responses = await Promise.all([h.publish(), h.publish(thirdKey)]);
     expect(responses.map(response => response.status)).toEqual([200, 200]);
     const current = h.db.prepare("SELECT archive_key FROM custom_games WHERE id=?").get(id)!.archive_key;
