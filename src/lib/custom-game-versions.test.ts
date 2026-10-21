@@ -25,7 +25,7 @@ function harness() {
     VALUES (?,?,?,'','image',?,100,'Old.exe',1)`).run(gameId, "Test game", "Test game", keys[0]!);
   db.exec(readFileSync(new NodeURL("../../migrations/0085_custom_game_versions.sql", import.meta.url), "utf8"));
   const game = { id: gameId, archive_key: keys[0]!, archive_size: 100, package_type: "zip" as "zip" | "folder",
-    executable_path: "Old.exe", origin: "native" as "native" | "port", protected_paths_json: "[]", version_label: "1", published: 1, install_name: "Test game" };
+    executable_path: "Old.exe", origin: "native" as "native" | "port", protected_paths_json: "[]", published: 1, install_name: "Test game" };
   const hooks = { beforeRun: undefined as undefined | ((sql: string, values: unknown[]) => void) };
   function prepare(sql: string) {
     let values: unknown[] = [];
@@ -51,7 +51,7 @@ function harness() {
   }
   async function publish(index: number, extra: Partial<typeof game> = {}) {
     const priorKey = game.archive_key;
-    Object.assign(game, { archive_key: keys[index]!, archive_size: 100 * (index + 1), executable_path: `Version${index + 1}.exe`, version_label: String(index + 1) }, extra);
+    Object.assign(game, { archive_key: keys[index]!, archive_size: 100 * (index + 1), executable_path: `Version${index + 1}.exe` }, extra);
     await ensureGameVersion(env, game);
     db.prepare("UPDATE custom_games SET archive_key=?,archive_size=?,executable_path=? WHERE id=?").run(game.archive_key, game.archive_size, game.executable_path, game.id);
     await retireGameVersionStatement(env, game.id, priorKey, { now: oldTime }).run();
@@ -114,7 +114,7 @@ describe("download sessions", () => {
     await h.publish(2);
     const result = await h.request("", { archiveKey: keys[1] });
     expect(result.response.status).toBe(200);
-    expect(result.body).toMatchObject({ archiveKey: keys[1], archiveSize: 200, executablePath: "Version2.exe", origin: "port", protectedPaths: ["game", "user"], versionLabel: "2", heartbeatSeconds: 60, installName: "Test game" });
+    expect(result.body).toMatchObject({ archiveKey: keys[1], archiveSize: 200, executablePath: "Version2.exe", origin: "port", protectedPaths: ["game", "user"], heartbeatSeconds: 60, installName: "Test game" });
     const url = `http://localhost/resolve?archiveKey=${encodeURIComponent(keys[1]!)}&downloadSessionId=${result.body.leaseId}`;
     const response = await h.app.request(url, { headers: protocol }, h.env);
     expect(response.status).toBe(200);

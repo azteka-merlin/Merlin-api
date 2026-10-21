@@ -5,7 +5,7 @@ import { requireAdminSession } from "./admin-security";
 import { requireGoldLauncherLicense } from "./launcher-auth";
 import { beginGameUploadFinalization, completeGameMultipart, finishGameUploadFinalization,
   registerGameUploadSessionRoutes } from "./custom-game-upload-sessions";
-import { metadataFromRow, readCustomGameMetadata, portReleaseStatus, type MetadataRow } from "./custom-game-metadata";
+import { metadataFromRow, readCustomGameMetadata, type MetadataRow } from "./custom-game-metadata";
 import { ensureGameVersion, gameVersionInsertStatement, getLegacyGamePackage, resolveGamePackage,
   registerGameVersionRoutes, findGameVersion, cleanupRetiredGameVersions } from "./custom-game-versions";
 import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, integrityManifestKey, integrityJobKey, integrityJobId, readJob, writeJob } from "./custom-game-integrity";
@@ -283,9 +283,9 @@ async function publishBatch(c: AppContext, statements: D1PreparedStatement[]) {
 }
 
 function packageSnapshot(id: string, data: { archiveKey: string; packageType: "zip" | "folder"; archiveSize: number;
-  executablePath: string | null; origin: "native" | "port"; protectedPaths: string[]; versionLabel: string }) {
+  executablePath: string | null; origin: "native" | "port"; protectedPaths: string[] }) {
   return { id, archiveKey: data.archiveKey, packageType: data.packageType, archiveSize: data.archiveSize,
-    executablePath: data.executablePath, origin: data.origin, protectedPaths: data.protectedPaths, versionLabel: data.versionLabel };
+    executablePath: data.executablePath, origin: data.origin, protectedPaths: data.protectedPaths };
 }
 
 const integrityDependencies = {
@@ -448,9 +448,8 @@ async function pendingGameStatus(c: AppContext, row: GameRow) {
   return { archiveKey: data.archiveKey, archiveSize: data.archiveSize, name: data.name, adminNote: data.note,
     adminNotes: notes, executablePath: data.executablePath, imageKey: data.imageKey,
     imageVersion: data.imageKey, imagePositionX: data.imagePositionX, imagePositionY: data.imagePositionY,
-    imageZoom: data.imageZoom, origin: data.origin, repositoryUrl: data.repositoryUrl,
-    discordUrl: data.discordUrl, protectedPaths: data.protectedPaths, versionLabel: data.versionLabel,
-    trackedReleaseTag: data.trackedReleaseTag, publishRequested: Boolean(data.published),
+    imageZoom: data.imageZoom, origin: data.origin, protectedPaths: data.protectedPaths,
+    publishRequested: Boolean(data.published),
     indexStatus, error: indexStatus === "failed" ? job?.job.error || "O ZIP enviado não está disponível." : null,
     processedBytes: job?.job.processedBytes || 0, totalBytes: job?.job.totalBytes || data.archiveSize,
     processedFiles: job?.job.processedFiles || 0, totalFiles: job?.job.totalFiles || 0,
@@ -465,14 +464,14 @@ async function applyGameUpdate(c: AppContext, prior: GameRow, data: GameFormData
     ...(!data.archiveKey.startsWith("draft/") ? [gameVersionInsertStatement(c.env, packageSnapshot(prior.id, data))] : []),
     c.env.merlin_db.prepare(`UPDATE custom_games SET name=?,install_name=?,admin_note=?,admin_notes_json=?,image_key=?,
       image_position_x=?,image_position_y=?,image_zoom=?,archive_key=?,archive_size=?,package_type=?,executable_path=?,
-      published=?,origin=?,repository_url=?,discord_url=?,protected_paths_json=?,version_label=?,tracked_release_tag=?,storage_revision=?,updated_at=CURRENT_TIMESTAMP${pendingReset} WHERE id=?`).bind(data.name, data.installName, data.note, data.notes,
+      published=?,origin=?,protected_paths_json=?,storage_revision=?,updated_at=CURRENT_TIMESTAMP${pendingReset} WHERE id=?`).bind(data.name, data.installName, data.note, data.notes,
       data.imageKey, data.imagePositionX, data.imagePositionY, data.imageZoom, data.archiveKey,
-      data.archiveSize, data.packageType, data.executablePath, data.published, data.origin, data.repositoryUrl,
-      data.discordUrl, JSON.stringify(data.protectedPaths), data.versionLabel, data.trackedReleaseTag,
+      data.archiveSize, data.packageType, data.executablePath, data.published, data.origin,
+      JSON.stringify(data.protectedPaths),
       prior.storage_revision || 0, ...(clearPending ? [prior.pending_source_etag] : []), prior.id),
-    c.env.merlin_db.prepare(`UPDATE custom_game_versions SET executable_path=?,origin=?,protected_paths_json=?,version_label=?,
+    c.env.merlin_db.prepare(`UPDATE custom_game_versions SET executable_path=?,origin=?,protected_paths_json=?,
       status='active',retired_at=NULL,delete_after=NULL WHERE game_id=? AND archive_key=? AND status IN ('active','retired')`).bind(data.executablePath, data.origin,
-        JSON.stringify(data.protectedPaths), data.versionLabel, prior.id, data.archiveKey),
+        JSON.stringify(data.protectedPaths), prior.id, data.archiveKey),
     c.env.merlin_db.prepare(`UPDATE custom_game_versions SET status='retired',retired_at=?,delete_after=? WHERE game_id=? AND archive_key!=? AND status='active'`)
       .bind(new Date().toISOString(), new Date(Date.now() + 86400_000).toISOString(), prior.id, data.archiveKey),
     ...(clearPending ? [c.env.merlin_db.prepare("UPDATE custom_games SET pending_source_etag=NULL WHERE id=? AND archive_key=?")
@@ -528,8 +527,7 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     await requireAdminSession(c);
     const rows = await c.env.merlin_db.prepare("SELECT * FROM custom_games WHERE deleted_at IS NULL ORDER BY created_at DESC").all<GameRow>();
     const games = await mapConcurrent(rows.results, 4, async row => ({ ...mapGame(row),
-      ...(row.pending_archive_key ? { pendingPackage: await pendingGameStatus(c, row) } : {}),
-      ...await portReleaseStatus(c.env, metadataFromRow(row)) }));
+      ...(row.pending_archive_key ? { pendingPackage: await pendingGameStatus(c, row) } : {}) }));
     return c.json({ success: true, games });
   });
 
@@ -780,14 +778,14 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     } else {
       await c.env.merlin_db.prepare(`INSERT INTO custom_games
         (id,name,install_name,admin_note,admin_notes_json,image_key,image_position_x,image_position_y,image_zoom,
-         archive_key,archive_size,package_type,executable_path,published,origin,repository_url,discord_url,
-         protected_paths_json,version_label,tracked_release_tag,pending_archive_key,pending_source_etag,
+         archive_key,archive_size,package_type,executable_path,published,origin,
+         protected_paths_json,pending_archive_key,pending_source_etag,
          pending_data_json,pending_base_archive_key,pending_created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
           id, data.name, `draft-${id}`, data.note, data.notes, data.imageKey, data.imagePositionX,
           data.imagePositionY, data.imageZoom, `draft/${id}`, 0, "zip", data.executablePath, 0,
-          data.origin, data.repositoryUrl, data.discordUrl, JSON.stringify(data.protectedPaths),
-          data.versionLabel, data.trackedReleaseTag, data.archiveKey, source.etag, JSON.stringify(data),
+          data.origin, JSON.stringify(data.protectedPaths),
+          data.archiveKey, source.etag, JSON.stringify(data),
           `draft/${id}`, new Date().toISOString()).run();
     }
     if (previous?.archiveKey && previous.archiveKey !== data.archiveKey) {
@@ -842,11 +840,10 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     const snapshot = packageSnapshot(id, data);
     const insert = c.env.merlin_db.prepare(`INSERT INTO custom_games
       (id,name,install_name,admin_note,admin_notes_json,image_key,image_position_x,image_position_y,image_zoom,archive_key,archive_size,package_type,executable_path,published,
-       origin,repository_url,discord_url,protected_paths_json,version_label,tracked_release_tag)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, data.name, data.installName, data.note, data.notes, data.imageKey,
+       origin,protected_paths_json)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id, data.name, data.installName, data.note, data.notes, data.imageKey,
       data.imagePositionX, data.imagePositionY, data.imageZoom, data.archiveKey, data.archiveSize,
-      data.packageType, data.executablePath, data.published, data.origin, data.repositoryUrl, data.discordUrl,
-      JSON.stringify(data.protectedPaths), data.versionLabel, data.trackedReleaseTag);
+      data.packageType, data.executablePath, data.published, data.origin, JSON.stringify(data.protectedPaths));
     await publishBatch(c, [insert, ...(!data.archiveKey.startsWith("draft/")
       ? [gameVersionInsertStatement(c.env, snapshot)] : [])]);
     if (!data.archiveKey.startsWith("draft/")) await queuePublishedIntegrity(c, snapshot);

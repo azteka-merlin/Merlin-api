@@ -182,7 +182,6 @@ seletiva, verificação e reparo aguardam a indexação correspondente.
   futuras enfileiram automaticamente o pacote novo e a referência antiga necessária.
 - `CUSTOM_GAME_INDEXER_SECRET` protege apenas as operações internas de manutenção;
   a execução em Queues usa o binding, sem segredo externo ou serviço persistente.
-- `CUSTOM_GAME_GITHUB_TOKEN` é opcional para a consulta de releases públicas.
 
 Detalhes: [indexação na Cloudflare](CUSTOM_GAME_INDEXING_CLOUDFLARE.md),
 [CLI de diagnóstico](CUSTOM_GAME_INDEXER_RUNNER.md),

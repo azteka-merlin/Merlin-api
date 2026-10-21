@@ -38,7 +38,6 @@ export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | 
   CUSTOM_GAMES_R2_BUCKET?: string;
   CUSTOM_GAME_INDEXER_SECRET?: string;
   CUSTOM_GAME_INDEX_QUEUE?: Queue<{ jobId: string; generation: string }>;
-  CUSTOM_GAME_GITHUB_TOKEN?: string;
 }
 
 export type AppContext = Context<{ Bindings: AppBindings }>;

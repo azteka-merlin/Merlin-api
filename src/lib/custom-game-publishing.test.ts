@@ -86,7 +86,7 @@ function harness() {
   async function publish(key = newKey, withIndex = true) {
     if (key !== oldKey && withIndex) index(key);
     const form = new FormData(); form.set("name", "Test Game"); form.set("published", "true"); form.set("archiveKey", key);
-    form.set("packageType", "zip"); form.set("executablePath", "new.exe"); form.set("origin", "port"); form.set("versionLabel", "2");
+    form.set("packageType", "zip"); form.set("executablePath", "new.exe"); form.set("origin", "port");
     return app.request(`http://localhost/panel-api/custom-games/${id}`, { method: "PUT", body: form }, env);
   }
   return { app, env, db, bucket, objects, store, hooks, session, publish, index };
@@ -209,7 +209,7 @@ describe("publishing complete game packages safely", () => {
     expect(h.bucket.delete).not.toHaveBeenCalled();
     const modern = await (await h.app.request("http://localhost/api/custom-games", { headers: protocol }, h.env)).json() as any;
     const legacy = await (await h.app.request("http://localhost/api/custom-games", {}, h.env)).json() as any;
-    expect(modern.games[0]).toMatchObject({ archiveKey: newKey, origin: "port", protectedPaths: [], versionLabel: "2" });
+    expect(modern.games[0]).toMatchObject({ archiveKey: newKey, origin: "port", protectedPaths: [] });
     expect(legacy.games[0].archiveKey).toBe(oldKey);
     expect(await (await h.app.request(`http://localhost/api/custom-games/${id}/archive`, { headers: { range: "bytes=4-7" } }, h.env)).text()).toBe("BBBB");
   });

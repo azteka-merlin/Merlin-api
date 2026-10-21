@@ -10,7 +10,7 @@ const PROTOCOL_HEADER = "x-merlin-custom-games-protocol";
 
 export type GamePackageVersion = {
   id: string; archiveKey: string; packageType: "zip" | "folder"; archiveSize: number;
-  executablePath: string | null; origin: "native" | "port"; protectedPaths: string[]; versionLabel: string;
+  executablePath: string | null; origin: "native" | "port"; protectedPaths: string[];
   status: "active" | "retired" | "deleting" | "deleted"; legacyHold: boolean;
   createdAt: string; retiredAt: string | null; deleteAfter: string | null;
 };
@@ -19,12 +19,12 @@ export type VersionGameInput = {
   id: string; archiveKey?: string; archive_key?: string; packageType?: "zip" | "folder"; package_type?: "zip" | "folder";
   archiveSize?: number; archive_size?: number; executablePath?: string | null; executable_path?: string | null;
   origin?: "native" | "port"; protectedPaths?: string[]; protected_paths_json?: string;
-  versionLabel?: string; version_label?: string; published?: number | boolean; installName?: string; install_name?: string;
+  published?: number | boolean; installName?: string; install_name?: string;
 };
 
 type VersionRow = {
   game_id: string; archive_key: string; package_type: "zip" | "folder"; archive_size: number;
-  executable_path: string | null; origin: "native" | "port"; protected_paths_json: string; version_label: string;
+  executable_path: string | null; origin: "native" | "port"; protected_paths_json: string;
   created_at: string; retired_at: string | null; delete_after: string | null;
   status: GamePackageVersion["status"]; legacy_hold: number;
 };
@@ -53,7 +53,7 @@ function rowVersion(row: VersionRow): GamePackageVersion {
   return {
     id: row.game_id, archiveKey: row.archive_key, packageType: row.package_type, archiveSize: row.archive_size,
     executablePath: row.executable_path, origin, protectedPaths: protection(row.protected_paths_json, origin),
-    versionLabel: row.version_label, status: row.status, legacyHold: Boolean(row.legacy_hold),
+    status: row.status, legacyHold: Boolean(row.legacy_hold),
     createdAt: row.created_at, retiredAt: row.retired_at, deleteAfter: row.delete_after,
   };
 }
@@ -67,7 +67,6 @@ function inputVersion(game: VersionGameInput) {
     archiveSize: game.archiveSize ?? game.archive_size ?? 0,
     executablePath: game.executablePath ?? game.executable_path ?? null,
     origin, protectedPaths: protection(game.protectedPaths ?? game.protected_paths_json, origin),
-    versionLabel: game.versionLabel ?? game.version_label ?? "",
   };
 }
 
@@ -77,7 +76,6 @@ function mergeVersion<T extends VersionGameInput>(game: T, version: GamePackageV
     // Existing package handlers use database column names; keep them pinned too.
     archive_key: version.archiveKey, package_type: version.packageType, archive_size: version.archiveSize,
     executable_path: version.executablePath, protected_paths_json: JSON.stringify(version.protectedPaths),
-    version_label: version.versionLabel,
   };
 }
 
@@ -85,12 +83,12 @@ export function gameVersionInsertStatement(env: AppBindings, game: VersionGameIn
   options: { legacyHold?: boolean; now?: string } = {}): D1PreparedStatement {
   const version = inputVersion(game);
   return env.merlin_db.prepare(`INSERT OR IGNORE INTO custom_game_versions
-    (game_id,archive_key,package_type,archive_size,executable_path,origin,protected_paths_json,version_label,
+    (game_id,archive_key,package_type,archive_size,executable_path,origin,protected_paths_json,
       created_at,retired_at,delete_after,status,legacy_hold)
-    SELECT ?,?,?,?,?,?,?,?, ?,NULL,NULL,'active',
+    SELECT ?,?,?,?,?,?,?,?,NULL,NULL,'active',
       CASE WHEN ?=1 AND NOT EXISTS (SELECT 1 FROM custom_game_versions WHERE game_id=? AND legacy_hold=1) THEN 1 ELSE 0 END`)
     .bind(version.id, version.archiveKey, version.packageType, version.archiveSize, version.executablePath,
-      version.origin, JSON.stringify(version.protectedPaths), version.versionLabel, options.now || new Date().toISOString(),
+      version.origin, JSON.stringify(version.protectedPaths), options.now || new Date().toISOString(),
       options.legacyHold === false ? 0 : 1, version.id);
 }
 
@@ -198,7 +196,7 @@ export function registerGameVersionRoutes(app: Hono<{ Bindings: AppBindings }>, 
     if (!result.meta.changes) fail(409, "game_version_unavailable", "Esta versão está sendo removida. Atualize o catálogo para baixar a versão nova.");
     return c.json({ success: true, leaseId, archiveKey: key, expiresAt, heartbeatSeconds: 60,
       packageType: version.packageType, archiveSize: version.archiveSize, executablePath: version.executablePath,
-      versionLabel: version.versionLabel, origin: version.origin, protectedPaths: version.protectedPaths,
+      origin: version.origin, protectedPaths: version.protectedPaths,
       installName: game.installName ?? game.install_name ?? "" });
   });
 
