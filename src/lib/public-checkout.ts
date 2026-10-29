@@ -10,6 +10,7 @@ import { normalizeStoredPlanTier, type PlanTier } from "./plan-tiers";
 import { getPublicAppOrigin } from "./public-origin";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 import { assertNoPendingPixReactivation } from "./card-to-pix";
+import { addReactivationEvidence } from "./reactivation-evidence";
 
 const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
 const PROVIDER_STRIPE = "stripe";
@@ -604,7 +605,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
   const checkoutIp = getClientIp(c);
   const checkoutCountry = getCheckoutCountry(c);
   const checkoutUserAgent = getCheckoutUserAgent(c);
-  const checkoutEvidence = buildCheckoutEvidence({
+  const checkoutEvidence = addReactivationEvidence(buildCheckoutEvidence({
     emailVerifiedAt,
     planType: input.planType,
     planTier: billing.plansEnabled && input.planType !== "lifetime" ? selectedTier : null,
@@ -614,7 +615,7 @@ export async function createPublicStripeCheckout(c: AppContext, input: PublicChe
     acceptedRecoveryNoticeAt: now,
     billingEnabledAtCheckout: true,
     cardTrialDays,
-  });
+  }), reactivationLicenseId ? existingLicense : null, new Date(now));
 
   try {
     await c.env.merlin_db

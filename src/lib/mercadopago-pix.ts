@@ -13,6 +13,7 @@ import { LIFETIME_EXPIRES_AT } from "./public-access-management";
 import { RECOVERY_SECRET_DESCRIPTION, hashRecoveryPin, normalizeRecoveryPin } from "./recovery-pin";
 import { getBillingPlanPrice } from "./subscription-plan-change";
 import { assertExpiredCardToPixReady } from "./card-to-pix";
+import { addReactivationEvidence } from "./reactivation-evidence";
 
 const PROVIDER_MP = "mercadopago";
 const PIX_MODE = "pix";
@@ -1583,7 +1584,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
     acceptedRecoveryNoticeAt: now,
     environment: runtimeEnvironment,
   });
-  const checkoutEvidence = transition || trustedRenewal?.cardToPixVerified ? JSON.stringify({
+  const checkoutEvidence = addReactivationEvidence(transition || trustedRenewal?.cardToPixVerified ? JSON.stringify({
     ...JSON.parse(checkoutEvidenceBase) as Record<string, unknown>,
     ...(transition ? {
       currentTier: transition.currentTier,
@@ -1595,7 +1596,7 @@ export async function createPublicPixOrder(c: AppContext, input: PublicPixOrderI
       unusedPixCreditCents: transition.unusedPixCreditCents,
     } : {}),
     ...(trustedRenewal?.cardToPixVerified ? { cardToPixVerified: true } : {}),
-  }) : checkoutEvidenceBase;
+  }) : checkoutEvidenceBase, canReactivate ? existingLicense : null, nowDate);
 
   try {
     await c.env.merlin_db

@@ -36,7 +36,7 @@ function setup(timing: "immediate" | "period_end" | "payment_method_only" | "ear
     CREATE TABLE payments (
       id INTEGER PRIMARY KEY, customer_id INTEGER, license_id INTEGER, provider TEXT,
       provider_payment_id TEXT, provider_checkout_session_id TEXT, provider_subscription_id TEXT,
-      amount_cents INTEGER, currency TEXT, status TEXT, payment_type TEXT, created_at TEXT
+      amount_cents INTEGER, currency TEXT, status TEXT, payment_type TEXT, billing_reason TEXT, created_at TEXT
     );
     CREATE TABLE payment_events (
       id INTEGER PRIMARY KEY, provider TEXT, provider_event_id TEXT UNIQUE,
@@ -156,6 +156,8 @@ describe("Pix-to-card webhook", () => {
         expires_at: "2030-02-16T00:00:00.000Z", stripe_subscription_id: "sub_test_change" });
     expect(sqlite.prepare("SELECT amount_cents FROM payments WHERE provider_payment_id = 'in_initial'").get())
       .toMatchObject({ amount_cents: 1245 });
+    expect(sqlite.prepare("SELECT billing_reason FROM payments WHERE provider_payment_id = 'in_initial'").get())
+      .toMatchObject({ billing_reason: "subscription_create" });
     const start = Date.parse("2030-02-16T00:00:00.000Z") / 1000;
     const end = Date.parse("2030-03-16T00:00:00.000Z") / 1000;
     await processStripeWebhookEvent(c, { id: "evt_renewal", type: "invoice.paid", data: { object: {
@@ -169,6 +171,8 @@ describe("Pix-to-card webhook", () => {
     expect(sqlite.prepare("SELECT license_key, hwid, plan_tier, expires_at FROM licenses WHERE id = 7").get())
       .toMatchObject({ license_key: "MERLIN-EXISTING", hwid: "existing-hwid", plan_tier: "prata",
         expires_at: "2030-03-16T00:00:00.000Z" });
+    expect(sqlite.prepare("SELECT billing_reason FROM payments WHERE provider_payment_id = 'in_renewal'").get())
+      .toMatchObject({ billing_reason: "subscription_cycle" });
     sqlite.close();
   });
 

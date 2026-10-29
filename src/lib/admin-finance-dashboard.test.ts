@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyPayer, summarizeFinance, type FinanceLicenseRow } from "./admin-finance-dashboard";
+import { classifyPayer, summarizeFinance, summarizePaidPeriodDistribution, type FinanceLicenseRow } from "./admin-finance-dashboard";
 
 const now = new Date("2026-10-28T12:00:00.000Z");
 
@@ -27,6 +27,13 @@ const prices = [
 ];
 
 describe("admin finance dashboard", () => {
+  it("groups retained active payers by confirmed paid periods", () => {
+    expect(summarizePaidPeriodDistribution([
+      { paid_periods: 1 }, { paid_periods: 2 }, { paid_periods: 3 },
+      { paid_periods: 4 }, { paid_periods: 8 }, { paid_periods: 0 },
+    ])).toEqual({ onePeriod: 1, twoPeriods: 1, threePeriods: 1, fourOrMorePeriods: 2 });
+  });
+
   it("separates Pix manual from Stripe even though both can use monthly_subscription", () => {
     expect(classifyPayer(license(1))).toBe("pix");
     expect(classifyPayer(license(2, { source: "stripe", stripe_subscription_id: "sub_2", billing_cancel_at_period_end: 0 }))).toBe("card_auto");

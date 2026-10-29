@@ -764,6 +764,7 @@ async function savePayment(
     currency: string;
     status: string;
     paymentType: "one_time" | "subscription";
+    billingReason?: string | null;
   },
 ) {
   await c.env.merlin_db
@@ -771,13 +772,22 @@ async function savePayment(
       `
         INSERT OR IGNORE INTO payments (
           customer_id, license_id, provider, provider_payment_id, provider_checkout_session_id, provider_subscription_id,
-          amount_cents, currency, status, payment_type, created_at
+          amount_cents, currency, status, payment_type, billing_reason, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     )
-    .bind(input.customerId, input.licenseId, PROVIDER_STRIPE, input.paymentId, input.checkoutSessionId, input.subscriptionId, input.amountCents, input.currency, input.status, input.paymentType, new Date().toISOString())
+    .bind(input.customerId, input.licenseId, PROVIDER_STRIPE, input.paymentId, input.checkoutSessionId, input.subscriptionId, input.amountCents, input.currency, input.status, input.paymentType, input.billingReason || null, new Date().toISOString())
     .run();
+
+  // checkout.session.completed can persist a paid invoice before invoice.paid;
+  // enrich that idempotent row later instead of losing Stripe's billing reason.
+  if (input.billingReason && input.paymentId) {
+    await c.env.merlin_db.prepare(`
+      UPDATE payments SET billing_reason = ?
+      WHERE provider = ? AND provider_payment_id = ? AND billing_reason IS NULL
+    `).bind(input.billingReason, PROVIDER_STRIPE, input.paymentId).run();
+  }
 }
 
 async function getUpgradeLicenseById(c: AppContext, licenseId: number) {
@@ -1063,6 +1073,7 @@ async function handleCheckoutCompleted(c: AppContext, session: Record<string, un
         currency: "brl",
         status: "paid",
         paymentType: "subscription",
+        billingReason: evidence.firstInvoiceSubscription ? "subscription_create" : null,
       });
     }
     return;
@@ -1254,7 +1265,8 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     await savePayment(c, { customerId: checkout.customer_id, licenseId: checkout.license_id,
       paymentId: getString(invoice.id), checkoutSessionId: checkout.provider_session_id, subscriptionId,
       amountCents: getNumber(invoice.amount_paid) ?? getNumber(invoice.total) ?? 0,
-      currency: getString(invoice.currency) || "brl", status: "paid", paymentType: "subscription" });
+      currency: getString(invoice.currency) || "brl", status: "paid", paymentType: "subscription",
+      billingReason: getString(invoice.billing_reason) });
     await syncInvoicePlanChangeFromStripe(c, invoice);
     return;
   }
@@ -1306,6 +1318,7 @@ async function handleInvoicePaid(c: AppContext, invoice: Record<string, unknown>
     currency: getString(invoice.currency) || "brl",
     status: "paid",
     paymentType: "subscription",
+    billingReason: getString(invoice.billing_reason),
   });
   await syncInvoicePlanChangeFromStripe(c, invoice);
 }

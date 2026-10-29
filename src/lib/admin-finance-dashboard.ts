@@ -30,6 +30,22 @@ type ReceiptRow = {
 };
 
 type ReconciliationRow = { unmatched_paid_checkouts: number };
+type RetentionRow = { paid_periods: number };
+type CountRow = { count: number };
+
+const RECURRING_ACCESS_TYPES = "'monthly_subscription','semiannual_subscription','annual_subscription','monthly_manual','semiannual_manual','annual_manual'";
+
+export function summarizePaidPeriodDistribution(rows: RetentionRow[]) {
+  const distribution = { onePeriod: 0, twoPeriods: 0, threePeriods: 0, fourOrMorePeriods: 0 };
+  for (const row of rows) {
+    const periods = Math.max(0, Number(row.paid_periods) || 0);
+    if (periods === 1) distribution.onePeriod += 1;
+    else if (periods === 2) distribution.twoPeriods += 1;
+    else if (periods === 3) distribution.threePeriods += 1;
+    else if (periods >= 4) distribution.fourOrMorePeriods += 1;
+  }
+  return distribution;
+}
 
 export type PayerCategory = "card_auto" | "card_ending" | "pix" | "lifetime" | "attention";
 type Period = "monthly" | "semiannual" | "annual" | "lifetime";
@@ -188,6 +204,95 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     SELECT DISTINCT license_id FROM subscription_plan_changes
     WHERE status IN ('pending_payment','payment_action_required','payment_failed','scheduled')
   `).all<{ license_id: number }>();
+  const retentionRows = await c.env.merlin_db.prepare(`
+    SELECT l.id,
+      COUNT(DISTINCT CASE WHEN
+        (p.provider='stripe' AND p.payment_type='subscription'
+          AND p.billing_reason IN ('subscription_create','subscription_cycle'))
+        OR (p.provider='mercadopago' AND p.payment_type='one_time'
+          AND pay_checkout.payment_status='paid' AND pay_checkout.plan_type IN ('monthly','semiannual','annual')
+          AND pay_checkout.operation_type IS NULL)
+        THEN p.id END) AS paid_periods,
+      COUNT(DISTINCT CASE WHEN p.provider='stripe' AND p.payment_type='subscription'
+        AND p.billing_reason IS NULL
+        AND COALESCE(pay_checkout.operation_type,'') NOT IN ('pix_plan_transition','prepaid_card_plan_change')
+        THEN p.id END) AS unclassified_card_payments
+    FROM licenses l
+    LEFT JOIN payments p ON p.license_id=l.id AND p.status='paid' AND p.amount_cents>0 AND p.currency='brl'
+    LEFT JOIN checkout_sessions pay_checkout
+      ON pay_checkout.provider=p.provider AND pay_checkout.provider_session_id=p.provider_checkout_session_id
+    WHERE l.status='active' AND l.expires_at > ?
+      AND COALESCE(l.license_type,'normal') <> 'test'
+      AND l.access_type IN (${RECURRING_ACCESS_TYPES})
+    GROUP BY l.id
+    HAVING paid_periods > 0 AND unclassified_card_payments = 0
+  `).bind(nowIso).all<RetentionRow>();
+  const unclassifiedRetentionRow = await c.env.merlin_db.prepare(`
+    SELECT COUNT(DISTINCT l.id) AS count
+    FROM licenses l JOIN payments p ON p.license_id=l.id
+    LEFT JOIN checkout_sessions pay_checkout
+      ON pay_checkout.provider=p.provider AND pay_checkout.provider_session_id=p.provider_checkout_session_id
+    WHERE l.status='active' AND l.expires_at > ?
+      AND COALESCE(l.license_type,'normal') <> 'test'
+      AND l.access_type IN (${RECURRING_ACCESS_TYPES})
+      AND p.provider='stripe' AND p.payment_type='subscription' AND p.status='paid' AND p.amount_cents>0
+      AND p.billing_reason IS NULL
+      AND COALESCE(pay_checkout.operation_type,'') NOT IN ('pix_plan_transition','prepaid_card_plan_change')
+  `).bind(nowIso).first<CountRow>();
+  const churnRow = await c.env.merlin_db.prepare(`
+    WITH churned_licenses AS (
+      SELECT l.id
+      FROM licenses l
+      WHERE l.expires_at >= ? AND l.expires_at <= ?
+        AND COALESCE(l.license_type,'normal') <> 'test' AND l.status <> 'revoked'
+        AND l.access_type IN (${RECURRING_ACCESS_TYPES})
+        AND EXISTS (
+          SELECT 1 FROM payments p
+          WHERE p.license_id=l.id AND p.status='paid' AND p.amount_cents>0
+            AND ((p.provider='stripe' AND p.payment_type='subscription') OR
+              (p.provider='mercadopago' AND EXISTS (
+                SELECT 1 FROM checkout_sessions pc WHERE pc.provider=p.provider
+                  AND pc.provider_session_id=p.provider_checkout_session_id
+                  AND pc.plan_type IN ('monthly','semiannual','annual')
+              )))
+        )
+      UNION
+      SELECT cs.reactivation_license_id AS id
+      FROM checkout_sessions cs
+      JOIN licenses l ON l.id=cs.reactivation_license_id
+      WHERE json_extract(CASE WHEN json_valid(cs.checkout_evidence_json) THEN cs.checkout_evidence_json ELSE '{}' END,'$.reactivationReason')='expired'
+        AND json_extract(CASE WHEN json_valid(cs.checkout_evidence_json) THEN cs.checkout_evidence_json ELSE '{}' END,'$.reactivationPreviousExpiresAt') >= ?
+        AND json_extract(CASE WHEN json_valid(cs.checkout_evidence_json) THEN cs.checkout_evidence_json ELSE '{}' END,'$.reactivationPreviousExpiresAt') <= ?
+        AND COALESCE(l.license_type,'normal') <> 'test'
+        AND EXISTS (
+          SELECT 1 FROM payments p WHERE p.license_id=l.id AND p.status='paid' AND p.amount_cents>0
+            AND p.created_at < COALESCE(cs.completed_at,cs.created_at)
+            AND (p.provider_checkout_session_id IS NULL OR p.provider_checkout_session_id <> cs.provider_session_id)
+        )
+    )
+    SELECT COUNT(*) AS count FROM churned_licenses
+  `).bind(startIso, nowIso, startIso, nowIso).first<CountRow>();
+  const returnedRow = await c.env.merlin_db.prepare(`
+    SELECT COUNT(DISTINCT cs.reactivation_license_id) AS count
+    FROM checkout_sessions cs
+    WHERE cs.reactivation_license_id IS NOT NULL AND cs.payment_status='paid'
+      AND cs.completed_at >= ? AND cs.completed_at <= ?
+      AND json_extract(CASE WHEN json_valid(cs.checkout_evidence_json) THEN cs.checkout_evidence_json ELSE '{}' END,'$.reactivationReason')='expired'
+      AND EXISTS (
+        SELECT 1 FROM payments current_payment
+        WHERE current_payment.provider=cs.provider
+          AND current_payment.provider_checkout_session_id=cs.provider_session_id
+          AND current_payment.status='paid' AND current_payment.amount_cents>0
+      )
+      AND EXISTS (
+        SELECT 1 FROM payments previous_payment
+        WHERE previous_payment.license_id=cs.reactivation_license_id
+          AND previous_payment.status='paid' AND previous_payment.amount_cents>0
+          AND previous_payment.created_at < cs.completed_at
+          AND (previous_payment.provider_checkout_session_id IS NULL
+            OR previous_payment.provider_checkout_session_id <> cs.provider_session_id)
+      )
+  `).bind(startIso, nowIso).first<CountRow>();
   const result = summarizeFinance(
     licenseRows.results,
     priceRows.results,
@@ -199,6 +304,15 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     generatedAt: nowIso,
     periodDays,
     reconciliation: { unmatchedPaidCheckouts: reconciliationRow?.unmatched_paid_checkouts || 0 },
+    lifecycle: {
+      retention: {
+        activeRecurringLicenses: retentionRows.results.length,
+        paidPeriodDistribution: summarizePaidPeriodDistribution(retentionRows.results),
+        unclassifiedCardLicenses: unclassifiedRetentionRow?.count || 0,
+      },
+      churn: { expiredPaidLicenses: churnRow?.count || 0, periodDays },
+      returned: { paidAgainAfterExpiry: returnedRow?.count || 0, periodDays },
+    },
     ...result,
   };
 }

@@ -31,7 +31,7 @@ function setup() {
     CREATE TABLE payments (id INTEGER PRIMARY KEY, customer_id INTEGER, license_id INTEGER,
       provider TEXT, provider_payment_id TEXT UNIQUE, provider_checkout_session_id TEXT,
       provider_subscription_id TEXT, amount_cents INTEGER, currency TEXT, status TEXT,
-      payment_type TEXT, created_at TEXT);
+      payment_type TEXT, billing_reason TEXT, created_at TEXT);
     CREATE TABLE payment_events (id INTEGER PRIMARY KEY, provider TEXT, provider_event_id TEXT UNIQUE,
       event_type TEXT, raw_created_at TEXT, processing_status TEXT, created_at TEXT,
       processed_at TEXT, error_message TEXT);

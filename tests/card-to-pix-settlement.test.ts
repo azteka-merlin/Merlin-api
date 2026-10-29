@@ -32,7 +32,7 @@ function setup(stripeStatus: "active" | "canceled") {
     CREATE TABLE payments (id INTEGER PRIMARY KEY, customer_id INTEGER, license_id INTEGER,
       provider TEXT, provider_payment_id TEXT UNIQUE, provider_checkout_session_id TEXT,
       provider_subscription_id TEXT, amount_cents INTEGER, currency TEXT, status TEXT,
-      payment_type TEXT, created_at TEXT);
+      payment_type TEXT, billing_reason TEXT, created_at TEXT);
     INSERT INTO customers (id, email, email_normalized)
       VALUES (3, 'someone@example.com', 'someone@example.com');
     INSERT INTO licenses (id, license_key, name, contact, contact_type, expires_at, status,
