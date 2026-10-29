@@ -260,17 +260,44 @@ function parseCloudScope(c: AppContext, accountId: string, appId: string): { acc
   return { accountId, appId, prefix: `${storage}steam/${accountId}/${appId}/` };
 }
 
-async function listR2Objects(bucket: R2Bucket, prefix: string): Promise<R2Object[]> {
+async function listR2Objects(bucket: R2Bucket, prefix: string, includeMetadata = false): Promise<R2Object[]> {
   const objects: R2Object[] = [];
   let cursor: string | undefined;
-  let pages = 0;
   do {
-    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    const page = await bucket.list({ prefix, cursor, limit: 1000,
+      ...(includeMetadata ? { include: ["customMetadata" as const] } : {}) });
     objects.push(...page.objects);
+    if (page.truncated && !page.cursor) throw new Error("R2 list returned no continuation cursor");
     cursor = page.truncated ? page.cursor : undefined;
-    pages += 1;
-  } while (cursor && pages < 20);
+  } while (cursor);
   return objects;
+}
+
+async function listCloudAppIds(bucket: R2Bucket, prefix: string): Promise<string[]> {
+  const appIds = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, delimiter: "/", cursor, limit: 1000 });
+    for (const folder of page.delimitedPrefixes) {
+      const appId = folder.startsWith(prefix) ? folder.slice(prefix.length).replace(/\/$/, "") : "";
+      if (/^[1-9]\d{0,9}$/.test(appId)) appIds.add(appId);
+    }
+    if (page.truncated && !page.cursor) throw new Error("R2 list returned no continuation cursor");
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return [...appIds];
+}
+
+async function mapLimited<T, R>(values: T[], concurrency: number, work: (value: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (next < values.length) {
+      const index = next++;
+      results[index] = await work(values[index]!);
+    }
+  }));
+  return results;
 }
 
 async function readCloudState(bucket: R2Bucket, scope: { prefix: string }): Promise<{ state: CloudState; object: R2ObjectBody } | null> {
@@ -317,14 +344,15 @@ function parseRecoveryBlobKey(originalKey: string, scope: { accountId: string; a
 
 async function listRecoveryGroups(c: AppContext, scope: { accountId: string; appId: string }, current: CloudState): Promise<RecoveryGroup[]> {
   const prefix = `${storagePrefix(c)}recovery/steam/${scope.accountId}/${scope.appId}/`;
-  const objects = await listR2Objects(c.env.MERLIN_FILES, prefix);
+  const objects = await listR2Objects(c.env.MERLIN_FILES, prefix, true);
   const groups = new Map<string, RecoveryFile[]>();
   for (const object of objects) {
-    const head = await c.env.MERLIN_FILES.head(object.key);
-    const originalKey = head?.customMetadata?.originalKey || "";
+    // Older R2 listings may omit metadata; only those objects need a HEAD.
+    const metadata = object.customMetadata ?? (await c.env.MERLIN_FILES.head(object.key))?.customMetadata;
+    const originalKey = metadata?.originalKey || "";
     const parsed = parseRecoveryBlobKey(originalKey, scope);
     if (!parsed) continue;
-    const snapshotId = head?.customMetadata?.snapshotId || "legacy";
+    const snapshotId = metadata?.snapshotId || "legacy";
     // CN alone is not a backup boundary: CloudRedirect can overwrite blobs
     // many minutes before publishing a new state with the same CN. Group
     // nearby file copies instead, and leave state/cn metadata out of the UI.
@@ -371,33 +399,51 @@ export async function listCloudGames(c: AppContext): Promise<Response> {
   const accountId = c.req.query("accountId") || "";
   if (!/^[1-9]\d{0,9}$/.test(accountId)) return c.json({ success: false, error: "Invalid Steam account" }, 400);
   const prefix = `${storage}steam/${accountId}/`;
-  const objects = await listR2Objects(c.env.MERLIN_FILES, prefix);
-  const stateObjects = objects.filter((item) => /\/state\.cloudredirect$/.test(item.key));
-  const games = [];
-  for (const object of stateObjects.slice(0, 100)) {
-    const match = new RegExp(`^${storage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}steam/${accountId}/([1-9]\\d{0,9})/state\\.cloudredirect$`).exec(object.key);
-    if (!match) continue;
-    const appId = match[1] || "";
-    const scope = parseCloudScope(c, accountId, appId);
-    if (!scope) continue;
-    const current = await readCloudState(c.env.MERLIN_FILES, scope);
-    if (!current) continue;
-    const backups = await listRecoveryGroups(c, scope, current.state);
-    const game = await c.env.merlin_db.prepare(
-      "SELECT name, cover_url FROM catalog_games WHERE app_id = ? LIMIT 1",
-    ).bind(appId).first<{ name?: string; cover_url?: string | null }>();
-    games.push({
-      appId,
-      name: game?.name || `Steam App ${appId}`,
-      coverUrl: game?.cover_url || null,
-      lastSyncAt: object.uploaded.toISOString(),
-      synced: true,
-      currentVersion: stateSummary(current.state, object.uploaded),
-      backupCount: backups.length,
+  const startedAt = performance.now();
+  let phase = "discovery";
+  try {
+    const appIds = await listCloudAppIds(c.env.MERLIN_FILES, prefix);
+    const discoveryMs = performance.now() - startedAt;
+    phase = "catalog";
+    const names = new Map<string, { name?: string; cover_url?: string | null }>();
+    // D1 allows at most 100 bound parameters per statement.
+    for (let offset = 0; offset < appIds.length; offset += 100) {
+      const batch = appIds.slice(offset, offset + 100);
+      const rows = await c.env.merlin_db.prepare(
+        `SELECT app_id, name, cover_url FROM catalog_games WHERE app_id IN (${batch.map(() => "?").join(",")})`,
+      ).bind(...batch).all<{ app_id: string; name?: string; cover_url?: string | null }>();
+      for (const row of rows.results) names.set(row.app_id, row);
+    }
+    const namesMs = performance.now() - startedAt - discoveryMs;
+    phase = "game-details";
+    const resolved = await mapLimited(appIds, 4, async (appId) => {
+      const scope = parseCloudScope(c, accountId, appId);
+      if (!scope) return null;
+      const current = await readCloudState(c.env.MERLIN_FILES, scope);
+      if (!current) return null;
+      const backups = await listRecoveryGroups(c, scope, current.state);
+      const game = names.get(appId);
+      return {
+        appId,
+        name: game?.name || `Steam App ${appId}`,
+        coverUrl: game?.cover_url || null,
+        lastSyncAt: current.object.uploaded.toISOString(),
+        synced: true,
+        currentVersion: stateSummary(current.state, current.object.uploaded),
+        backupCount: backups.length,
+      };
     });
+    const games = resolved.filter((game): game is NonNullable<typeof game> => game !== null);
+    games.sort((a, b) => a.name.localeCompare(b.name));
+    console.info("[cloud-sync:list-games]", { appFolders: appIds.length, games: games.length,
+      discoveryMs: Math.round(discoveryMs), namesMs: Math.round(namesMs),
+      gameDetailsMs: Math.round(performance.now() - startedAt - discoveryMs - namesMs) });
+    return c.json({ success: true, games }, 200, { "Cache-Control": "no-store" });
+  } catch (error) {
+    console.error("[cloud-sync:list-games:error]", { phase, elapsedMs: Math.round(performance.now() - startedAt),
+      errorType: error instanceof Error ? error.name : "unknown" });
+    throw error;
   }
-  games.sort((a, b) => a.name.localeCompare(b.name));
-  return c.json({ success: true, games }, 200, { "Cache-Control": "no-store" });
 }
 
 export async function getCloudGame(c: AppContext): Promise<Response> {

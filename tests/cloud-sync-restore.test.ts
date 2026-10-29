@@ -15,8 +15,10 @@ const newIndexSha = "e".repeat(40);
 const unchangedSha = "c".repeat(40);
 const capturedAt = new Date("2026-10-09T08:59:37Z");
 
-function fixture({ active = false, missingCurrentBlob = false } = {}) {
+function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, omitListMetadata = false,
+  catalogRows = {} as Record<string, { name: string; cover_url: string | null }> } = {}) {
   const objects = new Map<string, { bytes: Uint8Array; metadata: Record<string, string>; uploaded: Date }>();
+  const calls = { lists: [] as { prefix: string; delimiter?: string; include?: string[] }[], heads: 0, catalog: [] as string[][] };
   const put = (key: string, value: string, metadata: Record<string, string> = {}, uploaded = new Date()) => {
     objects.set(key, { bytes: new TextEncoder().encode(value), metadata, uploaded });
   };
@@ -53,6 +55,7 @@ function fixture({ active = false, missingCurrentBlob = false } = {}) {
       };
     },
     async head(key: string) {
+      calls.heads += 1;
       const object = objects.get(key);
       return object ? { size: object.bytes.length, customMetadata: object.metadata } : null;
     },
@@ -62,14 +65,35 @@ function fixture({ active = false, missingCurrentBlob = false } = {}) {
       objects.set(key, { bytes, metadata: options?.customMetadata || {}, uploaded: new Date() });
     },
     async delete(key: string) { objects.delete(key); },
-    async list({ prefix: listPrefix }: { prefix: string }) {
-      return { truncated: false, objects: [...objects.entries()].filter(([key]) => key.startsWith(listPrefix))
-        .map(([key, object]) => ({ key, size: object.bytes.length, uploaded: object.uploaded })) };
+    async list({ prefix: listPrefix, delimiter, include, cursor, limit = 1000 }:
+      { prefix: string; delimiter?: string; include?: string[]; cursor?: string; limit?: number }) {
+      calls.lists.push({ prefix: listPrefix, delimiter, include });
+      const keys = [...objects.keys()].filter((key) => key.startsWith(listPrefix)).sort();
+      const entries = [...new Set(keys.map((key) => {
+        const tail = key.slice(listPrefix.length);
+        const boundary = delimiter ? tail.indexOf(delimiter) : -1;
+        return boundary < 0 ? key : `${listPrefix}${tail.slice(0, boundary + delimiter!.length)}`;
+      }))];
+      const start = cursor ? entries.indexOf(cursor) + 1 : 0;
+      const count = Math.min(limit, pageSize);
+      const page = entries.slice(start, start + count);
+      const truncated = start + count < entries.length;
+      return { truncated, cursor: truncated ? page.at(-1) : undefined,
+        delimitedPrefixes: page.filter((key) => !objects.has(key)),
+        objects: page.filter((key) => objects.has(key)).map((key) => {
+          const object = objects.get(key)!;
+          return { key, size: object.bytes.length, uploaded: object.uploaded,
+            ...(include?.includes("customMetadata") && !omitListMetadata ? { customMetadata: object.metadata } : {}) };
+        }) };
     },
   };
   const context = {
     env: { ENVIRONMENT: "staging", MERLIN_FILES: bucket,
-      merlin_db: { prepare: () => ({ bind: () => ({ first: async () => null }) }) } },
+      merlin_db: { prepare: (sql: string) => ({ bind: (...ids: string[]) => ({
+        first: async () => null,
+        all: async () => { calls.catalog.push(ids); return { results: ids.filter((id) => catalogRows[id])
+          .map((app_id) => ({ app_id, ...catalogRows[app_id] })) }; },
+      }) }) } },
     req: {
       json: async () => ({ accountId: "123456", appId: "730", recoveryId }),
       query: () => "123456",
@@ -77,16 +101,46 @@ function fixture({ active = false, missingCurrentBlob = false } = {}) {
     },
     json: (value: unknown, status: number) => Response.json(value, { status }),
   } as unknown as AppContext;
-  return { context, objects, current, put, recoveryId };
+  return { context, objects, current, put, recoveryId, calls };
 }
 
 describe("cloud save restoration", () => {
   it("lists only the two overwritten save files, not unrelated state metadata", async () => {
-    const { context, recoveryId } = fixture();
+    const { context, recoveryId, calls } = fixture();
     const response = await getCloudGame(context);
     expect(response.status).toBe(200);
     const result = await response.json() as { game: { backups: { id: string; fileCount: number; totalSize: number }[] } };
     expect(result.game.backups).toEqual([{ id: recoveryId, createdAt: expect.any(String), fileCount: 2, totalSize: 17 }]);
+    expect(calls.heads).toBe(0);
+    expect(calls.lists.some((call) => call.include?.includes("customMetadata"))).toBe(true);
+  });
+
+  it("falls back to HEAD for a legacy listing without metadata", async () => {
+    const { context, recoveryId, calls } = fixture({ omitListMetadata: true });
+    const result = await (await getCloudGame(context)).json() as { game: { backups: { id: string }[] } };
+    expect(result.game.backups[0]?.id).toBe(recoveryId);
+    expect(calls.heads).toBeGreaterThan(0);
+  });
+
+  it("discovers game folders instead of all save blobs and batches catalog names", async () => {
+    const { context, put, current, calls } = fixture({ pageSize: 2,
+      catalogRows: { "730": { name: "Catalog title", cover_url: "https://example.test/cover.jpg" } } });
+    for (let appId = 1000; appId < 1102; appId++) {
+      put(`cloud-sync/stage/steam/123456/${appId}/state.cloudredirect`, JSON.stringify(current));
+      put(`cloud-sync/stage/steam/123456/${appId}/blobs/save.dat/${newSaveSha}`, "data");
+    }
+    put(`cloud-sync/stage/steam/123456/1200/blobs/orphan/${newSaveSha}`, "orphan");
+    const response = await listCloudGames(context);
+    const result = await response.json() as { games: { appId: string; backupCount: number }[] };
+    expect(result.games).toHaveLength(103);
+    expect(result.games.find((game) => game.appId === "1200")).toBeUndefined();
+    expect(result.games.find((game) => game.appId === "730")?.backupCount).toBe(1);
+    expect(result.games.find((game) => game.appId === "730")?.name).toBe("Catalog title");
+    expect(calls.catalog.map((batch) => batch.length)).toEqual([100, 4]);
+    expect(calls.lists.filter((call) => call.prefix === "cloud-sync/stage/steam/123456/")
+      .every((call) => call.delimiter === "/")).toBe(true);
+    expect(calls.lists.filter((call) => call.prefix === "cloud-sync/stage/steam/123456/").length).toBeGreaterThan(1);
+    expect(calls.heads).toBe(0);
   });
 
   it("keeps production saves separate from stage in the shared bucket", async () => {
