@@ -50,6 +50,7 @@ import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSour
 import { getBillingNotificationsDashboard, getExpirationReminderEligibility, retryFailedBillingNotification, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
+import { getAdminFinanceDashboard } from "./lib/admin-finance-dashboard";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
 import {
   cancelPublicAccessPlanChange,
@@ -2828,6 +2829,13 @@ app.get("/panel-api/payments", async (c) => {
   const limit = Number(c.req.query("limit") || "120");
   const payload = await listAdminPaymentLogs(c, Number.isFinite(limit) ? limit : 120);
   return c.json(payload, 200);
+});
+
+app.get("/panel-api/payments/dashboard", async (c) => {
+  await requireAdminSession(c);
+  const days = Number(c.req.query("days") || "30");
+  c.header("Cache-Control", "no-store");
+  return c.json(await getAdminFinanceDashboard(c, days), 200);
 });
 
 app.post("/panel-api/payments/checkouts/:sessionId/sync-stripe", async (c) => {
