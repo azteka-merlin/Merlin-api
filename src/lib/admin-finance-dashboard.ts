@@ -25,6 +25,7 @@ type PriceRow = {
 type ReceiptRow = {
   provider: string;
   payment_type: string;
+  plan_type: string | null;
   amount_cents: number;
   payment_count: number;
 };
@@ -49,6 +50,16 @@ export function summarizePaidPeriodDistribution(rows: RetentionRow[]) {
 
 export type PayerCategory = "card_auto" | "card_ending" | "pix" | "lifetime" | "attention";
 type Period = "monthly" | "semiannual" | "annual" | "lifetime";
+
+type ReceiptPeriod = Period | "other";
+
+function emptyPeriodTotals() {
+  return { amountCents: 0, paymentCount: 0 };
+}
+
+function emptyPeriodProjection() {
+  return { cardCents: 0, cardCount: 0, pixPotentialCents: 0, pixPotentialCount: 0 };
+}
 
 export function classifyPayer(row: FinanceLicenseRow): PayerCategory | null {
   const hasCard = Boolean(row.stripe_subscription_id);
@@ -92,10 +103,22 @@ export function summarizeFinance(
     receivedCount: 0,
     receivedStripeCents: 0,
     receivedPixCents: 0,
+    receivedByPeriod: {
+      monthly: emptyPeriodTotals(),
+      semiannual: emptyPeriodTotals(),
+      annual: emptyPeriodTotals(),
+      lifetime: emptyPeriodTotals(),
+      other: emptyPeriodTotals(),
+    },
     nextCardCents: 0,
     nextCardCount: 0,
     nextPixPotentialCents: 0,
     nextPixPotentialCount: 0,
+    nextRenewalsByPeriod: {
+      monthly: emptyPeriodProjection(),
+      semiannual: emptyPeriodProjection(),
+      annual: emptyPeriodProjection(),
+    },
     unpricedRenewals: 0,
     pendingChangeRenewals: 0,
   };
@@ -125,9 +148,17 @@ export function summarizeFinance(
       else if (category === "card_auto") {
         summary.nextCardCents += amountCents;
         summary.nextCardCount += 1;
+        if (period !== "lifetime") {
+          summary.nextRenewalsByPeriod[period].cardCents += amountCents;
+          summary.nextRenewalsByPeriod[period].cardCount += 1;
+        }
       } else {
         summary.nextPixPotentialCents += amountCents;
         summary.nextPixPotentialCount += 1;
+        if (period !== "lifetime") {
+          summary.nextRenewalsByPeriod[period].pixPotentialCents += amountCents;
+          summary.nextRenewalsByPeriod[period].pixPotentialCount += 1;
+        }
       }
     }
 
@@ -153,6 +184,12 @@ export function summarizeFinance(
     const count = Number(receipt.payment_count) || 0;
     summary.receivedCents += amount;
     summary.receivedCount += count;
+    const knownPeriods: ReceiptPeriod[] = ["monthly", "semiannual", "annual", "lifetime"];
+    const period: ReceiptPeriod = knownPeriods.includes(receipt.plan_type as ReceiptPeriod)
+      ? receipt.plan_type as Period
+      : "other";
+    summary.receivedByPeriod[period].amountCents += amount;
+    summary.receivedByPeriod[period].paymentCount += count;
     if (receipt.provider === "stripe") summary.receivedStripeCents += amount;
     if (receipt.provider === "mercadopago") summary.receivedPixCents += amount;
   }
@@ -185,10 +222,12 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     FROM billing_plan_prices WHERE provider='stripe' AND active=1
   `).all<PriceRow>();
   const receiptRows = await c.env.merlin_db.prepare(`
-    SELECT provider,payment_type,SUM(amount_cents) AS amount_cents,COUNT(*) AS payment_count
-    FROM payments
-    WHERE status='paid' AND currency='brl' AND created_at >= ? AND created_at <= ?
-    GROUP BY provider,payment_type
+    SELECT p.provider,p.payment_type,cs.plan_type,SUM(p.amount_cents) AS amount_cents,COUNT(*) AS payment_count
+    FROM payments p
+    LEFT JOIN checkout_sessions cs
+      ON cs.provider=p.provider AND cs.provider_session_id=p.provider_checkout_session_id
+    WHERE p.status='paid' AND p.currency='brl' AND p.created_at >= ? AND p.created_at <= ?
+    GROUP BY p.provider,p.payment_type,cs.plan_type
   `).bind(startIso, nowIso).all<ReceiptRow>();
   const reconciliationRow = await c.env.merlin_db.prepare(`
     SELECT COUNT(*) AS unmatched_paid_checkouts

@@ -2,6 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../src/types";
 import { handleCloudGateway } from "../src/lib/cloud-sync";
+import worker from "../src/index";
 
 const master = "test-only-master-secret";
 const accessKeyId = `MCL${"a".repeat(40)}`;
@@ -103,6 +104,26 @@ function fakeContext(request: Request) {
 }
 
 describe("stage cloud gateway roundtrip", () => {
+  it("routes signed saves through the public host after admin domain separation", async () => {
+    const key = "/merlin-cloud/steam/123456/730/blobs/routing-test.dat";
+    const fixture = fakeContext(signed("PUT", key, "save-through-public-host"));
+    const env = {
+      ...fixture.context.env,
+      ADMIN_APP_HOST: "admin-staging.api-merlin.com",
+      PUBLIC_APP_ORIGIN: "https://staging.api-merlin.com",
+      SESSION_HASH_SECRET: "routing-test-secret",
+    };
+    const execution = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
+    const put = await worker.fetch(signed("PUT", key, "save-through-public-host"), env, execution);
+    expect(put.status).toBe(200);
+    const get = await worker.fetch(signed("GET", key), env, execution);
+    expect(get.status).toBe(200);
+    expect(await get.text()).toBe("save-through-public-host");
+    const listing = await worker.fetch(signed("GET", "/merlin-cloud?list-type=2&prefix=steam%2F123456%2F730%2F"), env, execution);
+    expect(listing.status).toBe(200);
+    expect(await listing.text()).toContain("routing-test.dat");
+  });
+
   it("stores, lists and retrieves a signed save; keeps only the latest recovery copies", async () => {
     const key = "/merlin-cloud/steam/123456/730/blobs/save.dat";
     const first = signed("PUT", key, "save-v1");

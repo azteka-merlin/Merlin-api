@@ -97,6 +97,6 @@ export class PublicEmailVerificationVerifyRoute extends OpenAPIRoute {
 
 	async handle(c: AppContext) {
 		const data = await this.getValidatedData<typeof this.schema>();
-		return verifyPublicEmailCode(c, data.body);
+		return c.json(await verifyPublicEmailCode(c, data.body), 200);
 	}
 }

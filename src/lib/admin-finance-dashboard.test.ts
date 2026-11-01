@@ -23,6 +23,9 @@ function license(id: number, patch: Partial<FinanceLicenseRow> = {}): FinanceLic
 const prices = [
   { payment_method: "pix", billing_period: "monthly", plan_tier: "bronze", amount_cents: 1490 },
   { payment_method: "card", billing_period: "monthly", plan_tier: "bronze", amount_cents: 1490 },
+  { payment_method: "pix", billing_period: "semiannual", plan_tier: "bronze", amount_cents: 6590 },
+  { payment_method: "card", billing_period: "semiannual", plan_tier: "bronze", amount_cents: 6590 },
+  { payment_method: "pix", billing_period: "annual", plan_tier: "ouro", amount_cents: 19990 },
   { payment_method: "card", billing_period: "annual", plan_tier: "ouro", amount_cents: 19990 },
 ];
 
@@ -53,8 +56,8 @@ describe("admin finance dashboard", () => {
       license(5, { source: "stripe", stripe_subscription_id: "sub_5", billing_cancel_at_period_end: 0, plan_tier: "ouro", access_type: "annual_subscription" }),
       license(6, { source: "stripe", access_type: "paid_lifetime", billing_current_period_end: null, expires_at: "9999-12-31T00:00:00.000Z" }),
     ], prices, [
-      { provider: "stripe", payment_type: "subscription", amount_cents: 3000, payment_count: 2 },
-      { provider: "mercadopago", payment_type: "one_time", amount_cents: 1490, payment_count: 1 },
+      { provider: "stripe", payment_type: "subscription", plan_type: "monthly", amount_cents: 3000, payment_count: 2 },
+      { provider: "mercadopago", payment_type: "one_time", plan_type: "monthly", amount_cents: 1490, payment_count: 1 },
     ], new Set([4]), now);
 
     expect(result.summary).toMatchObject({
@@ -66,6 +69,13 @@ describe("admin finance dashboard", () => {
       paidLifetime: 1,
       receivedCents: 4490,
       receivedCount: 3,
+      receivedByPeriod: {
+        monthly: { amountCents: 4490, paymentCount: 3 },
+        semiannual: { amountCents: 0, paymentCount: 0 },
+        annual: { amountCents: 0, paymentCount: 0 },
+        lifetime: { amountCents: 0, paymentCount: 0 },
+        other: { amountCents: 0, paymentCount: 0 },
+      },
       nextCardCents: 21480,
       nextCardCount: 2,
       nextPixPotentialCents: 1490,
@@ -82,5 +92,36 @@ describe("admin finance dashboard", () => {
     expect(result.summary.unpricedRenewals).toBe(1);
     expect(result.summary.nextCardCents).toBe(0);
     expect(result.summary.nextPixPotentialCents).toBe(0);
+  });
+
+  it("separates receipts and next-30-day estimates by monthly, semiannual and annual plan", () => {
+    const result = summarizeFinance([
+      license(1),
+      license(2, { access_type: "semiannual_subscription", source: "stripe", stripe_subscription_id: "sub_2", billing_cancel_at_period_end: 0 }),
+      license(3, { access_type: "annual_manual", plan_tier: "ouro" }),
+      license(4, { access_type: "paid_lifetime", source: "stripe", stripe_subscription_id: null, billing_current_period_end: null, expires_at: "9999-12-31T00:00:00.000Z" }),
+    ], prices, [
+      { provider: "mercadopago", payment_type: "one_time", plan_type: "monthly", amount_cents: 1490, payment_count: 1 },
+      { provider: "mercadopago", payment_type: "one_time", plan_type: "semiannual", amount_cents: 6590, payment_count: 1 },
+      { provider: "mercadopago", payment_type: "one_time", plan_type: "annual", amount_cents: 19990, payment_count: 1 },
+      { provider: "stripe", payment_type: "one_time", plan_type: "lifetime", amount_cents: 15000, payment_count: 1 },
+      { provider: "stripe", payment_type: "one_time", plan_type: null, amount_cents: 500, payment_count: 1 },
+    ], new Set(), now);
+
+    expect(result.summary.receivedByPeriod).toEqual({
+      monthly: { amountCents: 1490, paymentCount: 1 },
+      semiannual: { amountCents: 6590, paymentCount: 1 },
+      annual: { amountCents: 19990, paymentCount: 1 },
+      lifetime: { amountCents: 15000, paymentCount: 1 },
+      other: { amountCents: 500, paymentCount: 1 },
+    });
+    expect(result.summary.nextRenewalsByPeriod).toEqual({
+      monthly: { cardCents: 0, cardCount: 0, pixPotentialCents: 1490, pixPotentialCount: 1 },
+      semiannual: { cardCents: 6590, cardCount: 1, pixPotentialCents: 0, pixPotentialCount: 0 },
+      annual: { cardCents: 0, cardCount: 0, pixPotentialCents: 19990, pixPotentialCount: 1 },
+    });
+    expect(result.summary.nextCardCents).toBe(6590);
+    expect(result.summary.nextPixPotentialCents).toBe(21480);
+    expect(result.summary.receivedCents).toBe(43570);
   });
 });

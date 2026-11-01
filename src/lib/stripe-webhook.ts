@@ -5,6 +5,7 @@ import { sendWelcomeAccessKeyEmail } from "./access-key-emails";
 import { sendStripeInvoicePaymentActionRequiredNotification, sendStripeInvoicePaymentFailedNotification } from "./billing-notifications";
 import { addBillingPeriod } from "./billing-period";
 import { assertRecentPublicEmailVerification } from "./email-verification";
+import { hasCheckoutProof } from "./checkout-proof";
 import { normalizeStoredPlanTier } from "./plan-tiers";
 import { PIX_PLAN_TRANSITION_OPERATION, parseCardPixTransitionEvidence } from "./pix-plan-management";
 import { applyPrepaidCardChange, parsePrepaidCardEvidence, PREPAID_CARD_CHANGE_OPERATION } from "./prepaid-card-change";
@@ -1875,6 +1876,10 @@ export async function getPublicCheckoutStatus(c: AppContext, sessionId: string) 
       checkoutStatus: checkout.status,
       paymentStatus: checkout.payment_status || (checkout.status === "open" ? "pending" : "processing"),
     };
+  }
+
+  if (!await hasCheckoutProof(c, sessionId)) {
+    return { status: "completed" as const, checkoutStatus: checkout.status, paymentStatus: "paid", verificationRequired: true };
   }
 
   const license = await getLicenseById(c, checkout.license_id);

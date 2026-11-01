@@ -54,7 +54,10 @@ If credentials are absent, sessions use the authenticated proxy transport.
 The bucket must allow PUT from the exact Admin origin and expose `ETag` through
 CORS. The Admin Content Security Policy must include only the configured R2
 origin in `connect-src`; use `customGamesR2Origin(env)` to obtain it. No wildcard
-origin or publicly writable bucket is needed.
+origin or publicly writable bucket is needed. Before switching production Admin
+to `https://admin.api-merlin.com`, add it to the production bucket policy while
+retaining the old origin during the transition. Staging has a separate policy in
+`scripts/custom-games-cors.stage.json` for its own bucket and Admin host.
 
 ## Contract
 

@@ -1,4 +1,5 @@
 import { HTTPException } from "hono/http-exception";
+import { getCookie, setCookie } from "hono/cookie";
 import type { AppContext } from "../types";
 import { getBillingSettings } from "./billing-settings";
 
@@ -21,6 +22,7 @@ const MAX_SENDS_PER_WINDOW = 10;
 const SEND_WINDOW_SECONDS = 10 * 60;
 const MAX_VERIFY_ATTEMPTS = 5;
 const VERIFIED_REUSE_SECONDS = 30 * 60;
+const VERIFICATION_COOKIE = "merlin_email_verification";
 
 function normalizeEmail(email: string) {
 	return email.trim().toLowerCase();
@@ -278,6 +280,17 @@ export async function verifyPublicEmailCode(c: AppContext, input: { email: strin
 		.bind(nowIso, nowIso, row.id)
 		.run();
 
+	const issuedAt = Math.floor(Date.now() / 1000);
+	const payload = `${row.id}.${issuedAt}`;
+	const signature = await hmacSha256Hex(String(c.env.SESSION_HASH_SECRET).trim(), `email-proof:${normalizedEmail}:${payload}`);
+	setCookie(c, VERIFICATION_COOKIE, `${payload}.${signature}`, {
+		httpOnly: true,
+		secure: new URL(c.req.url).protocol === "https:",
+		sameSite: "Strict",
+		path: "/api/public/",
+		maxAge: VERIFIED_REUSE_SECONDS,
+	});
+
 	return {
 		success: true as const,
 		verified: true as const,
@@ -286,13 +299,26 @@ export async function verifyPublicEmailCode(c: AppContext, input: { email: strin
 
 export async function assertRecentPublicEmailVerification(c: AppContext, email: string) {
 	const normalizedEmail = normalizeEmail(email);
+	const proof = getCookie(c, VERIFICATION_COOKIE) || "";
+	const match = /^(\d+)\.(\d{10})\.([a-f0-9]{64})$/.exec(proof);
+	const issuedAt = Number(match?.[2]);
+	const now = Math.floor(Date.now() / 1000);
+	if (!match || !Number.isSafeInteger(Number(match[1])) || issuedAt > now || now - issuedAt > VERIFIED_REUSE_SECONDS) {
+		throw new HTTPException(403, { message: "Email verification is required" });
+	}
+	const secret = String(c.env.SESSION_HASH_SECRET || "").trim();
+	if (!secret) throw new HTTPException(500, { message: "SESSION_HASH_SECRET is not configured" });
+	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+	const signature = new Uint8Array(match[3]!.match(/../g)!.map((byte) => parseInt(byte, 16)));
+	const valid = await crypto.subtle.verify("HMAC", key, signature, new TextEncoder().encode(`email-proof:${normalizedEmail}:${match[1]}.${match[2]}`));
+	if (!valid) throw new HTTPException(403, { message: "Email verification is required" });
 	const cutoffIso = addSeconds(new Date(), -VERIFIED_REUSE_SECONDS);
 	const row = await c.env.merlin_db
 		.prepare(
 			`
 				SELECT id
 				FROM email_verifications
-				WHERE email_normalized = ?
+				WHERE id = ? AND email_normalized = ?
 					AND status = 'verified'
 					AND verified_at IS NOT NULL
 					AND verified_at >= ?
@@ -301,7 +327,7 @@ export async function assertRecentPublicEmailVerification(c: AppContext, email: 
 				LIMIT 1
 			`,
 		)
-		.bind(normalizedEmail, cutoffIso)
+		.bind(Number(match[1]), normalizedEmail, cutoffIso)
 		.first<{ id: number }>();
 
 	if (!row) {

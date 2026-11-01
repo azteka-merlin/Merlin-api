@@ -1,5 +1,6 @@
 import { fromHono } from "chanfana";
 import { Hono } from "hono";
+import { adminIpGuard } from "./lib/admin-ip-guard";
 import { getCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
@@ -69,6 +70,7 @@ import {
 } from "./lib/public-access-management";
 import {
   consumeLauncherAccessHandoff,
+  clearSessionForDifferentCheckoutEmail,
   createLauncherAccessHandoff,
   createPublicAccessSession,
   requirePublicAccessSession,
@@ -170,6 +172,7 @@ import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-
 import { getUsageAnalytics } from "./lib/usage-analytics";
 import { enforceLoginRateLimit, enforceManifestsRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
+import { setCheckoutProof } from "./lib/checkout-proof";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
   getPublicSignupMetrics,
@@ -228,6 +231,33 @@ import {
 const app = new Hono<{ Bindings: AppBindings }>();
 
 app.use("*", async (c, next) => {
+  const path = c.req.path;
+  if (path === "/doc" || path.startsWith("/doc/") || path.startsWith("/openapi")) {
+    return c.json({ success: false, error: "Not Found" }, 404);
+  }
+  const adminHost = String(c.env.ADMIN_APP_HOST || "").toLowerCase();
+  const host = new URL(c.req.url).hostname.toLowerCase();
+  if (adminHost && host !== adminHost && host !== "localhost" && host !== "127.0.0.1") {
+    const publicPath = path === "/" || path === "/api" || path.startsWith("/api/") ||
+      path === "/merlin-cloud" || path.startsWith("/merlin-cloud/") ||
+      path === "/payment/webhooks/stripe" ||
+      path === "/internal/custom-game-indexing" || path.startsWith("/internal/custom-game-indexing/") ||
+      path === "/checkout" || path === "/votacao" || path.startsWith("/votacao/") ||
+      path === "/download" || path.startsWith("/download/") || path.startsWith("/download-assets/") ||
+      path === "/meu-acesso" || path.startsWith("/meu-acesso/") || path === "/catalogo" || path.startsWith("/catalogo/");
+    if (!publicPath) {
+      if ((c.req.method === "GET" || c.req.method === "HEAD") &&
+          path !== "/panel-api" && !path.startsWith("/panel-api/")) {
+        return c.redirect("/download", 302);
+      }
+      return c.json({ success: false, error: "Not Found" }, 404);
+    }
+  }
+  if (adminHost && host === adminHost && path === "/") return c.redirect("/login", 302);
+  await next();
+});
+
+app.use("*", async (c, next) => {
   await next();
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
@@ -256,6 +286,8 @@ app.use("*", async (c, next) => {
     headers,
   });
 });
+
+app.use("*", adminIpGuard);
 
 const openapi = fromHono(app, {
   docs_url: "/doc",
@@ -2190,6 +2222,8 @@ app.post("/api/public/checkout", async (c) => {
   const body = parseBody(publicCheckoutSchema, await c.req.json());
   try {
     const result = await createPublicStripeCheckout(c, body);
+    await clearSessionForDifferentCheckoutEmail(c, body.contact);
+    await setCheckoutProof(c, result.checkoutSessionId);
     return c.json({ success: true, ...result }, 201);
   } catch (error) {
     if (error instanceof HTTPException) {
@@ -2208,6 +2242,7 @@ app.post("/api/public/pix/orders", async (c) => {
   const body = parseBody(publicPixOrderSchema, await c.req.json());
   try {
     const result = await createPublicPixOrder(c, body);
+    await clearSessionForDifferentCheckoutEmail(c, body.contact);
     return c.json({ success: true, ...result }, 201);
   } catch (error) {
     if (error instanceof HTTPException) {
@@ -2231,7 +2266,7 @@ app.get("/api/public/pix/orders/:paymentIntentId/status", async (c) => {
 app.get("/api/public/checkout-status", async (c) => {
   const query = parseBody(publicCheckoutStatusQuerySchema, c.req.query());
   const result = await getPublicCheckoutStatus(c, query.session_id);
-  return c.json({ success: true, ...result }, 200);
+  return c.json({ success: true, ...result }, 200, { "Cache-Control": "no-store" });
 });
 
 app.post("/api/public/payment-status", async (c) => {
@@ -2313,6 +2348,7 @@ app.post("/api/public/access-keys/register", async (c) => {
   const contact = normalizePublicAccessContact(body.contact, body.contactType);
   await enforcePublicAccessKeyRateLimit(c, `${body.contactType}:${contact}`);
   const result = await registerPublicAccessKey(c, { ...body, contact });
+  await clearSessionForDifferentCheckoutEmail(c, contact);
   if (body.contactType === "email" && result.created) {
     queuePublicEmail(c, "welcome-access-key", sendWelcomeAccessKeyEmail(c, {
       email: contact,

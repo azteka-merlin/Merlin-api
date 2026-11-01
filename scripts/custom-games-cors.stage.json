@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "allowed": {
+        "origins": ["https://admin-staging.api-merlin.com"],
+        "methods": ["PUT", "HEAD"],
+        "headers": ["content-type", "content-md5", "x-amz-content-sha256"]
+      },
+      "exposeHeaders": ["ETag"],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}

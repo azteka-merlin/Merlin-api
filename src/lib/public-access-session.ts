@@ -214,3 +214,23 @@ export async function revokePublicAccessSession(c: AppContext) {
   }
   clearPublicAccessSessionCookie(c);
 }
+
+// A new purchase for another email must not leave Meu acesso showing the
+// previous customer's license. Renewals through the authenticated session do
+// not use this path.
+export async function clearSessionForDifferentCheckoutEmail(c: AppContext, email: string) {
+  if (!getCookie(c, PUBLIC_ACCESS_SESSION_COOKIE)) return;
+  try {
+    const current = await readPublicAccessSession(c, { touch: false });
+    if (!current) return;
+    const license = await c.env.merlin_db.prepare("SELECT contact, contact_type FROM licenses WHERE id = ?")
+      .bind(current.session.license_id).first<{ contact: string; contact_type: string }>();
+    if (license?.contact_type === "email" && license.contact.trim().toLowerCase() === email.trim().toLowerCase()) return;
+    await revokePublicAccessSession(c);
+  } catch {
+    // The checkout may already exist at the payment provider. Never turn that
+    // success into an error; discard the old browser cookie if D1 is unavailable.
+    clearPublicAccessSessionCookie(c);
+    console.warn("[public-access] could not revoke previous session after checkout");
+  }
+}

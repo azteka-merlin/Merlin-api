@@ -3,12 +3,40 @@ import { Hono } from "hono";
 import { describe, expect, test } from "vitest";
 import {
   createPublicAccessSession,
+  clearSessionForDifferentCheckoutEmail,
   readPublicAccessSession,
   requirePublicAccessSession,
   revokePublicAccessSession,
 } from "../src/lib/public-access-session";
 
 describe("public access sign out", () => {
+  test("a new checkout keeps the same account but signs out a different account", async () => {
+    const sqlite = new DatabaseSync(":memory:");
+    sqlite.exec(`CREATE TABLE public_access_sessions (id TEXT PRIMARY KEY, license_id INTEGER, token_hash TEXT, user_agent_hash TEXT, remember_device INTEGER, created_at TEXT, expires_at TEXT, last_seen_at TEXT, revoked_at TEXT, revoke_reason TEXT);
+      CREATE TABLE licenses (id INTEGER PRIMARY KEY, contact TEXT, contact_type TEXT);
+      INSERT INTO licenses VALUES (7, 'old@example.com', 'email');`);
+    const db = { prepare(sql: string) {
+      let args: unknown[] = [];
+      return { bind(...values: unknown[]) { args = values; return this; },
+        async first<T>() { return (sqlite.prepare(sql).get(...args as []) || null) as T | null; },
+        async run() { return { meta: { changes: Number(sqlite.prepare(sql).run(...args as []).changes) } }; } };
+    } };
+    const app = new Hono();
+    app.post("/login", async c => c.json(await createPublicAccessSession(c as any, 7, true)));
+    app.post("/checkout", async c => { await clearSessionForDifferentCheckoutEmail(c as any, c.req.query("email") || ""); return c.json({ ok: true }); });
+    app.get("/session", async c => c.json({ active: Boolean(await readPublicAccessSession(c as any, { touch: false })) }));
+    const env = { merlin_db: db, SESSION_HASH_SECRET: "test-only-session-secret" };
+    const headers = { "user-agent": "Merlin-Checkout-Test" };
+    const login = await app.request("https://example.test/login", { method: "POST", headers }, env as any);
+    const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+    const same = await app.request("https://example.test/checkout?email=OLD%40example.com", { method: "POST", headers: { ...headers, cookie } }, env as any);
+    expect(same.headers.get("set-cookie")).toBeNull();
+    expect(await (await app.request("https://example.test/session", { headers: { ...headers, cookie } }, env as any)).json()).toEqual({ active: true });
+    const different = await app.request("https://example.test/checkout?email=new%40example.com", { method: "POST", headers: { ...headers, cookie } }, env as any);
+    expect(different.headers.get("set-cookie")).toMatch(/Max-Age=0/i);
+    expect(await (await app.request("https://example.test/session", { headers: { ...headers, cookie } }, env as any)).json()).toEqual({ active: false });
+    sqlite.close();
+  });
   test("revokes the database session and makes the old cookie unusable", async () => {
     const sqlite = new DatabaseSync(":memory:");
     sqlite.exec(`CREATE TABLE public_access_sessions (

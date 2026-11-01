@@ -316,6 +316,15 @@ async function getBlockedIpRecord(c: AppContext, ipHash: string) {
     .first<{ id: number; failed_count: number; blocked_until: string | null; manually_unblocked_at: string | null }>();
 }
 
+export async function isAdminIpBlocked(c: AppContext): Promise<boolean> {
+  const { ipHash } = await getAdminHashes(c);
+  const blockedIp = await getBlockedIpRecord(c, ipHash);
+  const blockedUntil = parseDate(blockedIp?.blocked_until ?? null);
+  return Boolean(blockedIp && !blockedIp.manually_unblocked_at
+    && blockedIp.failed_count >= ADMIN_IP_BLOCK_THRESHOLD
+    && (!blockedUntil || blockedUntil > new Date()));
+}
+
 async function registerLoginAttempt(
   c: AppContext,
   input: {

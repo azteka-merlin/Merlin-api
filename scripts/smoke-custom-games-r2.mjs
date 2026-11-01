@@ -6,12 +6,16 @@ import assert from "node:assert/strict";
 import { AwsClient } from "aws4fetch";
 
 const profile = process.argv[2] || "merlin-r2";
+const adminOrigin = process.env.MERLIN_ADMIN_ORIGIN || "https://admin.api-merlin.com";
+const bucket = process.env.CUSTOM_GAMES_R2_BUCKET || "custom-games";
+if (!["https://admin.api-merlin.com", "https://admin-staging.api-merlin.com", "https://api-merlin.com"].includes(adminOrigin)) throw new Error("Invalid Admin origin");
+if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error("Invalid R2 bucket");
 const account = process.env.CUSTOM_GAMES_R2_ACCOUNT_ID || "7ad4971c1414af1203494d55ab660307";
 if (!/^[a-f0-9]{32}$/.test(account)) throw new Error("Invalid R2 account");
 const credentials = JSON.parse(execFileSync("aws", ["configure", "export-credentials", "--profile", profile, "--format", "process"], { encoding: "utf8" }));
 const signer = new AwsClient({ accessKeyId: credentials.AccessKeyId, secretAccessKey: credentials.SecretAccessKey, service: "s3", region: "auto" });
 const key = `_upload-smoke/${randomUUID()}`;
-const target = `https://${account}.r2.cloudflarestorage.com/custom-games/${key}`;
+const target = `https://${account}.r2.cloudflarestorage.com/${bucket}/${key}`;
 let uploadId;
 let complete = false;
 async function check(response, operation) {
@@ -39,11 +43,11 @@ try {
   url.searchParams.set("X-Amz-Expires", "900");
   const signed = await signer.sign(url, { method: "PUT", aws: { signQuery: true } });
   const preflight = await check(await fetch(signed.url, { method: "OPTIONS", headers: {
-    Origin: "https://api-merlin.com", "Access-Control-Request-Method": "PUT", "Access-Control-Request-Headers": "content-type",
+    Origin: adminOrigin, "Access-Control-Request-Method": "PUT", "Access-Control-Request-Headers": "content-type",
   } }), "CORS preflight");
-  assert.equal(preflight.headers.get("access-control-allow-origin"), "https://api-merlin.com");
+  assert.equal(preflight.headers.get("access-control-allow-origin"), adminOrigin);
   const bytes = Buffer.alloc(6 * 1024 ** 2, 0x5a);
-  const uploaded = await check(await fetch(signed.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream", Origin: "https://api-merlin.com" }, body: bytes }), "signed part");
+  const uploaded = await check(await fetch(signed.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream", Origin: adminOrigin }, body: bytes }), "signed part");
   const etag = uploaded.headers.get("etag");
   assert.ok(etag);
   assert.match(uploaded.headers.get("access-control-expose-headers") || "", /etag/i);

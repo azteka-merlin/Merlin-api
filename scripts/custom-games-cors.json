@@ -1,7 +1,7 @@
 {
   "CORSRules": [
     {
-      "AllowedOrigins": ["https://api-merlin.com"],
+      "AllowedOrigins": ["https://api-merlin.com", "https://admin.api-merlin.com"],
       "AllowedMethods": ["PUT", "HEAD"],
       "AllowedHeaders": ["content-type", "content-md5", "x-amz-content-sha256"],
       "ExposeHeaders": ["ETag"],
