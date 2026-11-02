@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { belongsToGame, readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256, type GameRow } from "./custom-games";
+import { belongsToGame, readGameForm, validFolderFileCount, validateExecutable, validateGameFilePath, validateInstallName, validateSha256, CUSTOM_GAME_DOWNLOAD_PEOPLE_SQL, type GameRow } from "./custom-games";
 import type { AppContext } from "../types";
+import { DatabaseSync } from "node:sqlite";
 
 describe("custom game install contracts", () => {
+  it("shows repeated starts per license without mixing games or counting cancellations as completed", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`CREATE TABLE licenses(id INTEGER, name TEXT); CREATE TABLE custom_game_download_sessions(game_id TEXT,license_id INTEGER,outcome TEXT,created_at TEXT);
+      INSERT INTO licenses VALUES(1,'Ana'),(2,'Bruno');
+      INSERT INTO custom_game_download_sessions VALUES
+      ('game',1,'completed','2026-11-01'),('game',1,'canceled','2026-11-02'),
+      ('game',2,NULL,'2026-11-02'),('other',1,'completed','2026-11-02'),('game',1,'completed','2026-09-01');`);
+    expect(db.prepare(CUSTOM_GAME_DOWNLOAD_PEOPLE_SQL).all('game', '2026-10-01', 0)).toEqual([
+      { license_id: 1, name: 'Ana', started: 2, completed: 1, last_started: '2026-11-02' },
+      { license_id: 2, name: 'Bruno', started: 1, completed: 0, last_started: '2026-11-02' },
+    ]);
+    db.close();
+  });
   it("groups new objects under their game without rejecting legacy keys", () => {
     const id = "00000000-0000-4000-8000-000000000001";
     const other = "00000000-0000-4000-8000-000000000002";
@@ -10,13 +24,15 @@ describe("custom game install contracts", () => {
     expect(belongsToGame(`${other}/archives/${id}.zip`, id)).toBe(false);
     expect(belongsToGame(`archives/${other}.zip`, id)).toBe(true);
   });
-  it("accepts up to 100,000 folder files and rejects larger manifests", () => {
+  it("accepts up to 200,000 folder files and rejects larger manifests", () => {
     expect(validFolderFileCount([])).toBe(false);
     expect(validFolderFileCount(new Array(11_000))).toBe(true);
     expect(validFolderFileCount(new Array(20_000))).toBe(true);
     expect(validFolderFileCount(new Array(30_000))).toBe(true);
     expect(validFolderFileCount(new Array(100_000))).toBe(true);
-    expect(validFolderFileCount(new Array(100_001))).toBe(false);
+    expect(validFolderFileCount(new Array(100_001))).toBe(true);
+    expect(validFolderFileCount(new Array(200_000))).toBe(true);
+    expect(validFolderFileCount(new Array(200_001))).toBe(false);
   });
   it("keeps a recognizable fixed Games folder name without Windows separators", () => {
     expect(validateInstallName("The Adventures of Elliot")).toBe("The Adventures of Elliot");

@@ -2,12 +2,13 @@ import type { AppBindings, AppContext } from "../types";
 import { available, readJob, sourceVersion, storeManifest, validateIntegrityManifest, workerSeen, writeJob,
   type IntegrityDependencies, type IntegrityFile, type IntegrityJob } from "./custom-game-integrity";
 import { planCloudflareZip, hashCloudflareZipEntry, type CloudflareZipEntry } from "./custom-game-cloudflare-zip";
+import { MAX_FOLDER_GAME_FILES, MAX_FOLDER_MANIFEST_BYTES } from './custom-game-limits';
 
 export type IntegrityQueueMessage = { jobId: string; generation: string };
 type FolderEntry = { path: string; key: string; sizeBytes: number; etag?: string; sha256?: string };
 type Plan = { version: 1; totalSizeBytes: number; files: (CloudflareZipEntry | FolderEntry)[] };
 type Part = { from: number; to: number; files: IntegrityFile[] };
-const MAX_PLAN_BYTES = 16 * 1024 ** 2;
+const MAX_PLAN_BYTES = MAX_FOLDER_MANIFEST_BYTES;
 const LEASE_MS = 20 * 60_000;
 const ID = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9-]{36}$/i;
@@ -97,7 +98,7 @@ export async function processCloudflareIntegrityMessage(env: AppBindings, body: 
     await env.CUSTOM_GAMES.put(key, json, { httpMetadata: { contentType: "application/json" } });
     await save({ queuePlanKey: key, totalFiles: plan.files.length, totalBytes: plan.totalSizeBytes });
   }
-  if (plan.version !== 1 || !plan.files.length || plan.files.length > 100_000) throw new Error("Plano de indexação inválido.");
+  if (plan.version !== 1 || !plan.files.length || plan.files.length > MAX_FOLDER_GAME_FILES) throw new Error("Plano de indexação inválido.");
   const from = record.job.queueCursor || 0;
   if (!Number.isSafeInteger(from) || from < 0 || from > plan.files.length) throw new Error("Checkpoint de arquivo inválido.");
   let cursor = from;

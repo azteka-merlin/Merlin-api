@@ -9,6 +9,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { configurationFromEnv, indexZip, IndexerClient, processIndexJob, runIndexer, safeError } from "./lib/custom-game-indexer.mjs";
 
 const sha = value => createHash("sha256").update(value).digest("hex");
+test('folder indexer accepts 200,000 paths before work begins and rejects 200,001',async()=>{
+  let posts=0;
+  const client={async post(){posts++;throw new Error('validation completed');}};
+  const files=Array.from({length:200000},(_,i)=>({key:`files/${i}`,path:`data/${i}.bin`,sizeBytes:1}));
+  const job={id:'boundary-job',gameId:'boundary-game',leaseToken:'test',archiveKey:'folder-manifest',packageType:'folder',files};
+  await assert.rejects(processIndexJob(client,job),/validation completed/);
+  assert.ok(posts>0);
+  posts=0;
+  files.push({key:'files/extra',path:'extra.bin',sizeBytes:1});
+  await assert.rejects(processIndexJob(client,job),/Lista de arquivos da pasta inválida/);
+  assert.equal(posts,0);
+});
 function fixtureZip(entries, { zip64 = false } = {}) {
   const local = [];
   const central = [];

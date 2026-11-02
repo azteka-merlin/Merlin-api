@@ -89,6 +89,7 @@ export async function assertPremiumActivationLimit(c: AppContext, licenseId: num
         FROM premium_activations
         WHERE license_id = ?
           AND status IN ('reserved', 'active', 'expired')
+          AND retry_of IS NULL
           AND (? IS NULL OR created_at > ?)
       `,
     )

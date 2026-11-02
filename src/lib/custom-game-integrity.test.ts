@@ -162,7 +162,7 @@ describe("custom game integrity index", () => {
     const h = harness(); await h.init();
     const denied = await h.request("/internal/custom-game-indexing/claim", {}, { headers: { authorization: "Bearer wrong" } });
     expect(denied.status).toBe(401);
-    const oversized = await h.request(`/internal/custom-game-indexing/${"a".repeat(64)}/complete`, {}, { headers: { "content-length": String(17 * 1024 ** 2) } });
+    const oversized = await h.request(`/internal/custom-game-indexing/${"a".repeat(64)}/complete`, {}, { headers: { "content-length": String(33 * 1024 ** 2) } });
     expect(oversized.status).toBe(413);
     h.env.CUSTOM_GAME_INDEXER_SECRET = undefined;
     expect((await h.request("/internal/custom-game-indexing/claim", {})).status).toBe(503);

@@ -1,4 +1,4 @@
-import type { AppContext } from "../types";
+import type { AppBindings, AppContext } from "../types";
 import { normalizeStoredPlanTier } from "./plan-tiers";
 
 export type FinanceLicenseRow = {
@@ -13,6 +13,7 @@ export type FinanceLicenseRow = {
   billing_cancel_at_period_end: number | null;
   stripe_subscription_id: string | null;
   has_confirmed_payment: number;
+  has_positive_payment?: number;
 };
 
 type PriceRow = {
@@ -35,6 +36,17 @@ type RetentionRow = { paid_periods: number };
 type CountRow = { count: number };
 
 const RECURRING_ACCESS_TYPES = "'monthly_subscription','semiannual_subscription','annual_subscription','monthly_manual','semiannual_manual','annual_manual'";
+
+export const TIER_RECEIPTS_SQL = `
+  SELECT CASE WHEN cs.plan_tier IN ('bronze','prata','ouro') THEN cs.plan_tier ELSE 'unknown' END AS tier,
+    SUM(p.amount_cents) AS amount_cents, COUNT(*) AS payment_count,
+    COUNT(DISTINCT p.license_id) AS licenses
+  FROM payments p
+  LEFT JOIN checkout_sessions cs ON cs.provider=p.provider AND cs.provider_session_id=p.provider_checkout_session_id
+  LEFT JOIN licenses l ON l.id=p.license_id
+  WHERE p.status='paid' AND p.amount_cents>0 AND p.currency='brl' AND p.created_at >= ? AND p.created_at <= ?
+    AND COALESCE(l.license_type,'normal') <> 'test'
+  GROUP BY CASE WHEN cs.plan_tier IN ('bronze','prata','ouro') THEN cs.plan_tier ELSE 'unknown' END`;
 
 export function summarizePaidPeriodDistribution(rows: RetentionRow[]) {
   const distribution = { onePeriod: 0, twoPeriods: 0, threePeriods: 0, fourOrMorePeriods: 0 };
@@ -170,6 +182,7 @@ export function summarizeFinance(
       period,
       paymentMethod: period === "lifetime" ? "one_time" : paymentMethod,
       billingStatus: row.billing_status || "none",
+      hasPositivePayment: row.has_positive_payment === 1 && row.access_type !== "free" && row.access_type !== "legacy_lifetime",
       attentionReason: category === "attention"
         ? row.has_confirmed_payment !== 1 ? "Sem pagamento confirmado" : `Cobrança: ${row.billing_status || "sem status"}`
         : null,
@@ -198,13 +211,14 @@ export function summarizeFinance(
 }
 
 export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
-  const periodDays = [30, 90, 365].includes(days) ? days : 30;
+  const periodDays = Number.isInteger(days) && days >= 1 && days <= 3650 ? days : 30;
   const now = new Date();
   const nowIso = now.toISOString();
   const startIso = new Date(now.getTime() - periodDays * 86400000).toISOString();
   const licenseRows = await c.env.merlin_db.prepare(`
     SELECT l.id,l.name,l.source,l.access_type,l.billing_status,l.plan_tier,l.expires_at,
       l.billing_current_period_end,l.billing_cancel_at_period_end,l.stripe_subscription_id,
+      CASE WHEN EXISTS (SELECT 1 FROM payments paid WHERE paid.license_id=l.id AND paid.status='paid' AND paid.amount_cents>0 AND paid.currency='brl') THEN 1 ELSE 0 END AS has_positive_payment,
       CASE WHEN EXISTS (
         SELECT 1 FROM payments p WHERE p.license_id=l.id AND p.status='paid'
       ) OR EXISTS (
@@ -229,6 +243,16 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     WHERE p.status='paid' AND p.currency='brl' AND p.created_at >= ? AND p.created_at <= ?
     GROUP BY p.provider,p.payment_type,cs.plan_type
   `).bind(startIso, nowIso).all<ReceiptRow>();
+  // A current license tier cannot identify the tier at payment time after an upgrade.
+  const tierReceiptRows = await c.env.merlin_db.prepare(TIER_RECEIPTS_SQL).bind(startIso, nowIso)
+    .all<{ tier: string; amount_cents: number; payment_count: number; licenses: number }>();
+  const monthlySnapshots = await c.env.merlin_db.prepare(`
+    SELECT tier,SUM(subscribers) AS subscriber_days,COUNT(*) AS days,
+      MIN(day) AS first_day,MAX(day) AS last_day
+    FROM paid_subscriber_daily_snapshots
+    WHERE day >= substr(date(?, '-3 hours'),1,7) || '-01' AND day <= date(?, '-3 hours')
+    GROUP BY tier
+  `).bind(nowIso, nowIso).all<{tier: string; subscriber_days: number; days: number; first_day: string; last_day: string}>();
   const reconciliationRow = await c.env.merlin_db.prepare(`
     SELECT COUNT(*) AS unmatched_paid_checkouts
     FROM checkout_sessions cs
@@ -343,6 +367,8 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     generatedAt: nowIso,
     periodDays,
     reconciliation: { unmatchedPaidCheckouts: reconciliationRow?.unmatched_paid_checkouts || 0 },
+    tierReceipts: tierReceiptRows.results,
+    monthlySubscriberSnapshots: monthlySnapshots.results,
     lifecycle: {
       retention: {
         activeRecurringLicenses: retentionRows.results.length,
@@ -354,4 +380,21 @@ export async function getAdminFinanceDashboard(c: AppContext, days = 30) {
     },
     ...result,
   };
+}
+
+export async function capturePaidSubscriberSnapshot(env: AppBindings, at = new Date()) {
+  const now = at.toISOString();
+  await env.merlin_db.prepare(`
+    INSERT INTO paid_subscriber_daily_snapshots(day,tier,subscribers,sampled_at)
+    SELECT date(?, '-3 hours'), tiers.tier, COUNT(l.id), ?
+    FROM (SELECT 'bronze' AS tier UNION ALL SELECT 'prata' UNION ALL SELECT 'ouro') tiers
+    LEFT JOIN licenses l ON l.plan_tier=tiers.tier AND l.status='active' AND l.expires_at>?
+      AND COALESCE(l.license_type,'normal')<>'test' AND l.billing_status='active'
+      AND l.access_type IN (${RECURRING_ACCESS_TYPES})
+      AND (l.stripe_subscription_id IS NOT NULL OR l.source='mercadopago_pix')
+      AND EXISTS (SELECT 1 FROM payments p WHERE p.license_id=l.id AND p.status='paid' AND p.amount_cents>0 AND p.currency='brl')
+    GROUP BY tiers.tier
+    ON CONFLICT(day,tier) DO UPDATE SET subscribers=excluded.subscribers,sampled_at=excluded.sampled_at
+    WHERE excluded.sampled_at > paid_subscriber_daily_snapshots.sampled_at
+  `).bind(now, now, now).run();
 }

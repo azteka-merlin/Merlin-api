@@ -184,6 +184,7 @@ export async function getLicenseById(c: AppContext, id: number): Promise<License
 						FROM premium_activations pa
 						WHERE pa.license_id = licenses.id
 							AND pa.status IN ('reserved', 'active', 'expired')
+							AND pa.retry_of IS NULL
 							AND (licenses.activation_usage_reset_at IS NULL OR pa.created_at > licenses.activation_usage_reset_at)
 					) AS premium_activation_used,
 					recovery_pin_hash,

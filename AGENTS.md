@@ -39,3 +39,17 @@ If the application uses Durable Objects or Workflows, refer to the relevant best
 
 - Durable Objects: https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/
 - Workflows: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+
+## Premium activation regression gate
+
+Read `docs/PREMIUM_REGRESSION_GUARD.md` before changing Premium activation,
+operation/retry triggers, or D1 test adapters. D1 `meta.changes` includes
+trigger writes; do not assume one claimed activation implies exactly one
+reported change. Preserve atomic slot, identity, replay and quota checks.
+
+Before deployment, run `npm run validate:premium` on the code being published.
+Use the npm deploy scripts, whose predeploy hooks enforce this gate; do not
+bypass a failed gate with a direct Wrangler deploy. When changing the D1
+adapter, triggers or test runtime, also run `npm run test:premium:proof`.
+Keep the native local D1 regression test enabled; a mocked row count or a
+healthy endpoint does not replace activation coverage.

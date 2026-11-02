@@ -116,4 +116,5 @@ Admin routes use `/panel-api/*` and require an admin session:
 - Staging deploy uses `npm run deploy-stage`; staging panel deploy uses `npm run deploy-stage:panel`.
 - Overrides are shared through R2 and are not migrated between D1 databases.
 - Mutating admin routes must validate admin session and CSRF.
+- Premium activation/D1 changes must follow `docs/PREMIUM_REGRESSION_GUARD.md`; npm deploy hooks run `npm run validate:premium`. Keep trigger-aware SQLite fixtures and the native local D1 HTTP regression enabled.
 - Large uploads use R2 multipart flows; validate abort/complete behavior when changing that path.

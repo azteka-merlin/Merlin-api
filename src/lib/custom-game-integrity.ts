@@ -3,10 +3,11 @@ import { HTTPException } from "hono/http-exception";
 import type { AppBindings, AppContext } from "../types";
 import { requireAdminSession } from "./admin-security";
 import { requireGoldLauncherLicense } from "./launcher-auth";
+import { MAX_FOLDER_GAME_FILES, MAX_INTEGRITY_MANIFEST_BYTES } from './custom-game-limits';
 
 const JOB_PREFIX = "_integrity-jobs/";
-const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
-const MAX_FILES = 100_000;
+const MAX_MANIFEST_BYTES = MAX_INTEGRITY_MANIFEST_BYTES;
+const MAX_FILES = MAX_FOLDER_GAME_FILES;
 const MAX_FILE_BYTES = 30 * 1024 ** 3;
 const MAX_GAME_BYTES = 200 * 1024 ** 3;
 const MAX_ARCHIVE_BYTES = 100 * 1024 ** 3;

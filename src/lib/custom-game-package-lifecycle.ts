@@ -1,11 +1,12 @@
 import { HTTPException } from "hono/http-exception";
 import type { AppBindings } from "../types";
+import { MAX_FOLDER_GAME_FILES, MAX_FOLDER_MANIFEST_BYTES } from './custom-game-limits';
 
 const UUID = "[a-f0-9-]{36}";
 const FILE_KEY = new RegExp(`^(?:game-files/${UUID}|${UUID}/files/${UUID})$`, "i");
 const MANIFEST_KEY = new RegExp(`^(?:manifests/${UUID}|${UUID}/manifests/${UUID})\\.json$`, "i");
 const SCOPED_KEY = new RegExp(`^(${UUID})/(?:files|manifests)/`, "i");
-const MAX_MANIFEST_BYTES = 12 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = MAX_FOLDER_MANIFEST_BYTES;
 
 type StoredFile = { key: string; path: string; sizeBytes: number; id?: string; sha256?: string; etag?: string };
 type StoredMember = { path: string; sizeBytes: number; sha256: string };
@@ -18,7 +19,7 @@ export function folderManifestObjectKeys(value: unknown): string[] {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("Não foi possível conferir as referências do pacote de pasta.");
   const manifest = value as StoredManifest;
   if (!Array.isArray(manifest.files) || (manifest.bundles !== undefined && !Array.isArray(manifest.bundles)) ||
-    manifest.files.length > 100_000 || (manifest.bundles?.length || 0) > 2500) fail("Não foi possível conferir as referências do pacote de pasta.");
+    manifest.files.length > MAX_FOLDER_GAME_FILES || (manifest.bundles?.length || 0) > 2500) fail("Não foi possível conferir as referências do pacote de pasta.");
   const keys = [];
   for (const entry of [...manifest.files, ...(manifest.bundles || [])]) {
     if (!entry || typeof entry.key !== "string" || !FILE_KEY.test(entry.key)) fail("O manifesto contém uma referência de arquivo inválida.");

@@ -51,7 +51,7 @@ import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSour
 import { getBillingNotificationsDashboard, getExpirationReminderEligibility, retryFailedBillingNotification, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
-import { getAdminFinanceDashboard } from "./lib/admin-finance-dashboard";
+import { capturePaidSubscriberSnapshot, getAdminFinanceDashboard } from "./lib/admin-finance-dashboard";
 import { deleteOverride, readOverrides, upsertOverride } from "./lib/overrides";
 import {
   cancelPublicAccessPlanChange,
@@ -157,6 +157,11 @@ import {
   setBronzePremiumActivationCredits,
   updatePremiumGame,
 } from "./lib/premium-games";
+import { listAdminPremiumWishes, listPremiumWishes, removePremiumWish, savePremiumWish } from "./lib/premium-wishlist";
+import { createPremiumRetryGrant } from './lib/premium-retry-grants';
+import { startPremiumOperation, finishPremiumOperation, readPremiumOperation } from './lib/premium-operations';
+import { claimPremiumGenerationForLicense } from './lib/premium-games';
+import { savePremiumSlotWatch, cancelPremiumSlotWatch, listAdminPremiumNotifications, runPremiumNotificationCron } from './lib/premium-notifications';
 import {
   createPoll,
   deletePoll,
@@ -513,6 +518,8 @@ const activationDownloadQuerySchema = z.object({
 });
 const premiumActivationRequestSchema = z.object({
   appId: z.string().regex(/^\d+$/),
+  retryGrantId: z.coerce.number().int().positive().optional(),
+  operationId: z.string().regex(/^[a-zA-Z0-9_-]{8,120}$/).optional(),
 });
 const premiumThirdPartyActivationRequestSchema = z.object({
   appId: z.string().regex(/^\d+$/),
@@ -543,6 +550,7 @@ const premiumGameCreateSchema = z.object({
   accessOuroEnabled: z.boolean().optional(),
   featured: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  comingSoon: z.boolean().optional(),
 });
 const premiumGameUpdateSchema = z.object({
   name: z.string().min(1).nullable().optional(),
@@ -558,6 +566,7 @@ const premiumGameUpdateSchema = z.object({
   accessOuroEnabled: z.boolean().optional(),
   featured: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  comingSoon: z.boolean().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: "At least one premium game field must be provided",
 });
@@ -1599,6 +1608,48 @@ app.get("/panel-api/overrides", async (c) => {
   await requireAdminSession(c);
   const overrides = await readOverrides(c.env);
   return c.json({ overrides }, 200);
+});
+
+app.get("/panel-api/premium/wishlist", async (c) => {
+  c.header('Cache-Control','no-store');
+  await requireAdminSession(c);
+  const beforeId = c.req.query("beforeId");
+  const result = await listAdminPremiumWishes(c, c.req.query("appId"), beforeId === undefined ? undefined : Number(beforeId));
+  return c.json(result, 200);
+});
+
+app.get('/panel-api/premium/notifications',async c=>{
+  c.header('Cache-Control','no-store');
+  await requireAdminSession(c);
+  const before=c.req.query('beforeId');
+  return c.json(await listAdminPremiumNotifications(c,{
+    appId:c.req.query('appId'),kind:c.req.query('kind'),status:c.req.query('status'),
+    beforeId:before===undefined?undefined:Number(before),
+  }));
+});
+
+app.post('/panel-api/premium/activations/:id/retry',async c=>{
+  const session = await requireAdminSession(c,{mutate:true});
+  const id = Number(c.req.param('id'));
+  const body = parseBody(z.object({confirmedFailure:z.boolean().optional()}),await c.req.json());
+  if(!Number.isSafeInteger(id)||id<1) throw new HTTPException(400,{message:'Ativação inválida.'});
+  const activation = await c.env.merlin_db.prepare('SELECT status FROM premium_activations WHERE id=?').bind(id).first<{status:string}>();
+  if(!activation) throw new HTTPException(404,{message:'Ativação não encontrada.'});
+  let retry:unknown;
+  if(activation.status!=='active') {
+    if(body.confirmedFailure!==true) throw new HTTPException(409,{message:'Confirme pelo suporte que a tentativa não funcionou.'});
+    const result=await c.env.merlin_db.prepare(`UPDATE premium_operations SET status='failed',updated_at=?
+      WHERE reservation_id=? AND status='review'`).bind(new Date().toISOString(),id).run();
+    if(Number(result.meta.changes||0)!==1) throw new HTTPException(409,{message:'Não há tentativa pendente para verificar.'});
+    retry=null;
+  } else {
+    retry=await createPremiumRetryGrant(c,id,session.session.admin_user_id,new Date(),body.confirmedFailure===true);
+  }
+  await writeAdminAuditLog(c,{
+    adminUserId:session.session.admin_user_id,action:'premium_activation_retry_granted',entityType:'premium_activation',entityId:String(id),
+    metadata:{confirmedFailure:body.confirmedFailure===true,retry},ipHash:session.session.ip_hash,userAgentHash:session.session.user_agent_hash,
+  });
+  return c.json({success:true,retry});
 });
 
 app.get("/panel-api/premium/games", async (c) => {
@@ -3528,7 +3579,47 @@ app.post("/panel-api/licenses/:id/plan-change/cancel", async (c) => {
   return c.json({ success: true, result }, 200);
 });
 
+app.get("/api/public/access/session/premium/wishlist", async (c) => {
+  c.header('Cache-Control','no-store');
+  const session = await requirePublicAccessSession(c);
+  return c.json({ success: true, wishes: await listPremiumWishes(c, session.session.license_id) });
+});
+
+app.delete("/api/public/access/session/premium/wishlist/:appId", async (c) => {
+  const session = await requirePublicAccessSession(c, { mutate: true });
+  const removed = await removePremiumWish(c, session.session.license_id, c.req.param("appId"));
+  return c.json({ success: true, removed });
+});
+
+app.post("/api/premium/wishlist/:appId", async (c) => {
+  const license = await requireAuthenticatedPremiumLicense(c);
+  await savePremiumWish(c, license.id, c.req.param("appId"), await c.req.json());
+  return c.json({ success: true }, 201);
+});
+
+app.delete('/api/premium/wishlist/:appId',async c=>{
+  const license=await requireAuthenticatedPremiumLicense(c);
+  return c.json({success:true,removed:await removePremiumWish(c,license.id,c.req.param('appId'))});
+});
+app.post('/api/premium/slot-watch/:appId',async c=>{
+  const license=await requireAuthenticatedPremiumLicense(c);
+  await savePremiumSlotWatch(c,license.id,c.req.param('appId'),await c.req.json());
+  return c.json({success:true},201);
+});
+app.delete('/api/premium/slot-watch/:appId',async c=>{
+  const license=await requireAuthenticatedPremiumLicense(c);
+  await cancelPremiumSlotWatch(c,license.id,c.req.param('appId'));
+  return c.json({success:true});
+});
+app.get('/api/premium/operation-status',async c=>{
+  c.header('Cache-Control','no-store');
+  const license=await requireReadablePremiumLicense(c);
+  const operationId=parseBody(z.string().regex(/^[a-zA-Z0-9_-]{8,120}$/),c.req.query('operationId'));
+  return c.json({success:true,...await readPremiumOperation(c,license.id,operationId)});
+});
+
 app.get("/api/premium/catalog", async (c) => {
+  c.header('Cache-Control','no-store');
   const license = await requireReadablePremiumLicense(c);
   const games = await listPremiumCatalog(c, license.id);
 
@@ -3541,11 +3632,14 @@ app.get("/api/premium/catalog", async (c) => {
 app.post("/api/premium/activate", async (c) => {
   const license = await requireAuthenticatedPremiumLicense(c);
   const body = parseBody(premiumActivationRequestSchema, await c.req.json());
+  const operationId=body.operationId||crypto.randomUUID();
+  await startPremiumOperation(c,license.id,body.appId,operationId);
 
   let reservation: Awaited<ReturnType<typeof reservePremiumActivation>>;
   try {
-    reservation = await reservePremiumActivation(c, license.id, body.appId);
+    reservation = await reservePremiumActivation(c, license.id, body.appId,{retryGrantId:body.retryGrantId,operationId});
   } catch (error) {
+    await finishPremiumOperation(c,license.id,operationId,'failed');
     const game = await getPremiumGame(c, body.appId).catch(() => null);
     await writePremiumActivityLog(c, license, {
       action: "premium_activation_failed",
@@ -3607,6 +3701,7 @@ app.post("/api/premium/activate", async (c) => {
   }
 
   let worker: Awaited<ReturnType<typeof callMerlinWorker>> | null = null;
+  await claimPremiumGenerationForLicense(c,reservation.reservationId,license.id,body.appId);
   try {
     worker = await callMerlinWorker(c, body.appId, steamAccountId);
     if (!worker.ok) {
@@ -3650,7 +3745,7 @@ app.post("/api/premium/activate", async (c) => {
       }, 502);
     }
 
-    const completion = await completePremiumActivation(c, reservation.reservationId);
+    const completion = await completePremiumActivation(c, reservation.reservationId,true);
     const activation = getPremiumActivationPayload(
       worker,
       body.appId,
@@ -3688,6 +3783,7 @@ app.post("/api/premium/activate", async (c) => {
         reservation.reservationId,
         failureStage,
         error instanceof Error ? error.message : "Unknown activation error",
+        true,
       );
       await writePremiumActivityLog(c, license, {
         action: "premium_activation_failed",
@@ -3704,7 +3800,7 @@ app.post("/api/premium/activate", async (c) => {
         },
       });
     }
-
+    else await failPremiumActivationReservation(c,reservation.reservationId,'completion',getErrorMessage(error),true);
     throw error;
   }
 });
@@ -3720,7 +3816,7 @@ app.post("/api/premium/activate-third-party", async (c) => {
     throw new HTTPException(409, { message: "Premium activation reservation is not available" });
   }
 
-  await assertPremiumActivationReservationForLicense(c, reservationId, license.id, body.appId);
+  await claimPremiumGenerationForLicense(c, reservationId, license.id, body.appId);
 
   let worker: Awaited<ReturnType<typeof callMerlinWorkerThirdPartyToken>>;
   try {
@@ -3733,6 +3829,7 @@ app.post("/api/premium/activate-third-party", async (c) => {
       body.appId,
       "worker_call",
       getErrorMessage(error),
+      true,
     );
     await writePremiumActivityLog(c, license, {
       action: "premium_activation_failed",
@@ -3813,6 +3910,7 @@ app.post("/api/premium/activate-third-party", async (c) => {
       body.appId,
       "worker_payload",
       "Merlin worker did not return an activation payload",
+      true,
     );
     await writePremiumActivityLog(c, license, {
       action: "premium_activation_failed",
@@ -3847,8 +3945,10 @@ app.post("/api/premium/activate-third-party", async (c) => {
       reservationId,
       license.id,
       body.appId,
+      true,
     );
   } catch (error) {
+    await failPremiumActivationReservationForLicense(c,reservationId,license.id,body.appId,'completion',getErrorMessage(error),true);
     await writePremiumActivityLog(c, license, {
       action: "premium_activation_failed",
       status: "denied",
@@ -4370,11 +4470,15 @@ export default {
   },
   async scheduled(controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
     const scheduledAt = new Date(controller.scheduledTime);
+    _ctx.waitUntil(runPremiumNotificationCron(env,scheduledAt).catch(()=>console.error('[PremiumNotifications] dispatch-failed')));
     _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {
       console.error("[CustomGamesIntegrity] queue-dispatch-failed");
     }));
     if (scheduledAt.getUTCMinutes() === 0) _ctx.waitUntil(cleanupCustomGamePackages(env).catch(() => {
       console.error("[CustomGamesVersions] cleanup-failed");
+    }));
+    if (scheduledAt.getUTCMinutes() === 0) _ctx.waitUntil(capturePaidSubscriberSnapshot(env, scheduledAt).catch(() => {
+      console.error("[Finance] subscriber-snapshot-failed");
     }));
     if (scheduledAt.getUTCMinutes() !== 0) {
       await Promise.all([runCatalogEnrichment(env), runCatalogAvailabilitySync(env)]);

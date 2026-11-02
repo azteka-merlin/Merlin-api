@@ -216,8 +216,9 @@ export function registerGameVersionRoutes(app: Hono<{ Bindings: AppBindings }>, 
       }
       const now = new Date().toISOString();
       await c.env.merlin_db.prepare(`UPDATE custom_game_download_sessions
-        SET completed_at=COALESCE(completed_at,?),expires_at=MIN(expires_at,?) WHERE id=? AND game_id=? AND license_id=?`)
-        .bind(now, now, leaseId, gameId, license.id).run();
+        SET outcome=CASE WHEN completed_at IS NULL THEN ? ELSE outcome END,
+          completed_at=COALESCE(completed_at,?),expires_at=MIN(expires_at,?) WHERE id=? AND game_id=? AND license_id=?`)
+        .bind(action === "complete" ? "completed" : "canceled", now, now, leaseId, gameId, license.id).run();
       return c.json({ success: true });
     });
   }

@@ -13,6 +13,7 @@ import {
 } from "./plan-tiers";
 import { getPremiumCatalogCutoffAt } from "./billing-settings";
 import type { AppContext } from "../types";
+import { claimPremiumRetryGrant, finishPremiumRetryFailure, getPremiumRetry } from './premium-retry-grants';
 
 type PremiumGameMetadata = {
   name: string | null;
@@ -51,6 +52,7 @@ type PremiumActivationRecord = {
   failure_reason: string | null;
   created_at: string;
   updated_at: string;
+  retry_of?: number | null;
 };
 
 export type PremiumGameRecord = {
@@ -70,6 +72,8 @@ export type PremiumGameRecord = {
   featured?: number | null;
   featured_at?: string | null;
   enabled: number;
+  coming_soon?: number;
+  available_at?: string|null;
   early_access_count?: number | null;
   created_at: string;
   updated_at: string;
@@ -92,6 +96,8 @@ export type PremiumGame = {
   featured: boolean;
   featuredAt: string | null;
   enabled: boolean;
+  comingSoon: boolean;
+  availableAt: string|null;
   earlyAccessCount: number;
   createdAt: string;
   updatedAt: string;
@@ -115,6 +121,7 @@ export type PremiumCatalogItem = {
   launchExecutablePath: string | null;
   activationLimit: number;
   enabled: boolean;
+  comingSoon: boolean;
   archiveAvailable: boolean;
   availability: {
     activeCount: number;
@@ -128,6 +135,11 @@ export type PremiumCatalogItem = {
     }>;
   };
   viewer: {
+    wishlisted: boolean;
+    slotWatching: boolean;
+    contactEmail: string|null;
+    retry: Awaited<ReturnType<typeof getPremiumRetry>>;
+    operationStatus: 'pending'|'review'|null;
     status: "available" | "cooldown" | "reserved" | "unavailable" | "locked";
     canActivate: boolean;
     cooldownUntil: string | null;
@@ -207,6 +219,8 @@ export type AdminPremiumActivation = {
   failureReason: string | null;
   createdAt: string;
   updatedAt: string;
+  retryOf: number|null;
+  retry: Awaited<ReturnType<typeof getPremiumRetry>>;
 };
 
 export type PremiumGameCreateInput = {
@@ -224,6 +238,7 @@ export type PremiumGameCreateInput = {
   accessOuroEnabled?: boolean | null;
   featured?: boolean | null;
   enabled?: boolean | null;
+  comingSoon?: boolean;
 };
 
 export type PremiumGameUpdateInput = {
@@ -240,6 +255,7 @@ export type PremiumGameUpdateInput = {
   accessOuroEnabled?: boolean | null;
   featured?: boolean | null;
   enabled?: boolean | null;
+  comingSoon?: boolean;
 };
 
 const USER_AGENT = "Merlin/2.0";
@@ -379,6 +395,8 @@ function mapPremiumGame(row: PremiumGameRecord): PremiumGame {
     featured: row.featured === 1,
     featuredAt: row.featured_at || null,
     enabled: Boolean(row.enabled),
+    comingSoon: row.coming_soon === 1,
+    availableAt: row.available_at || null,
     earlyAccessCount: Number(row.early_access_count || 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -442,6 +460,18 @@ function isReservedActivation(record: PremiumActivationRecord, nowIso: string): 
   return (record.status === "reserved" || record.status === "processing") && Boolean(reservedUntil) && String(reservedUntil) > nowIso;
 }
 
+/** Support grants retain their old slot, and reserve one if that slot has already
+ * elapsed. Their 15 minute expiry is never a public release prediction. */
+export async function listOpenPremiumRetries(c: AppContext, now = new Date()) {
+  const at = now.toISOString();
+  const rows = await c.env.merlin_db.prepare(`SELECT g.id,g.activation_id AS activationId,
+    g.license_id AS licenseId,g.app_id AS appId,g.status,g.expires_at AS expiresAt,a.activated_at AS activatedAt
+    FROM premium_retry_grants g JOIN premium_activations a ON a.id=g.activation_id
+    WHERE g.status IN ('processing','review') OR (g.status='available' AND g.expires_at>?)`)
+    .bind(at).all<{id:number;activationId:number;licenseId:number;appId:string;status:'available'|'processing'|'review';expiresAt:string;activatedAt:string|null}>();
+  return rows.results || [];
+}
+
 async function getPremiumLicensePlan(c: AppContext, licenseId: number): Promise<{ license: PremiumLicensePlanRow; plan: EffectivePlan }> {
   const [settings, license] = await Promise.all([
     getPlanSettings(c),
@@ -485,17 +515,17 @@ function isPremiumCatalogCutoffLocked(game: PremiumGame, license: PremiumLicense
 }
 
 function isTierAvailableNow(game: PremiumGame, tier: PlanTier, now: Date) {
-  const releaseAt = premiumReleaseAt(game.createdAt, tier);
+  const releaseAt = premiumReleaseAt(game.availableAt || game.createdAt, tier);
   return tierManualAccess(game, tier) || Boolean(releaseAt && releaseAt <= now.toISOString());
 }
 
-function getTierAvailability(game: PremiumGame, now: Date): PremiumCatalogItem["viewer"]["tierAvailability"] {
+export function getTierAvailability(game: PremiumGame, now: Date): PremiumCatalogItem["viewer"]["tierAvailability"] {
   return [...PLAN_TIERS].reverse().map((tier) => {
     const availableNow = isTierAvailableNow(game, tier, now);
     return {
       tier,
       availableNow,
-      availableAt: availableNow ? null : premiumReleaseAt(game.createdAt, tier),
+      availableAt: availableNow ? null : premiumReleaseAt(game.availableAt || game.createdAt, tier),
     };
   });
 }
@@ -520,7 +550,7 @@ function resolvePremiumTierAccess(game: PremiumGame, plan: EffectivePlan, licens
   }
 
   const tier = plan.effectiveTier;
-  const currentReleaseAt = premiumReleaseAt(game.createdAt, tier);
+  const currentReleaseAt = premiumReleaseAt(game.availableAt || game.createdAt, tier);
   const allowed = isTierAvailableNow(game, tier, now);
 
   if (allowed) {
@@ -702,7 +732,7 @@ async function listCurrentPremiumActivations(c: AppContext, appIds: string[]): P
         failure_stage,
         failure_reason,
         created_at,
-        updated_at
+        updated_at,retry_of
       FROM premium_activations
       WHERE app_id IN (${placeholders})
         AND status IN ('reserved', 'processing', 'active')
@@ -729,7 +759,7 @@ async function listLicensePremiumActivations(c: AppContext, licenseId: number, a
         failure_stage,
         failure_reason,
         created_at,
-        updated_at
+        updated_at,retry_of
       FROM premium_activations
       WHERE license_id = ?
         ${appFilter}
@@ -749,6 +779,7 @@ async function countBronzePremiumActivationsInCycle(c: AppContext, licenseId: nu
       FROM premium_activations
       WHERE license_id = ?
         AND status IN ('active', 'expired')
+        AND retry_of IS NULL
         AND activated_at IS NOT NULL
         AND activated_at >= ?
         AND activated_at < ?
@@ -835,6 +866,7 @@ async function consumeBronzePremiumActivationSlot(
       SELECT ?, ?, COUNT(*), ?
       FROM premium_activations
       WHERE license_id = ?
+        AND retry_of IS NULL
         AND status IN ('active', 'expired')
         AND activated_at IS NOT NULL
         AND activated_at >= ?
@@ -881,6 +913,20 @@ export async function cleanupPremiumActivations(c: AppContext, now = new Date())
   const expiredReservationBefore = new Date(now.getTime() - PREMIUM_RESERVATION_TIMEOUT_MS).toISOString();
 
   await c.env.merlin_db.batch([
+    c.env.merlin_db.prepare(`UPDATE premium_operations SET status='failed',updated_at=?
+      WHERE status='pending' AND reservation_id IS NULL AND created_at<=?`).bind(nowIso,expiredReservationBefore),
+    c.env.merlin_db.prepare(`UPDATE premium_retry_grants SET status='expired',updated_at=?
+      WHERE status='available' AND (expires_at<=? OR NOT EXISTS(SELECT 1 FROM premium_activations a
+        WHERE a.id=premium_retry_grants.activation_id AND a.status='active' AND a.cooldown_until>?))`).bind(nowIso,nowIso,nowIso),
+    c.env.merlin_db.prepare(`UPDATE premium_retry_grants SET status='review',updated_at=?
+      WHERE status='processing' AND retry_activation_id IN (SELECT id FROM premium_activations
+        WHERE status='processing' AND reserved_at<=?)`).bind(nowIso,expiredReservationBefore),
+    c.env.merlin_db.prepare(`UPDATE premium_retry_grants SET status=CASE WHEN expires_at>? THEN 'available' ELSE 'expired' END,
+      retry_activation_id=NULL,updated_at=? WHERE status='processing' AND retry_activation_id IN
+        (SELECT id FROM premium_activations WHERE status='reserved' AND reserved_at<=?)`).bind(nowIso,nowIso,expiredReservationBefore),
+    c.env.merlin_db.prepare(`UPDATE premium_operations SET status='review',updated_at=?
+      WHERE status='pending' AND reservation_id IN (SELECT id FROM premium_activations
+        WHERE status='processing' AND reserved_at<=?)`).bind(nowIso,expiredReservationBefore),
     c.env.merlin_db
       .prepare(`
         UPDATE premium_activations
@@ -927,6 +973,8 @@ export async function listAdminPremiumActivations(c: AppContext): Promise<AdminP
       pa.failure_reason,
       pa.created_at,
       pa.updated_at
+      ,pa.retry_of,
+      (SELECT id FROM premium_operations op WHERE op.reservation_id=pa.id AND op.status='review' LIMIT 1) AS review_operation_id
     FROM premium_activations pa
     INNER JOIN licenses l ON l.id = pa.license_id
     LEFT JOIN premium_games pg ON pg.app_id = pa.app_id
@@ -947,8 +995,10 @@ export async function listAdminPremiumActivations(c: AppContext): Promise<AdminP
     failure_reason: string | null;
     created_at: string;
     updated_at: string;
+    retry_of: number|null;
+    review_operation_id: number|null;
   }>();
-
+  const openRetries = await listOpenPremiumRetries(c);
   return (result.results || []).map((row) => ({
     id: row.id,
     licenseId: row.license_id,
@@ -965,6 +1015,9 @@ export async function listAdminPremiumActivations(c: AppContext): Promise<AdminP
     failureReason: row.failure_reason,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    retryOf: row.retry_of,
+    retry: openRetries.find(retry=>retry.activationId===row.id)
+      || (row.review_operation_id ? {id:row.review_operation_id,activationId:row.id,status:'review' as const,expiresAt:row.updated_at} : null),
   }));
 }
 
@@ -974,6 +1027,9 @@ export async function listAdminPremiumActivations(c: AppContext): Promise<AdminP
  */
 export async function releasePremiumActivationCooldown(c: AppContext, activationId: number): Promise<boolean> {
   const now = new Date().toISOString();
+  const pending = await c.env.merlin_db.prepare(`SELECT id FROM premium_retry_grants WHERE activation_id=?
+    AND status IN ('processing','review') LIMIT 1`).bind(activationId).first();
+  if(pending) throw new HTTPException(409,{message:'Verifique a tentativa com o suporte antes de liberar o cooldown.'});
   const result = await c.env.merlin_db.prepare(`
     UPDATE premium_activations
     SET status = 'expired', cooldown_until = ?, updated_at = ?
@@ -999,6 +1055,7 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
     .prepare(`
       SELECT premium_games.id, premium_games.app_id, premium_games.name, premium_games.cover_url, premium_games.archive_key,
         premium_games.activation_limit, premium_games.activation_cooldown_hours, premium_games.enabled,
+        premium_games.coming_soon,premium_games.available_at,
         premium_games.created_at, premium_games.updated_at,
         premium_games.install_subpath,
         premium_games.activation_type,
@@ -1110,6 +1167,16 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
       ? getBronzePremiumActivationCycleSummaryForLicense(c, licenseId, license)
       : Promise.resolve(null),
   ]);
+  const [wishRows,watchRows,contact,openRetries,operationRows] = await Promise.all([
+    c.env.merlin_db.prepare('SELECT app_id FROM premium_wishlist WHERE license_id=? AND removed_at IS NULL').bind(licenseId).all<{app_id:string}>(),
+    c.env.merlin_db.prepare("SELECT app_id FROM premium_slot_watches WHERE license_id=? AND status='watching'").bind(licenseId).all<{app_id:string}>(),
+    c.env.merlin_db.prepare("SELECT contact FROM licenses WHERE id=?").bind(licenseId).first<{contact:string}>(),
+    listOpenPremiumRetries(c),
+    c.env.merlin_db.prepare("SELECT app_id,status FROM premium_operations WHERE license_id=? AND status IN ('pending','review')")
+      .bind(licenseId).all<{app_id:string;status:'pending'|'review'}>(),
+  ]);
+  const wishIds = new Set((wishRows.results||[]).map(row=>row.app_id));
+  const watchIds = new Set((watchRows.results||[]).map(row=>row.app_id));
   const bronzeUsed = bronzeSummary?.used || 0;
   const bronzeLimit = bronzeSummary?.totalLimit ?? PLAN_RULES.bronze.premiumLimitPerCycle;
 
@@ -1178,7 +1245,7 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
         lastActivatedAt = row.activated_at || lastActivatedAt;
       }
 
-      if (isReservedActivation(row, nowIso)) {
+      if (isReservedActivation(row, nowIso) && !row.retry_of) {
         reservedCount += 1;
         const rowReservedUntil = getReservedUntil(row);
         if (rowReservedUntil) {
@@ -1196,6 +1263,12 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
           reservedUntil = rowReservedUntil;
         }
       }
+    }
+
+    const gameRetries = openRetries.filter(retry=>retry.appId===game.appId);
+    for (const retry of gameRetries) {
+      const originalRelease = premiumGameSlotAvailableAt(retry.activatedAt);
+      if (!originalRelease || originalRelease<=nowIso) reservedCount += 1;
     }
 
     const archiveAvailable = archiveStates[index] || false;
@@ -1230,6 +1303,14 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
     if (viewerStatus === "available" && (!archiveAvailable || availableSlots <= 0)) {
       viewerStatus = "unavailable";
     }
+    const retry = gameRetries.find(entry=>entry.licenseId===licenseId) || null;
+    if (retry && game.enabled && !game.comingSoon && archiveAvailable) {
+      viewerStatus = retry.status === 'available' ? 'available' : 'reserved';
+      reservedUntil = retry.expiresAt;
+    }
+    const operationStatus=(operationRows.results||[]).find(op=>op.app_id===game.appId)?.status||null;
+    if(operationStatus) viewerStatus='reserved';
+    if (game.comingSoon) viewerStatus = 'unavailable';
 
     return {
       id: game.id,
@@ -1241,6 +1322,7 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
       launchExecutablePath: game.launchExecutablePath,
       activationLimit: game.activationLimit,
       enabled: game.enabled,
+      comingSoon: game.comingSoon,
       archiveAvailable,
       availability: {
         activeCount,
@@ -1253,6 +1335,11 @@ export async function listPremiumCatalog(c: AppContext, licenseId: number): Prom
         ),
       },
       viewer: {
+        wishlisted: wishIds.has(game.appId),
+        slotWatching: watchIds.has(game.appId),
+        contactEmail: contact?.contact && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact.contact) ? contact.contact : null,
+        retry,
+        operationStatus,
         status: viewerStatus,
         canActivate: viewerStatus === "available",
         cooldownUntil,
@@ -1277,6 +1364,7 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
   const row = await c.env.merlin_db
     .prepare(`
       SELECT id, app_id, name, cover_url, archive_key, activation_limit, activation_cooldown_hours, enabled, created_at, updated_at,
+        coming_soon,available_at,
         install_subpath,
         activation_type,
         launch_executable_path,
@@ -1296,7 +1384,7 @@ export async function getPremiumGame(c: AppContext, appId: string): Promise<Prem
   return row ? mapPremiumGame(row) : null;
 }
 
-export async function reservePremiumActivation(c: AppContext, licenseId: number, appId: string): Promise<PremiumReservationResult> {
+export async function reservePremiumActivation(c: AppContext, licenseId: number, appId: string, options: {retryGrantId?:number;operationId?:string} = {}): Promise<PremiumReservationResult> {
   await cleanupPremiumActivations(c);
 
   const [{ license, plan }, catalogCutoffAt] = await Promise.all([
@@ -1304,7 +1392,7 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
     getPremiumCatalogCutoffAt(c),
   ]);
   const game = await getPremiumGame(c, appId);
-  if (!game || !game.enabled) {
+  if (!game || !game.enabled || game.comingSoon) {
     throw new HTTPException(404, { message: "Premium game not found" });
   }
 
@@ -1326,12 +1414,21 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
   }
 
   const nowIso = new Date().toISOString();
+  const retry = options.retryGrantId ? await getPremiumRetry(c, licenseId, game.appId) : null;
+  if (options.retryGrantId && (!retry || retry.id!==options.retryGrantId || retry.status!=='available')) {
+    throw new HTTPException(409,{message:'A nova tentativa não está disponível. Atualize a lista.'});
+  }
+  const unresolved = await c.env.merlin_db.prepare(`SELECT id FROM premium_operations WHERE license_id=?
+    AND (app_id=? OR ?=1) AND status IN ('pending','review') AND operation_id<>? LIMIT 1`)
+    .bind(licenseId,game.appId,PLAN_RULES[plan.effectiveTier].premiumCooldownScope==='global'?1:0,options.operationId||'').first();
+  if(unresolved && !retry) throw new HTTPException(409,{message:'Há uma tentativa aguardando confirmação. Atualize o estado ou fale com o suporte.'});
   const licenseRows = await listLicensePremiumActivations(
     c,
     licenseId,
     PLAN_RULES[plan.effectiveTier].premiumCooldownScope === "game" ? game.appId : undefined,
   );
   for (const row of licenseRows) {
+    if (retry && row.id===retry.activationId) continue;
     if (row.app_id === game.appId && isActiveActivation(row, nowIso)) {
       throw new HTTPException(409, { message: `Premium activation is in cooldown until ${row.cooldown_until}` });
     }
@@ -1349,14 +1446,14 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
     }
   }
 
-  if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
+  if (!retry && plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
     const summary = await getBronzePremiumActivationCycleSummaryForLicense(c, licenseId, license);
     if (summary.used >= summary.totalLimit) {
       throw new HTTPException(409, { message: "Bronze premium activation limit reached for the current cycle." });
     }
   }
 
-  await assertPremiumActivationLimit(c, licenseId);
+  if (!retry) await assertPremiumActivationLimit(c, licenseId);
 
   const appRows = await listCurrentPremiumActivations(c, [game.appId]);
   let occupiedSlots = 0;
@@ -1371,7 +1468,7 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
       continue;
     }
 
-    if (isReservedActivation(row, nowIso)) {
+    if (isReservedActivation(row, nowIso) && !row.retry_of) {
       occupiedSlots += 1;
       const reservedUntil = getReservedUntil(row);
       if (reservedUntil && (!nextSlotAt || reservedUntil < nextSlotAt)) {
@@ -1379,8 +1476,13 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
       }
     }
   }
+  const heldRetries = (await listOpenPremiumRetries(c)).filter(entry=>entry.appId===game.appId);
+  for (const held of heldRetries) {
+    const release = premiumGameSlotAvailableAt(held.activatedAt);
+    if (!release || release<=nowIso) occupiedSlots+=1;
+  }
 
-  if (occupiedSlots >= game.activationLimit) {
+  if (!retry && occupiedSlots >= game.activationLimit) {
     throw new HTTPException(409, {
       message: nextSlotAt
         ? `No premium activation slots available right now. Next slot at ${nextSlotAt}`
@@ -1389,7 +1491,14 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
   }
 
   const createdAt = new Date().toISOString();
-  const insertResult = await c.env.merlin_db
+  if (retry && !(await claimPremiumRetryGrant(c,retry.id,licenseId,game.appId))) {
+    throw new HTTPException(409,{message:'A nova tentativa já foi iniciada ou expirou.'});
+  }
+  const slotCutoff = new Date(Date.now()-PREMIUM_GAME_SLOT_COOLDOWN_MS).toISOString();
+  const reservationCutoff = new Date(Date.now()-PREMIUM_RESERVATION_TIMEOUT_MS).toISOString();
+  let insertResult: D1Result;
+  try {
+    insertResult = await c.env.merlin_db
     .prepare(`
       INSERT INTO premium_activations (
         license_id,
@@ -1401,17 +1510,40 @@ export async function reservePremiumActivation(c: AppContext, licenseId: number,
         failure_stage,
         failure_reason,
         created_at,
-        updated_at
+        updated_at,retry_of,operation_id
       )
-      VALUES (?, ?, 'reserved', ?, NULL, NULL, NULL, NULL, ?, ?)
+      SELECT ?, ?, 'reserved', ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?
+      WHERE (? IS NULL OR EXISTS(SELECT 1 FROM premium_operations op WHERE op.license_id=? AND op.operation_id=? AND op.status='pending'))
+      AND (?=1 OR (
+        (SELECT COUNT(*) FROM premium_activations a WHERE a.app_id=? AND
+          ((a.status='active' AND a.activated_at>?) OR
+           (a.retry_of IS NULL AND a.status IN ('reserved','processing') AND a.reserved_at>?)))
+        + (SELECT COUNT(*) FROM premium_retry_grants g JOIN premium_activations a ON a.id=g.activation_id
+           WHERE g.app_id=? AND (g.status IN ('processing','review') OR (g.status='available' AND g.expires_at>?))
+             AND (a.activated_at IS NULL OR a.activated_at<=?)) < ?
+        AND NOT EXISTS(SELECT 1 FROM premium_activations a WHERE a.license_id=?
+          AND (a.app_id=? OR ?=1) AND a.status IN ('reserved','processing') AND a.reserved_at>?)
+      ))
     `)
-    .bind(licenseId, game.appId, createdAt, createdAt, createdAt)
+    .bind(licenseId, game.appId, createdAt, createdAt, createdAt,retry?.activationId??null,options.operationId??null,
+      options.operationId??null,licenseId,options.operationId??null,retry?1:0,
+      game.appId,slotCutoff,reservationCutoff,game.appId,createdAt,slotCutoff,game.activationLimit,
+      licenseId,game.appId,PLAN_RULES[plan.effectiveTier].premiumCooldownScope==='global'?1:0,reservationCutoff)
     .run();
+    // D1 counts writes from AFTER triggers as well (operation/retry links).
+    // This INSERT can create at most one reservation; zero alone means it lost the claim.
+    if (Number(insertResult.meta.changes||0)<1) throw new HTTPException(409,{message:'A vaga foi ocupada ou já existe uma ativação em andamento. Atualize a lista.'});
+  } catch(error) {
+    if(retry) await finishPremiumRetryFailure(c,retry.id,false);
+    throw error;
+  }
 
   const reservationId = Number(insertResult.meta.last_row_id || 0);
   if (!reservationId) {
     throw new HTTPException(500, { message: "Could not reserve premium activation slot" });
   }
+  if(options.operationId) await c.env.merlin_db.prepare(`UPDATE premium_operations SET reservation_id=?,updated_at=?
+    WHERE license_id=? AND operation_id=? AND status='pending'`).bind(reservationId,createdAt,licenseId,options.operationId).run();
 
   return {
     reservationId,
@@ -1425,8 +1557,11 @@ export async function failPremiumActivationReservation(
   reservationId: number,
   stage: string,
   reason: string | null,
+  uncertain = false,
 ): Promise<void> {
   const nowIso = new Date().toISOString();
+  if (uncertain) await c.env.merlin_db.prepare(`UPDATE premium_operations SET status='review',updated_at=?
+    WHERE reservation_id=? AND status IN ('pending','failed')`).bind(nowIso,reservationId).run();
   await c.env.merlin_db
     .prepare(`
       UPDATE premium_activations
@@ -1440,6 +1575,9 @@ export async function failPremiumActivationReservation(
     `)
     .bind(stage, reason, nowIso, reservationId)
     .run();
+  const grant = await c.env.merlin_db.prepare(`SELECT id FROM premium_retry_grants WHERE retry_activation_id=? AND status='processing'`)
+    .bind(reservationId).first<{id:number}>();
+  if(grant) await finishPremiumRetryFailure(c,grant.id,uncertain);
 }
 
 export async function failPremiumActivationReservationForLicense(
@@ -1449,23 +1587,11 @@ export async function failPremiumActivationReservationForLicense(
   appId: string,
   stage: string,
   reason: string | null,
+  uncertain = false,
 ): Promise<void> {
-  const nowIso = new Date().toISOString();
-  await c.env.merlin_db
-    .prepare(`
-      UPDATE premium_activations
-      SET
-        status = 'failed',
-        failure_stage = ?,
-        failure_reason = ?,
-        updated_at = ?
-      WHERE id = ?
-        AND license_id = ?
-        AND app_id = ?
-        AND status = 'reserved'
-    `)
-    .bind(stage, reason, nowIso, reservationId, licenseId, normalizeAppId(appId))
-    .run();
+  const row = await c.env.merlin_db.prepare(`SELECT id FROM premium_activations WHERE id=? AND license_id=? AND app_id=?
+    AND status IN ('reserved','processing')`).bind(reservationId,licenseId,normalizeAppId(appId)).first<{id:number}>();
+  if(row) await failPremiumActivationReservation(c,reservationId,stage,reason,uncertain);
 }
 
 export async function assertPremiumActivationReservationForLicense(
@@ -1520,10 +1646,11 @@ export async function findPremiumActivationReservationForLicense(
 export async function completePremiumActivation(
   c: AppContext,
   reservationId: number,
+  alreadyClaimed = false,
 ): Promise<PremiumActivationCompletion> {
   const reservation = await c.env.merlin_db
     .prepare(`
-      SELECT id, license_id, app_id, status, reserved_at, activated_at, cooldown_until,
+      SELECT id, license_id, app_id, status, reserved_at, activated_at, cooldown_until,retry_of,
         failure_stage, failure_reason, created_at, updated_at
       FROM premium_activations
       WHERE id = ?
@@ -1532,12 +1659,12 @@ export async function completePremiumActivation(
     .bind(reservationId)
     .first<PremiumActivationRecord>();
 
-  if (!reservation || reservation.status !== "reserved") {
+  if (!reservation || reservation.status !== (alreadyClaimed?'processing':'reserved')) {
     throw new HTTPException(409, { message: "Premium activation reservation is not available" });
   }
 
   const claimedAt = new Date().toISOString();
-  const claim = await c.env.merlin_db
+  const claim = alreadyClaimed ? {meta:{changes:1}} : await c.env.merlin_db
     .prepare(`
       UPDATE premium_activations
       SET status = 'processing', updated_at = ?
@@ -1559,7 +1686,7 @@ export async function completePremiumActivation(
       throw new HTTPException(404, { message: "Premium game not found" });
     }
 
-    if (plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
+    if (!reservation.retry_of && plan.effectiveTier === "bronze" && PLAN_RULES.bronze.premiumLimitPerCycle !== null) {
       const summary = await getBronzePremiumActivationCycleSummaryForLicense(c, reservation.license_id, license);
       const consumed = await consumeBronzePremiumActivationSlot(
         c,
@@ -1595,7 +1722,9 @@ export async function completePremiumActivation(
       `)
       .bind(activatedAtIso, cooldownUntilIso, activatedAtIso, reservationId)
       .run();
-    if (Number(completion.meta.changes || 0) !== 1) {
+    // Completing one reservation also updates its operation and any support retry.
+    // D1's changes count includes those trigger writes.
+    if (Number(completion.meta.changes || 0) < 1) {
       throw new HTTPException(409, { message: "Premium activation reservation is not available" });
     }
 
@@ -1614,6 +1743,7 @@ export async function completePremiumActivation(
       reservationId,
       "completion",
       error instanceof Error ? error.message : "Premium activation could not be completed.",
+      true,
     );
     throw error;
   }
@@ -1624,9 +1754,22 @@ export async function completePremiumActivationForLicense(
   reservationId: number,
   licenseId: number,
   appId: string,
+  alreadyClaimed = false,
 ): Promise<PremiumActivationCompletion> {
-  await assertPremiumActivationReservationForLicense(c, reservationId, licenseId, appId);
-  return completePremiumActivation(c, reservationId);
+  if(alreadyClaimed) {
+    const owned=await c.env.merlin_db.prepare("SELECT id FROM premium_activations WHERE id=? AND license_id=? AND app_id=? AND status='processing'")
+      .bind(reservationId,licenseId,normalizeAppId(appId)).first();
+    if(!owned) throw new HTTPException(409,{message:'A tentativa não está mais disponível.'});
+  } else await assertPremiumActivationReservationForLicense(c, reservationId, licenseId, appId);
+  return completePremiumActivation(c, reservationId,alreadyClaimed);
+}
+
+export async function claimPremiumGenerationForLicense(c: AppContext,reservationId:number,licenseId:number,appId:string) {
+  await cleanupPremiumActivations(c);
+  const now=new Date().toISOString();
+  const result=await c.env.merlin_db.prepare(`UPDATE premium_activations SET status='processing',reserved_at=?,updated_at=?
+    WHERE id=? AND license_id=? AND app_id=? AND status='reserved'`).bind(now,now,reservationId,licenseId,normalizeAppId(appId)).run();
+  if(Number(result.meta.changes||0)!==1) throw new HTTPException(409,{message:'Esta tentativa já está em processamento ou não está disponível.'});
 }
 
 export async function assertPremiumDownloadAccess(c: AppContext, licenseId: number, appId: string): Promise<PremiumGame> {
@@ -1653,7 +1796,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
   const installSubpath = normalizeInstallSubpath(input.installSubpath);
   const activationType = normalizeActivationType(input.activationType);
   const launchExecutablePath = normalizeRelativeExecutablePath(input.launchExecutablePath);
-  if (activationType === "third_party" && !launchExecutablePath) {
+  if (activationType === "third_party" && !launchExecutablePath && input.comingSoon!==true) {
     throw new HTTPException(400, { message: "launchExecutablePath is required for third-party activations" });
   }
   const activationLimit = normalizeActivationLimit(input.activationLimit);
@@ -1663,6 +1806,7 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
   const accessOuroEnabled = input.accessOuroEnabled !== false;
   const featured = Boolean(input.featured);
   const enabled = Boolean(input.enabled);
+  const comingSoon = input.comingSoon === true;
   const now = new Date().toISOString();
   const metadata = await resolvePremiumGameMetadata(appId);
   const name = normalizeOptionalText(input.name) || metadata.name || buildDefaultName(appId);
@@ -1687,10 +1831,12 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
           featured,
           featured_at,
           enabled,
+          coming_soon,
+          available_at,
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         appId,
@@ -1708,6 +1854,8 @@ export async function createPremiumGame(c: AppContext, input: PremiumGameCreateI
         featured ? 1 : 0,
         featured ? now : null,
         enabled ? 1 : 0,
+        comingSoon ? 1 : 0,
+        comingSoon ? null : now,
         now,
         now,
       )
@@ -1752,7 +1900,7 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
   const nextLaunchExecutablePath = input.launchExecutablePath !== undefined
     ? normalizeRelativeExecutablePath(input.launchExecutablePath)
     : existing.launchExecutablePath;
-  if (nextActivationType === "third_party" && !nextLaunchExecutablePath) {
+  if (nextActivationType === "third_party" && !nextLaunchExecutablePath && !(input.comingSoon ?? existing.comingSoon)) {
     throw new HTTPException(400, { message: "launchExecutablePath is required for third-party activations" });
   }
   const nextActivationLimit = input.activationLimit !== undefined
@@ -1780,6 +1928,13 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
     ? Boolean(input.enabled)
     : existing.enabled;
   const now = new Date().toISOString();
+  const nextComingSoon = input.comingSoon ?? existing.comingSoon;
+  if (existing.comingSoon && !nextComingSoon) {
+    if (!nextEnabled || !(await headArchiveAvailability(c, nextArchiveKey))) {
+      throw new HTTPException(409, { message: 'Ative o jogo e envie o arquivo antes de disponibilizá-lo e avisar os interessados.' });
+    }
+  }
+  const nextAvailableAt = existing.comingSoon && !nextComingSoon ? now : existing.availableAt;
 
   await c.env.merlin_db
     .prepare(`
@@ -1799,6 +1954,8 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
         featured = ?,
         featured_at = ?,
         enabled = ?,
+        coming_soon = ?,
+        available_at = ?,
         updated_at = ?
       WHERE app_id = ?
     `)
@@ -1817,6 +1974,8 @@ export async function updatePremiumGame(c: AppContext, appId: string, input: Pre
       nextFeatured ? 1 : 0,
       nextFeaturedAt,
       nextEnabled ? 1 : 0,
+      nextComingSoon ? 1 : 0,
+      nextAvailableAt,
       now,
       existing.appId,
     )

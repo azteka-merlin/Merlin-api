@@ -24,6 +24,7 @@ function harness() {
   db.prepare(`INSERT INTO custom_games (id,name,install_name,admin_note,image_key,archive_key,archive_size,executable_path,published)
     VALUES (?,?,?,'','image',?,100,'Old.exe',1)`).run(gameId, "Test game", "Test game", keys[0]!);
   db.exec(readFileSync(new NodeURL("../../migrations/0085_custom_game_versions.sql", import.meta.url), "utf8"));
+  db.exec(readFileSync(new NodeURL("../../migrations/0088_custom_game_download_outcome.sql", import.meta.url), "utf8"));
   const game = { id: gameId, archive_key: keys[0]!, archive_size: 100, package_type: "zip" as "zip" | "folder",
     executable_path: "Old.exe", origin: "native" as "native" | "port", protected_paths_json: "[]", published: 1, install_name: "Test game" };
   const hooks = { beforeRun: undefined as undefined | ((sql: string, values: unknown[]) => void) };
@@ -157,6 +158,11 @@ describe("download sessions", () => {
     expect((await h.request(`/${result.body.leaseId}/complete`)).response.status).toBe(200);
     expect((await h.request(`/${result.body.leaseId}/complete`)).response.status).toBe(200);
     expect((await h.request(`/${result.body.leaseId}/cancel`)).response.status).toBe(200);
+    expect(h.db.prepare("SELECT outcome FROM custom_game_download_sessions WHERE id=?").get(result.body.leaseId)?.outcome).toBe("completed");
+    const canceled = await h.request("", { archiveKey: keys[0] });
+    expect((await h.request(`/${canceled.body.leaseId}/cancel`)).response.status).toBe(200);
+    expect((await h.request(`/${canceled.body.leaseId}/complete`)).response.status).toBe(200);
+    expect(h.db.prepare("SELECT outcome FROM custom_game_download_sessions WHERE id=?").get(canceled.body.leaseId)?.outcome).toBe("canceled");
     expect((await h.request(`/${result.body.leaseId}/heartbeat`)).response.status).toBe(409);
   });
 

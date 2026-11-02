@@ -12,6 +12,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxGameBytes: 200 * GiB,
   maxFileBytes: 30 * GiB,
   maxFiles: 100_000,
+  maxFolderFiles: 200_000,
   maxEntries: 200_000,
   maxCompressionRatio: 10_000,
   reserveDiskBytes: GiB,
@@ -424,7 +425,7 @@ function validateJob(job, limits) {
     typeof job.archiveKey !== "string" || !["zip", "folder"].includes(job.packageType)) throw new Error("Job de indexação inválido.");
   if (job.packageType === "zip") integer(job.sourceSize, "Tamanho da origem", limits.maxArchiveBytes);
   else {
-    if (!Array.isArray(job.files) || !job.files.length || job.files.length > limits.maxFiles) throw new Error("Lista de arquivos da pasta inválida.");
+    if (!Array.isArray(job.files) || !job.files.length || job.files.length > limits.maxFolderFiles) throw new Error("Lista de arquivos da pasta inválida.");
     const register = pathRegistry();
     let total = 0;
     for (const file of job.files) {
@@ -524,6 +525,7 @@ export function configurationFromEnv(env = process.env) {
     maxArchiveBytes: readInteger("CUSTOM_GAME_INDEXER_MAX_ARCHIVE_BYTES", DEFAULT_LIMITS.maxArchiveBytes),
     maxGameBytes: readInteger("CUSTOM_GAME_INDEXER_MAX_GAME_BYTES", DEFAULT_LIMITS.maxGameBytes),
     maxFileBytes: readInteger("CUSTOM_GAME_INDEXER_MAX_FILE_BYTES", DEFAULT_LIMITS.maxFileBytes),
+    maxFolderFiles: readInteger("CUSTOM_GAME_INDEXER_MAX_FOLDER_FILES", DEFAULT_LIMITS.maxFolderFiles),
     reserveDiskBytes: readInteger("CUSTOM_GAME_INDEXER_RESERVE_DISK_BYTES", DEFAULT_LIMITS.reserveDiskBytes),
   };
   const rangeBytes = readInteger("CUSTOM_GAME_INDEXER_RANGE_BYTES", 16 * 1024 ** 2);

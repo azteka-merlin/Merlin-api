@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { classifyPayer, summarizeFinance, summarizePaidPeriodDistribution, type FinanceLicenseRow } from "./admin-finance-dashboard";
+import { capturePaidSubscriberSnapshot, classifyPayer, summarizeFinance, summarizePaidPeriodDistribution, TIER_RECEIPTS_SQL, type FinanceLicenseRow } from "./admin-finance-dashboard";
+import { DatabaseSync } from "node:sqlite";
+import type { AppBindings } from "../types";
 
 const now = new Date("2026-10-28T12:00:00.000Z");
 
@@ -30,6 +32,51 @@ const prices = [
 ];
 
 describe("admin finance dashboard", () => {
+  it("records daily paid subscribers and excludes free, tests, expired and lifetime licenses", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`CREATE TABLE paid_subscriber_daily_snapshots(day TEXT,tier TEXT,subscribers INTEGER,sampled_at TEXT,PRIMARY KEY(day,tier));
+      CREATE TABLE licenses(id INTEGER,plan_tier TEXT,status TEXT,expires_at TEXT,license_type TEXT,billing_status TEXT,access_type TEXT,stripe_subscription_id TEXT,source TEXT);
+      CREATE TABLE payments(license_id INTEGER,status TEXT,amount_cents INTEGER,currency TEXT);
+      INSERT INTO licenses VALUES
+      (1,'bronze','active','2026-12-01','normal','active','monthly_manual',NULL,'mercadopago_pix'),
+      (2,'ouro','active','2026-12-01','normal','active','annual_subscription','sub_2','stripe'),
+      (3,'bronze','active','2026-12-01','normal','active','free',NULL,'mercadopago_pix'),
+      (4,'prata','active','2026-12-01','test','active','monthly_manual',NULL,'mercadopago_pix'),
+      (5,'prata','active','2026-10-01','normal','active','monthly_manual',NULL,'mercadopago_pix'),
+      (6,'ouro','active','2026-12-01','normal','active','paid_lifetime',NULL,'stripe'),
+      (7,'prata','active','2026-12-01','normal','active','monthly_manual',NULL,'mercadopago_pix');
+      INSERT INTO payments VALUES(1,'paid',1490,'brl'),(2,'paid',5000,'brl'),(3,'paid',100,'brl'),(4,'paid',100,'brl'),(5,'paid',100,'brl'),(6,'paid',100,'brl'),(7,'paid',0,'brl');`);
+    const env = { merlin_db: { prepare: (sql: string) => ({ bind: (...values: string[]) => ({ run: async () => db.prepare(sql).run(...values) }) }) } } as unknown as AppBindings;
+    await capturePaidSubscriberSnapshot(env, new Date('2026-11-02T01:00:00Z'));
+    const rows = db.prepare('SELECT day,tier,subscribers FROM paid_subscriber_daily_snapshots ORDER BY tier').all();
+    expect(rows).toEqual([{ day: '2026-11-01', tier: 'bronze', subscribers: 1 }, { day: '2026-11-01', tier: 'ouro', subscribers: 1 }, { day: '2026-11-01', tier: 'prata', subscribers: 0 }]);
+    await capturePaidSubscriberSnapshot(env, new Date('2026-11-02T01:00:00Z'));
+    expect(db.prepare('SELECT COUNT(*) AS count FROM paid_subscriber_daily_snapshots').get()?.count).toBe(3);
+    db.close();
+  });
+  it("attributes paid amounts to checkout tier, excluding tests, free amounts and refunds", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`CREATE TABLE licenses(id INTEGER,license_type TEXT,plan_tier TEXT);
+      CREATE TABLE checkout_sessions(provider TEXT,provider_session_id TEXT,plan_tier TEXT);
+      CREATE TABLE payments(provider TEXT,provider_checkout_session_id TEXT,license_id INTEGER,status TEXT,amount_cents INTEGER,currency TEXT,created_at TEXT);
+      INSERT INTO licenses VALUES(1,'normal','ouro'),(2,'test','bronze');
+      INSERT INTO checkout_sessions VALUES('stripe','s1','bronze'),('stripe','s2','ouro');
+      INSERT INTO payments VALUES
+        ('stripe','s1',1,'paid',1490,'brl','2026-10-15'),
+        ('stripe','s2',1,'paid',2490,'brl','2026-10-16'),
+        ('stripe','s1',2,'paid',1490,'brl','2026-10-16'),
+        ('stripe','s1',1,'refunded',1490,'brl','2026-10-16'),
+        ('stripe','s1',1,'paid',0,'brl','2026-10-16'),
+        ('stripe',NULL,1,'paid',500,'brl','2026-10-16'),
+        ('stripe','s1',1,'paid',1000,'brl','2026-09-01');`);
+    const rows = db.prepare(TIER_RECEIPTS_SQL).all('2026-10-01','2026-11-01');
+    expect(rows).toEqual([
+      { tier: 'bronze', amount_cents: 1490, payment_count: 1, licenses: 1 },
+      { tier: 'ouro', amount_cents: 2490, payment_count: 1, licenses: 1 },
+      { tier: 'unknown', amount_cents: 500, payment_count: 1, licenses: 1 },
+    ]);
+    db.close();
+  });
   it("groups retained active payers by confirmed paid periods", () => {
     expect(summarizePaidPeriodDistribution([
       { paid_periods: 1 }, { paid_periods: 2 }, { paid_periods: 3 },

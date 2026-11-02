@@ -11,13 +11,14 @@ import { ensureGameVersion, gameVersionInsertStatement, getLegacyGamePackage, re
 import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, integrityManifestKey, integrityJobKey, integrityJobId, readJob, writeJob } from "./custom-game-integrity";
 import { consumeCloudflareIntegrityBatch, type IntegrityQueueMessage } from "./custom-game-cloudflare-indexer";
 import { folderManifestObjectKeys, putImmutableFolderManifest, referencedGameFileKeys } from "./custom-game-package-lifecycle";
+import { MAX_FOLDER_GAME_FILES, MAX_FOLDER_MANIFEST_BYTES } from './custom-game-limits';
 
 const PART_SIZE = 64 * 1024 * 1024;
 const MAX_ARCHIVE_SIZE = 100 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_PARTS = Math.ceil(MAX_ARCHIVE_SIZE / PART_SIZE);
 const MAX_GAME_SIZE = 200 * 1024 * 1024 * 1024;
 const MAX_GAME_FILE_SIZE = 30 * 1024 * 1024 * 1024;
-const MAX_GAME_FILES = 100000;
+const MAX_GAME_FILES = MAX_FOLDER_GAME_FILES;
 const MAX_GAME_BUNDLES = 2500;
 const MAX_NEW_BUNDLE_SIZE = 200 * 1024 * 1024;
 const MAX_BUNDLE_MEMBER_SIZE = 200 * 1024 * 1024;
@@ -25,7 +26,7 @@ const MAX_DIRECT_FILE_SIZE = 32 * 1024 * 1024;
 const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 const MAX_RANGE_SIZE = 64 * 1024 * 1024;
 const MAX_FOLDER_RANGE_SIZE = 256 * 1024 * 1024;
-const MAX_FOLDER_MANIFEST_SIZE = 12 * 1024 * 1024;
+const MAX_FOLDER_MANIFEST_SIZE = MAX_FOLDER_MANIFEST_BYTES;
 const UUID = "[0-9a-f-]{36}";
 const GAME_ID_PATTERN = new RegExp(`^${UUID}$`);
 const ARCHIVE_KEY_PATTERN = new RegExp(`^(?:archives/${UUID}|${UUID}/archives/${UUID})\\.zip$`);
@@ -35,7 +36,8 @@ const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b78
 const DRAFT_KEY_PATTERN = /^draft\/[0-9a-f-]{36}$/;
 const FOLDER_MANIFEST_CACHE_MS = 60_000;
 const FOLDER_MANIFEST_CACHE_SIZE = 4;
-const folderManifestCache = new Map<string, { expiresAt: number; manifest: FolderManifest }>();
+const FOLDER_MANIFEST_CACHE_FILES = 100_000;
+const folderManifestCache = new Map<string, { expiresAt: number; fileCount: number; manifest: FolderManifest }>();
 
 export function validFolderFileCount(files: unknown): files is unknown[] {
   return Array.isArray(files) && files.length >= 1 && files.length <= MAX_GAME_FILES;
@@ -109,6 +111,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
   const object = await c.env.CUSTOM_GAMES.get(key);
   if (!object) fail("Manifesto do jogo não encontrado.", 404);
   if (object.size > MAX_FOLDER_MANIFEST_SIZE) fail("Manifesto do jogo inválido.");
+  if (object.size > 8 * 1024 * 1024) folderManifestCache.clear();
   let manifest: FolderManifest;
   try { manifest = await object.json<FolderManifest>(); }
   catch { fail("Manifesto do jogo inválido."); }
@@ -164,11 +167,15 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
   if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE || manifest.totalSizeBytes !== totalSizeBytes) fail("Tamanho do manifesto inválido.");
   const validated: FolderManifest = { version: manifest.version, files: manifest.files,
     ...(manifest.bundles ? { bundles: manifest.bundles } : {}), totalSizeBytes };
-  if (folderManifestCache.size >= FOLDER_MANIFEST_CACHE_SIZE) {
+  // Large folders remain supported without retaining several expanded copies
+  // between requests in the Workers isolate.
+  if (memberCount > FOLDER_MANIFEST_CACHE_FILES) return validated;
+  while (folderManifestCache.size >= FOLDER_MANIFEST_CACHE_SIZE ||
+    [...folderManifestCache.values()].reduce((total,entry)=>total+entry.fileCount,0)+memberCount>FOLDER_MANIFEST_CACHE_FILES) {
     const oldest = folderManifestCache.keys().next().value;
     if (oldest) folderManifestCache.delete(oldest);
   }
-  folderManifestCache.set(key, { expiresAt: Date.now() + FOLDER_MANIFEST_CACHE_MS, manifest: validated });
+  folderManifestCache.set(key, { expiresAt: Date.now() + FOLDER_MANIFEST_CACHE_MS, fileCount:memberCount, manifest: validated });
   return validated;
 }
 
@@ -519,10 +526,45 @@ async function publishStagedZip(c: AppContext, id: string) {
   return { id, name: data.name };
 }
 
+export const CUSTOM_GAME_DOWNLOAD_PEOPLE_SQL = `SELECT s.license_id, COALESCE(l.name, 'Licença removida') AS name,
+  COUNT(*) AS started, SUM(CASE WHEN s.outcome='completed' THEN 1 ELSE 0 END) AS completed,
+  MAX(s.created_at) AS last_started
+  FROM custom_game_download_sessions s LEFT JOIN licenses l ON l.id=s.license_id
+  WHERE s.game_id=? AND s.created_at>=?
+  GROUP BY s.license_id,l.name ORDER BY started DESC,last_started DESC,s.license_id ASC LIMIT 51 OFFSET ?`;
+
 export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) {
   registerGameUploadSessionRoutes(app);
   registerGameVersionRoutes(app, { findGame });
   registerCustomGameIntegrityRoutes(app, integrityDependencies);
+  app.get("/panel-api/custom-games/download-ranking", async c => {
+    await requireAdminSession(c);
+    const requested = Number(c.req.query("days") || 30);
+    const days = Number.isInteger(requested) && requested >= 1 && requested <= 3650 ? requested : 30;
+    const start = new Date(Date.now() - days * 86400000).toISOString();
+    const rows = await c.env.merlin_db.prepare(`SELECT s.game_id, COALESCE(g.name, s.game_id) AS name,
+      COUNT(*) AS started, COUNT(DISTINCT s.license_id) AS licenses,
+      SUM(CASE WHEN s.outcome='completed' THEN 1 ELSE 0 END) AS completed,
+      SUM(CASE WHEN s.outcome='canceled' THEN 1 ELSE 0 END) AS canceled,
+      SUM(CASE WHEN s.completed_at IS NOT NULL AND s.outcome IS NULL THEN 1 ELSE 0 END) AS unknown
+      FROM custom_game_download_sessions s LEFT JOIN custom_games g ON g.id=s.game_id
+      WHERE s.created_at >= ? GROUP BY s.game_id, g.name ORDER BY started DESC, name ASC`).bind(start).all();
+    c.header("Cache-Control", "no-store");
+    return c.json({ success: true, days, games: rows.results });
+  });
+  app.get("/panel-api/custom-games/:id/downloads", async c => {
+    await requireAdminSession(c);
+    const id = validGameId(c.req.param("id"));
+    const requested = Number(c.req.query("days") || 30);
+    const days = Number.isInteger(requested) && requested >= 1 && requested <= 1095 ? requested : 30;
+    const pageValue = Number(c.req.query("page") || 1);
+    const page = Number.isInteger(pageValue) && pageValue >= 1 && pageValue <= 10000 ? pageValue : 1;
+    const start = new Date(Date.now() - days * 86400000).toISOString();
+    const rows = await c.env.merlin_db.prepare(CUSTOM_GAME_DOWNLOAD_PEOPLE_SQL)
+      .bind(id, start, (page - 1) * 50).all();
+    c.header("Cache-Control", "no-store");
+    return c.json({ success: true, page, hasMore: rows.results.length > 50, people: rows.results.slice(0, 50) });
+  });
   app.get("/panel-api/custom-games", async c => {
     await requireAdminSession(c);
     const rows = await c.env.merlin_db.prepare("SELECT * FROM custom_games WHERE deleted_at IS NULL ORDER BY created_at DESC").all<GameRow>();
