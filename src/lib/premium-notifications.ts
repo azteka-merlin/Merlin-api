@@ -105,13 +105,24 @@ async function scheduleSlotMessages(c: AppContext, game: PremiumGame, now: Date,
         AND w.updated_at=premium_notification_outbox.source_updated_at))`).bind(at, game.appId, slot, prefix, prefix).run();
   if (!slot) return 0;
   const scheduled = new Date(Math.max(now.getTime(), Date.parse(slot) - FIVE_MINUTES)).toISOString();
+  // A prediction may move away and return to a previously canceled release.
+  // Reuse that event only for its still-active subscription. Preserve delivery
+  // attempts, the frozen body and the provider key if a send was uncertain.
+  const restored = await c.env.merlin_db.prepare(`UPDATE premium_notification_outbox
+    SET status='scheduled',scheduled_at=?,lease_until=NULL,updated_at=?
+    WHERE app_id=? AND kind='slot_available' AND status='canceled' AND slot_at=? AND attempts<?
+      AND substr(dedupe_key,1,length(?))=?
+      AND EXISTS(SELECT 1 FROM premium_slot_watches w WHERE w.license_id=premium_notification_outbox.license_id
+        AND w.app_id=premium_notification_outbox.app_id AND w.status='watching'
+        AND w.updated_at=premium_notification_outbox.source_updated_at AND w.email=premium_notification_outbox.email)`)
+    .bind(scheduled, at, game.appId, slot, MAX_ATTEMPTS, prefix, prefix).run();
   const inserted = await c.env.merlin_db.prepare(`INSERT OR IGNORE INTO premium_notification_outbox
     (license_id,app_id,kind,dedupe_key,email,status,scheduled_at,slot_at,source_updated_at,created_at,updated_at)
     SELECT w.license_id,w.app_id,'slot_available',?||w.id||':'||w.updated_at,w.email,'scheduled',?,?,w.updated_at,?,?
     FROM premium_slot_watches w WHERE w.app_id=? AND w.status='watching'
       AND NOT EXISTS(SELECT 1 FROM premium_notification_outbox n WHERE n.dedupe_key=?||w.id||':'||w.updated_at)
     ORDER BY w.id LIMIT 100`).bind(prefix, scheduled, slot, at, at, game.appId, prefix).run();
-  return Number(inserted.meta.changes || 0);
+  return Number(restored.meta.changes || 0) + Number(inserted.meta.changes || 0);
 }
 
 function escapeHtml(text: string) {

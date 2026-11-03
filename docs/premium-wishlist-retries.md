@@ -17,6 +17,7 @@ Implementação das regras aprovadas em 02/11/2026. A migração 0090 é necess�
 - O agendador calcula a próxima liberação de uma ativação pública de 24 horas. Reservas temporárias e prazos de suporte não são anúncios de vaga.
 - Envio previsto cerca de cinco minutos antes, com nova validação imediatamente antes da chamada ao provedor. O aviso não reserva a vaga.
 - Alterações na previsão, cancelamento e reativação exclusiva invalidam mensagens antigas. Após envio, a inscrição é encerrada.
+- Se a previsão mudar e depois voltar ao mesmo horário, o evento cancelado é reagendado somente enquanto a mesma inscrição continuar ativa. Tentativas, corpo congelado e chave do provedor são preservados; inscrições canceladas e avisos enviados não são reativados.
 
 ## Nova tentativa acompanhada
 

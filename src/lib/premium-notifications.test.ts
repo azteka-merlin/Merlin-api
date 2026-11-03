@@ -111,6 +111,27 @@ describe('Premium notifications',()=>{
     ]);
   });
 
+  it('restores a canceled prediction when capacity returns to the same release without duplicating delivery',async()=>{
+    const h=harness();h.game.activationLimit=2;
+    h.active(1,'2026-11-02T16:00:00.000Z');h.active(2,'2026-11-02T17:00:00.000Z');
+    await savePremiumSlotWatch(h.c,1,'123',{email:'one@example.com'},at);
+    await h.tick();
+    const original=h.db.prepare('SELECT id,dedupe_key FROM premium_notification_outbox').get();
+    h.game.activationLimit=1;
+    await h.tick(new Date('2026-11-02T15:10:00.000Z'));
+    h.game.activationLimit=2;
+    expect(await h.tick(new Date('2026-11-02T15:20:00.000Z'))).toMatchObject({scheduled:1,sent:0});
+    expect(h.db.prepare('SELECT id,dedupe_key,status,slot_at FROM premium_notification_outbox ORDER BY id').all()).toEqual([
+      {...original,status:'scheduled',slot_at:'2026-11-02T16:00:00.000Z'},
+      {id:expect.any(Number),dedupe_key:expect.any(String),status:'canceled',slot_at:'2026-11-02T17:00:00.000Z'},
+    ]);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(await h.tick(new Date('2026-11-02T15:56:00.000Z'))).toMatchObject({sent:1});
+    await h.tick(new Date('2026-11-02T15:57:00.000Z'));
+    expect(h.request).toHaveBeenCalledTimes(1);
+    expect(h.db.prepare('SELECT status FROM premium_slot_watches').get()?.status).toBe('sent');
+  });
+
   it('does not announce private support deadlines or reservation expiry',async()=>{
     const h=harness();h.active();
     state.retries=[{id:9,activationId:1,licenseId:1,appId:'123',status:'available',expiresAt:'2026-11-02T15:15:00.000Z',activatedAt:'2026-11-01T15:04:00.000Z'}];
@@ -125,6 +146,29 @@ describe('Premium notifications',()=>{
     expect(h.request).not.toHaveBeenCalled();
     await h.tick(new Date('2026-11-02T15:04:00.000Z'));
     expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('keeps the same frozen message and provider key when an uncertain prediction is restored',async()=>{
+    const h=harness();h.active(1,'2026-11-02T16:00:00.000Z');
+    await savePremiumSlotWatch(h.c,1,'123',{email:'one@example.com'},at);
+    await h.tick();
+    h.request.mockRejectedValueOnce(new Error('response lost after sending'));
+    expect(await h.tick(new Date('2026-11-02T15:56:00.000Z'))).toMatchObject({failed:1,sent:0});
+    const original=h.db.prepare('SELECT id,dedupe_key,payload_json,first_attempt_at FROM premium_notification_outbox').get();
+    h.game.activationLimit=2;
+    await h.tick(new Date('2026-11-02T15:56:30.000Z'));
+    expect(h.db.prepare('SELECT status FROM premium_notification_outbox').get()?.status).toBe('canceled');
+    h.game.activationLimit=1;
+    expect(await h.tick(new Date('2026-11-02T15:58:00.000Z'))).toMatchObject({sent:1});
+    expect(h.db.prepare('SELECT id,dedupe_key,payload_json,first_attempt_at,attempts,status FROM premium_notification_outbox').get())
+      .toEqual({...original,attempts:2,status:'sent'});
+    expect(h.request.mock.calls[1]![1]!.body).toBe(h.request.mock.calls[0]![1]!.body);
+    expect(h.request.mock.calls[1]![1]!.headers).toEqual(h.request.mock.calls[0]![1]!.headers);
+    h.game.activationLimit=2;
+    await h.tick(new Date('2026-11-02T15:58:20.000Z'));
+    h.game.activationLimit=1;
+    await h.tick(new Date('2026-11-02T15:58:40.000Z'));
+    expect(h.request).toHaveBeenCalledTimes(2);
   });
 
   it('accounts private additional holds when the original catalog slot already elapsed',async()=>{
