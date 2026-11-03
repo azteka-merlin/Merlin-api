@@ -2,6 +2,7 @@ import { HTTPException } from "hono/http-exception";
 import { getCookie, setCookie } from "hono/cookie";
 import type { AppContext } from "../types";
 import { getBillingSettings } from "./billing-settings";
+import { sendTransactionalEmail } from './email-transport';
 
 type EmailVerificationRow = {
 	id: number;
@@ -14,7 +15,6 @@ type EmailVerificationRow = {
 	cooldown_until: string;
 };
 
-const RESEND_API_URL = "https://api.resend.com/emails";
 const DEFAULT_EMAIL_FROM = "Merlin <onboarding@resend.dev>";
 const CODE_TTL_SECONDS = 10 * 60;
 const RESEND_COOLDOWN_SECONDS = 60;
@@ -113,43 +113,12 @@ function renderVerificationEmail(code: string) {
 }
 
 async function sendVerificationEmail(c: AppContext, input: { email: string; code: string; idempotencyKey: string }) {
-	const apiKey = String(c.env.RESEND_API_KEY || "").trim();
-	if (!apiKey) {
-		throw new HTTPException(500, { message: "RESEND_API_KEY is not configured" });
-	}
-
 	const message = renderVerificationEmail(input.code);
-	const from = getEmailFrom(c);
-	const response = await fetch(RESEND_API_URL, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			"Idempotency-Key": input.idempotencyKey,
-			"User-Agent": "Merlin API",
-		},
-		body: JSON.stringify({
-			from,
-			to: [input.email],
-			subject: message.subject,
-			html: message.html,
-			text: message.text,
-		}),
-	});
-
-	if (response.ok) {
-		return;
-	}
-
-	let detail = "";
 	try {
-		detail = await response.text();
+    return await sendTransactionalEmail(c.env,{from:getEmailFrom(c),to:[input.email],...message},input.idempotencyKey);
 	} catch {
-		detail = "";
+    throw new HTTPException(502, { message: "Could not send verification email" });
 	}
-	console.warn("[email-verification] resend failed", response.status, detail.slice(0, 300));
-	throw new HTTPException(502, { message: "Could not send verification email" });
 }
 
 async function getLatestPendingVerification(c: AppContext, emailNormalized: string) {
@@ -208,9 +177,7 @@ export async function startPublicEmailVerification(c: AppContext, email: string)
 	const billing = isStaging ? await getBillingSettings(c) : null;
 	const useStagingTestCode = isStaging && !billing?.stagingEmailDeliveryEnabled;
 
-	if (!useStagingTestCode) {
-		await sendVerificationEmail(c, { email, code, idempotencyKey });
-	}
+	const delivery = useStagingTestCode ? null : await sendVerificationEmail(c, { email, code, idempotencyKey });
 
 	await c.env.merlin_db
 		.prepare(
@@ -233,7 +200,7 @@ export async function startPublicEmailVerification(c: AppContext, email: string)
 				VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?)
 			`,
 		)
-		.bind(email.trim(), normalizedEmail, codeHash, useStagingTestCode ? "staging_test" : "resend", expiresAt, cooldownUntil, nowIso, nowIso, nowIso)
+		.bind(email.trim(), normalizedEmail, codeHash, delivery?.provider || "staging_test", expiresAt, cooldownUntil, nowIso, nowIso, nowIso)
 		.run();
 
 	return {

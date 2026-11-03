@@ -1,6 +1,6 @@
 import type { AppBindings } from "../types";
+import { sendTransactionalEmail } from './email-transport';
 
-const RESEND_API_URL = "https://api.resend.com/emails";
 const DEFAULT_EMAIL_FROM = "Merlin <onboarding@resend.dev>";
 
 export type BillingEmailKind =
@@ -57,15 +57,15 @@ function optionalLicenseBlock(licenseKeyMasked?: string | null) {
               </table>`;
 }
 
-function renderShell(input: {
+export function renderShell(input: {
   title: string;
   preheader: string;
   eyebrow: string;
   heroLabel: string;
   heading: string;
   bodyHtml: string;
-  ctaLabel: string;
-  ctaUrl: string;
+  ctaLabel?: string;
+  ctaUrl?: string;
   footer: string;
 }) {
   return `<!doctype html>
@@ -94,10 +94,10 @@ function renderShell(input: {
             <td style="padding:28px;font-family:Arial,Helvetica,sans-serif;background:#ffffff;color:#18181b;">
               <p style="margin:0 0 8px;color:#7c3aed;font-size:13px;line-height:18px;letter-spacing:1px;text-transform:uppercase;font-weight:700;">${escapeHtml(input.eyebrow)}</p>
               <h1 style="margin:0 0 12px;font-size:24px;line-height:30px;font-weight:700;color:#111827;">${escapeHtml(input.heading)}</h1>
-${input.bodyHtml}
+${input.bodyHtml}${input.ctaLabel && input.ctaUrl ? `
               <p style="margin:24px 0 0;">
                 <a href="${escapeHtml(input.ctaUrl)}" style="display:inline-block;padding:13px 18px;border-radius:10px;background:#7c3aed;color:#ffffff;text-decoration:none;font-size:14px;line-height:18px;font-weight:700;">${escapeHtml(input.ctaLabel)}</a>
-              </p>
+              </p>` : ""}
             </td>
           </tr>
           <tr>
@@ -297,33 +297,6 @@ export function renderBillingEmail(input: BillingEmailInput) {
 }
 
 export async function sendBillingEmail(c: BillingEmailContext, input: BillingEmailInput) {
-  const apiKey = String(c.env.RESEND_API_KEY || "").trim();
-  if (!apiKey) {
-    throw new Error("RESEND_API_KEY is not configured");
-  }
-
   const message = renderBillingEmail(input);
-  const response = await fetch(RESEND_API_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "Idempotency-Key": input.idempotencyKey,
-      "User-Agent": "Merlin API",
-    },
-    body: JSON.stringify({
-      from: getEmailFrom(c),
-      to: [input.email],
-      subject: message.subject,
-      html: message.html,
-      text: message.text,
-    }),
-  });
-
-  if (response.ok) {
-    return response.json().catch(() => ({ success: true }));
-  }
-
-  const detail = await response.text().catch(() => "");
-  throw new Error(`Billing email failed with ${response.status}: ${detail.slice(0, 300)}`);
+  return sendTransactionalEmail(c.env, {from:getEmailFrom(c),to:[input.email],...message},input.idempotencyKey);
 }

@@ -32,6 +32,7 @@
 	"vars": {
 		"ENVIRONMENT": "production",
 		"PUBLIC_APP_ORIGIN": "https://your-public-domain.example.com",
+		"BREVO_EMAIL_FROM": "Merlin <no-reply@your-domain.example.com>",
 		"PIX_ENABLED": "false",
 		"PIX_PROVIDER": "mercadopago",
 		"PIX_ENV": "production",
@@ -181,6 +182,7 @@
 			"vars": {
 				"ENVIRONMENT": "staging",
 				"PUBLIC_APP_ORIGIN": "https://your-staging-public-domain.example.com",
+				"BREVO_EMAIL_FROM": "Merlin <no-reply@your-domain.example.com>",
 				"PIX_ENABLED": "false",
 				"PIX_PROVIDER": "mercadopago",
 				"PIX_ENV": "test",

@@ -1,4 +1,5 @@
 import type { AppContext } from "../types";
+import { sendTransactionalEmail } from './email-transport';
 
 type AccessKeyEmailInput = {
 	email: string;
@@ -6,7 +7,6 @@ type AccessKeyEmailInput = {
 	licenseKey: string;
 };
 
-const RESEND_API_URL = "https://api.resend.com/emails";
 const DEFAULT_EMAIL_FROM = "Merlin <onboarding@resend.dev>";
 const DOWNLOAD_URL = "https://api-merlin.com/download";
 
@@ -93,35 +93,9 @@ function renderAccessKeyEmail(input: AccessKeyEmailInput & { mode: "welcome" | "
 }
 
 async function sendAccessKeyEmail(c: AppContext, input: AccessKeyEmailInput & { mode: "welcome" | "recovery" }) {
-	const apiKey = String(c.env.RESEND_API_KEY || "").trim();
-	if (!apiKey) {
-		throw new Error("RESEND_API_KEY is not configured");
-	}
-
 	const message = renderAccessKeyEmail(input);
-	const response = await fetch(RESEND_API_URL, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-			"Idempotency-Key": `access-key-${input.mode}-${input.email}-${input.licenseKey}`,
-			"User-Agent": "Merlin API",
-		},
-		body: JSON.stringify({
-			from: getEmailFrom(c),
-			to: [input.email],
-			subject: message.subject,
-			html: message.html,
-			text: message.text,
-		}),
-	});
-
-	if (response.ok) {
-		return response.json().catch(() => ({ success: true }));
-	}
-
-	const detail = await response.text().catch(() => "");
-	throw new Error(`Access key email failed with ${response.status}: ${detail.slice(0, 300)}`);
+  return sendTransactionalEmail(c.env, {from:getEmailFrom(c),to:[input.email],...message},
+    `access-key-${input.mode}-${input.email}-${input.licenseKey}`);
 }
 
 export async function sendWelcomeAccessKeyEmail(c: AppContext, input: AccessKeyEmailInput) {

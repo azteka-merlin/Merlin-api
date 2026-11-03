@@ -4,6 +4,8 @@ import type { AppBindings, AppContext } from '../types';
 import { getPremiumGame, getTierAvailability, listOpenPremiumRetries, PREMIUM_GAME_SLOT_COOLDOWN_MS, type PremiumGame } from './premium-games';
 import { getPlanSettings, planTierLabel } from './plan-tiers';
 import { nextPublicPremiumSlot } from './premium-notification-rules';
+import { renderShell as renderMerlinEmailShell } from './billing-emails';
+import { hasEmailTransport, sendTransactionalEmail, type EmailMessage } from './email-transport';
 
 const FIVE_MINUTES = 5 * 60_000;
 const LEASE_MS = 2 * 60_000;
@@ -132,17 +134,45 @@ function escapeHtml(text: string) {
 async function renderMessage(c: AppContext, row: OutboxRow, game: PremiumGame, now: Date) {
   const { plansEnabled } = await getPlanSettings(c);
   const tiers = plansEnabled ? getTierAvailability(game, now).filter(tier => tier.availableNow).map(tier => planTierLabel(tier.tier)).filter(Boolean).join(', ') : 'todos os planos';
-  const body = row.kind === 'game_available'
-    ? `${game.name} chegou ao Premium do Merlin.\n\nDisponível agora para: ${tiers || 'nenhum plano neste momento'}.\nA ativação depende das vagas disponíveis e das regras do seu plano. Abra o launcher para conferir. Você continua com este jogo na sua lista de desejos.`
-    : `A próxima vaga pública para ativar ${game.name} está prevista para ${new Intl.DateTimeFormat('pt-BR', { timeZone:'America/Sao_Paulo', dateStyle:'short', timeStyle:'short' }).format(new Date(row.slot_at!))} (horário de Brasília).\n\nEste aviso não reserva a vaga. Confira a disponibilidade e as regras do seu plano no launcher.`;
-  const subject = row.kind === 'game_available' ? `${game.name} chegou ao Premium` : `Próxima ativação disponível: ${game.name}`;
-  let origin = 'https://api-merlin.com';
-  try { const configured = new URL(c.env.PUBLIC_APP_ORIGIN || origin); if (configured.protocol === 'https:') origin = configured.origin; } catch { /* Use the public origin. */ }
-  const url = `${origin}/meu-acesso#lista-de-desejos`;
+  const launched = row.kind === 'game_available';
+  const slotLabel = launched ? '' : new Intl.DateTimeFormat('pt-BR', {
+    timeZone:'America/Sao_Paulo', dateStyle:'short', timeStyle:'short',
+  }).format(new Date(row.slot_at!));
+  const detail = launched ? (tiers || 'nenhum plano neste momento') : `${slotLabel} (horário de Brasília)`;
+  const intro = launched
+    ? 'O jogo que você colocou na sua lista de desejos já está disponível no Premium do Merlin.'
+    : 'Você pediu para ser avisado sobre a próxima ativação deste jogo. A liberação está prevista para o horário abaixo.';
+  const notice = launched
+    ? 'As ativações estão sujeitas à disponibilidade e às regras do seu plano.'
+    : 'Este aviso não reserva uma ativação. A disponibilidade pode mudar; confira as regras do seu plano no Merlin.';
+  const instruction = `Abra o Merlin, acesse a aba Premium e procure por ${game.name}.`;
+  const subject = launched ? `${game.name} chegou ao Premium` : `Próxima ativação disponível: ${game.name}`;
+  const preheader = launched ? `${game.name} já está disponível. Confira os planos com acesso.` : `Próxima ativação de ${game.name}: ${detail}.`;
+  const footer = launched
+    ? 'Merlin Launcher • Você recebeu este e-mail porque adicionou este jogo à sua lista de desejos.'
+    : 'Merlin Launcher • Você recebeu este e-mail porque solicitou um aviso sobre a próxima ativação deste jogo.';
+  const bodyHtml = `
+              <p style="margin:0 0 22px;font-size:14px;line-height:22px;color:#374151;">${escapeHtml(intro)}</p>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border:1px solid #ddd6fe;border-radius:14px;border-collapse:separate;background:#faf5ff;">
+                <tr>
+                  <td style="padding:20px;font-family:Arial,Helvetica,sans-serif;">
+                    <p style="margin:0 0 16px;color:#111827;font-size:20px;line-height:27px;font-weight:700;">${escapeHtml(game.name)}</p>
+                    <p style="margin:0;color:#6b21a8;font-size:12px;line-height:18px;font-weight:700;text-transform:uppercase;letter-spacing:1px;">${launched ? 'Planos com acesso agora' : 'Próxima ativação prevista'}</p>
+                    <p style="margin:6px 0 0;color:#111827;font-size:${launched ? '18' : '22'}px;line-height:28px;font-weight:700;">${escapeHtml(launched ? detail : slotLabel)}</p>
+                    ${launched ? '' : '<p style="margin:4px 0 0;color:#6b7280;font-size:12px;line-height:18px;">Horário de Brasília</p>'}
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:22px 0 14px;font-size:14px;line-height:22px;color:#374151;">${escapeHtml(notice)}</p>
+              <p style="margin:0;font-size:14px;line-height:22px;color:#374151;font-weight:700;">${escapeHtml(instruction)}</p>
+              ${launched ? '<p style="margin:18px 0 0;font-size:12px;line-height:18px;color:#6b7280;">Este jogo continua na sua lista de desejos.</p>' : ''}`;
   return {
     from: String(c.env.EMAIL_FROM || '').trim() || 'Merlin <onboarding@resend.dev>', to:[row.email], subject,
-    text: `${body}\n\nGerencie seus interesses: ${url}`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;line-height:1.6"><h1 style="font-size:22px">${escapeHtml(subject)}</h1>${body.split('\n\n').map(text => `<p>${escapeHtml(text).replace(/\n/g,'<br>')}</p>`).join('')}<p><a href="${escapeHtml(url)}">Minha conta no Merlin</a></p></div>`,
+    text: [subject, intro, `${game.name}\n${launched ? 'Disponível agora para' : 'Próxima ativação prevista'}: ${detail}.`, notice, instruction,
+      ...(launched ? ['Você continua com este jogo na sua lista de desejos.'] : []), footer].join('\n\n'),
+    html: renderMerlinEmailShell({ title:subject, preheader, heroLabel:'Merlin Premium',
+      eyebrow:launched ? 'Lista de desejos' : 'Aviso de ativação',
+      heading:launched ? 'Seu jogo chegou ao Premium' : 'Uma ativação está chegando', bodyHtml, footer }),
   };
 }
 
@@ -161,7 +191,7 @@ async function sourceStillValid(c: AppContext, row: OutboxRow, game: PremiumGame
   return true;
 }
 
-/** This cron is independent of expiration reminders. No delivery occurs without configured Resend credentials. */
+/** This cron is independent of expiration reminders. No delivery occurs without email credentials. */
 export async function runPremiumNotificationCron(env: AppBindings, now = new Date(), delivery: {
   request?: typeof fetch; pause?: (milliseconds: number) => Promise<void>;
 } = {}) {
@@ -186,7 +216,7 @@ export async function runPremiumNotificationCron(env: AppBindings, now = new Dat
     const game = await getPremiumGame(c, app_id);
     if (game) summary.scheduled += await scheduleSlotMessages(c, game, now, retries);
   }
-  if (!String(env.RESEND_API_KEY || '').trim()) { summary.skipped++; return summary; }
+  if (!hasEmailTransport(env)) { summary.skipped++; return summary; }
   const due = await env.merlin_db.prepare(`SELECT * FROM premium_notification_outbox
     WHERE attempts<? AND ((status IN ('scheduled','failed') AND scheduled_at<=?) OR (status='sending' AND lease_until<=?))
     ORDER BY CASE kind WHEN 'slot_available' THEN 0 ELSE 1 END,scheduled_at,id LIMIT ?`)
@@ -200,6 +230,7 @@ export async function runPremiumNotificationCron(env: AppBindings, now = new Dat
     if (Number(claim.meta.changes || 0)!==1) { summary.skipped++; continue; }
     let row = await env.merlin_db.prepare('SELECT * FROM premium_notification_outbox WHERE id=?').bind(candidate.id).first<OutboxRow>();
     if (!row) continue;
+    const legacyResend = Boolean(row.payload_json);
     try {
       const game = await getPremiumGame(c, row.app_id);
       if (!game || !await sourceStillValid(c,row,game,dispatchTime())) {
@@ -230,13 +261,23 @@ export async function runPremiumNotificationCron(env: AppBindings, now = new Dat
       const idempotencyHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${row.dedupe_key}:${row.payload_json}`));
       const idempotencyKey = `merlin-premium:${Array.from(new Uint8Array(idempotencyHash), byte => byte.toString(16).padStart(2,'0')).join('')}`;
       lastRequestAt = Date.now();
-      const response = await request('https://api.resend.com/emails', {
-        method:'POST', headers:{ Authorization:`Bearer ${env.RESEND_API_KEY}`, 'Content-Type':'application/json', 'Idempotency-Key':idempotencyKey, 'User-Agent':'Merlin API' },
-        body:row.payload_json, signal:AbortSignal.timeout(10_000),
-      });
-      if (!response.ok) throw new Error(`Provedor de e-mail respondeu ${response.status}.`);
-      const acknowledgement = await response.json().catch(() => null) as {id?:string}|null;
-      if (!acknowledgement?.id) throw new Error('O provedor de e-mail não confirmou o envio.');
+      let canceledBeforeSend = false;
+      try {
+        await sendTransactionalEmail(env,JSON.parse(row.payload_json) as EmailMessage,idempotencyKey,{
+          request,legacyResend,
+          beforeSend:async()=>{
+            const latestGame=await getPremiumGame(c,row!.app_id);
+            if (!latestGame || !await sourceStillValid(c,row!,latestGame,dispatchTime())) {
+              canceledBeforeSend=true;
+              throw new Error('Inscrição cancelada ou previsão alterada antes do envio.');
+            }
+          },
+        });
+      } catch (error) {
+        if (!canceledBeforeSend) throw error;
+        await env.merlin_db.prepare(`UPDATE premium_notification_outbox SET status='canceled',lease_until=NULL,updated_at=? WHERE id=? AND status='sending' AND lease_until=?`).bind(at,row.id,lease).run();
+        summary.canceled++;continue;
+      }
       await env.merlin_db.batch([
         env.merlin_db.prepare(`UPDATE premium_notification_outbox SET status='sent',sent_at=?,last_error=NULL,lease_until=NULL,updated_at=? WHERE id=? AND status='sending' AND lease_until=?`).bind(at,at,row.id,lease),
         env.merlin_db.prepare(`UPDATE premium_slot_watches SET status='sent' WHERE license_id=? AND app_id=? AND updated_at=? AND status='watching'

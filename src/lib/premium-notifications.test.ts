@@ -29,6 +29,7 @@ function harness() {
     INSERT INTO licenses VALUES(1,'Player A'),(2,'Player B');
     INSERT INTO premium_games VALUES('123','Upcoming <game>',NULL,1,'2026-11-02T15:00:00.000Z','2026-11-02T15:00:00.000Z');`);
   db.exec(readFileSync(new URL('../../migrations/0090_premium_wishes_and_retries.sql', import.meta.url),'utf8'));
+  db.exec(readFileSync(new URL('../../migrations/0091_email_delivery_routes.sql', import.meta.url),'utf8'));
   function prepare(sql: string) {
     let args: unknown[] = [];
     return {
@@ -71,6 +72,29 @@ beforeEach(()=>{state.games.clear();state.retries=[];state.plansEnabled=true;});
 afterEach(()=>{for (const db of databases.splice(0)) db.close();vi.restoreAllMocks();});
 
 describe('Premium notifications',()=>{
+  it('delivers a wishlist announcement through Brevo and preserves sent state on replay',async()=>{
+    const h=harness();h.env.BREVO_API_KEY='test-brevo';h.wish();h.launch();
+    h.request.mockImplementation(async url=>String(url).endsWith('/account')
+      ?Response.json({relay:{enabled:true},plan:[{type:'free',creditsType:'sendLimit',credits:300}]}) : Response.json({messageId:'brevo-id'}));
+    expect(await h.tick()).toMatchObject({sent:1,failed:0});
+    const body=JSON.parse(String(h.request.mock.calls[1]![1]!.body));
+    expect(body.htmlContent).toContain('Planos com acesso agora');
+    expect(h.db.prepare('SELECT provider,message_id FROM email_delivery_routes').get()).toEqual({provider:'brevo',message_id:'brevo-id'});
+    await h.tick();expect(h.request).toHaveBeenCalledTimes(2);
+  });
+
+  it('revalidates a canceled watch after the Brevo quota check and does not send it',async()=>{
+    const h=harness();h.env.BREVO_API_KEY='test-brevo';h.active();
+    await savePremiumSlotWatch(h.c,1,'123',{email:'one@example.com'},at);
+    h.request.mockImplementation(async()=>{
+      h.db.prepare("UPDATE premium_slot_watches SET status='canceled'").run();
+      return Response.json({relay:{enabled:true},plan:[{type:'free',creditsType:'sendLimit',credits:300}]});
+    });
+    expect(await h.tick()).toMatchObject({sent:0,canceled:1});
+    expect(h.request).toHaveBeenCalledTimes(1);
+    expect(h.db.prepare('SELECT status FROM premium_notification_outbox').get()?.status).toBe('canceled');
+  });
+
   it('requires a valid email and an enabled available game with no public capacity',async()=>{
     const h=harness();
     await expect(savePremiumSlotWatch(h.c,1,'123',{email:'bad'},at)).rejects.toMatchObject({status:400});
@@ -91,9 +115,13 @@ describe('Premium notifications',()=>{
     expect(result).toMatchObject({sent:1,scheduled:1});
     expect(h.request).toHaveBeenCalledTimes(1);
     const body=JSON.parse(String(h.request.mock.calls[0]![1]!.body));
-    expect(body.text).toContain('não reserva a vaga');
+    expect(body.text).toContain('não reserva uma ativação');
     expect(body.text).toContain('02/11/2026, 12:04');
     expect(body.html).toContain('&lt;game&gt;');
+    expect(body.html).toContain('letter-spacing:6px');
+    expect(body.html).toContain('Próxima ativação prevista');
+    expect(body.html).not.toContain('Minha conta');
+    expect(body.html).not.toContain('/meu-acesso');
     expect(h.db.prepare('SELECT status FROM premium_slot_watches').get()?.status).toBe('sent');
     await h.tick(new Date(at.getTime()+30_000));
     expect(h.request).toHaveBeenCalledTimes(1);
@@ -194,7 +222,10 @@ describe('Premium notifications',()=>{
     expect(await h.tick()).toMatchObject({sent:2});
     const body=JSON.parse(String(h.request.mock.calls[0]![1]!.body));
     expect(body.text).toContain('Disponível agora para: Ouro.');
-    expect(body.text).toContain('depende das vagas disponíveis');
+    expect(body.text).toContain('sujeitas à disponibilidade e às regras do seu plano');
+    expect(body.html).toContain('Seu jogo chegou ao Premium');
+    expect(body.html).toContain('Planos com acesso agora');
+    expect(body.html).not.toContain('Minha conta');
     expect(h.db.prepare('SELECT COUNT(*) AS n FROM premium_wishlist WHERE removed_at IS NULL').get()?.n).toBe(2);
     await h.tick();expect(h.request).toHaveBeenCalledTimes(2);
   });

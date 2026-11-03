@@ -2,12 +2,14 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { isValidRecoverySecret } from "./lib/recovery-pin";
 
-export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | "PIX_ENV" | "MERCADO_PAGO_API_BASE" | "MERCADO_PAGO_TEST_PAYER_EMAIL" | "LICENSE_FILE_AES_KEY_BASE64" | "STEAM_ACCOUNT_ID" | "PUBLIC_APP_ORIGIN" | "CUSTOM_GAME_INDEX_QUEUE"> {
+export interface AppBindings extends Omit<Env, "PIX_ENABLED" | "PIX_PROVIDER" | "PIX_ENV" | "MERCADO_PAGO_API_BASE" | "MERCADO_PAGO_TEST_PAYER_EMAIL" | "LICENSE_FILE_AES_KEY_BASE64" | "STEAM_ACCOUNT_ID" | "PUBLIC_APP_ORIGIN" | "CUSTOM_GAME_INDEX_QUEUE" | "BREVO_EMAIL_FROM" | "ADMIN_APP_HOST"> {
 	PUBLIC_APP_ORIGIN?: string;
 	ADMIN_APP_HOST?: string;
 	STEAM_API_KEY?: string;
   SESSION_HASH_SECRET: string;
   RESEND_API_KEY: string;
+  BREVO_API_KEY?: string;
+  BREVO_EMAIL_FROM?: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_MONTHLY_PRICE_ID?: string;
   STRIPE_ANNUAL_PRICE_ID?: string;
