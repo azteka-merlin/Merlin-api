@@ -162,6 +162,7 @@ import { createPremiumRetryGrant } from './lib/premium-retry-grants';
 import { startPremiumOperation, finishPremiumOperation, readPremiumOperation } from './lib/premium-operations';
 import { claimPremiumGenerationForLicense } from './lib/premium-games';
 import { savePremiumSlotWatch, cancelPremiumSlotWatch, listAdminPremiumNotifications, runPremiumNotificationCron } from './lib/premium-notifications';
+import { getEmailProviderQuotas } from './lib/email-quotas';
 import {
   createPoll,
   deletePoll,
@@ -3150,6 +3151,12 @@ app.get("/panel-api/licenses/:id/expiration-reminder", async (c) => {
   await requireAdminSession(c);
   const result = await getExpirationReminderEligibility(c, parseLicenseId(c.req.param("id")));
   return c.json({ eligible: result.eligible, reason: result.eligible ? null : result.reason }, 200);
+});
+
+app.get('/panel-api/email/quotas',async c=>{
+  await requireAdminSession(c);
+  c.header('Cache-Control','no-store');
+  return c.json(await getEmailProviderQuotas(c.env),200);
 });
 
 app.get("/panel-api/billing-notifications/dashboard", async (c) => {
