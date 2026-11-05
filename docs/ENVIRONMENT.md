@@ -17,7 +17,8 @@ These values are required for the production Worker declared in `wrangler.jsonc`
 | `DEPOTBOX_API_KEY` | manifests, fixes, game search | Authenticates Depotbox requests. |
 | `RYUU_AUTH_CODE` | manifests, fixes | Enables Ryuu manifest source when `RYU_API_URL` is configured and lets the API proxy Ryuu fix downloads without exposing the auth code to the launcher. |
 | `STEAM_API_KEY` | manifests | Authenticates the Steam API manifest ZIP source with the `x-api-key` header. Configure separately in production and staging Workers; the value may be reused if desired. |
-| `HUBCAP_TOKEN` | manifests | Enables Hubcap manifest fallback. |
+| `HBCP_KEY` | manifests | Authenticates Hubcap; preferred over the legacy `HUBCAP_TOKEN`. The free usage endpoint controls the quota circuit. |
+  | `HUBCAP_TOKEN` | manifests | Legacy Hubcap secret, used if `HBCP_KEY` is absent. |
 | `JWT_SECRET` | launcher auth | Signs launcher API bearer tokens. |
 | `LICENSE_FILE_AES_KEY_BASE64` | special correction activation | Decrypts the bounded license file sent by an authenticated launcher. It must decode to 16, 24, or 32 bytes and must never be committed. |
 | `SESSION_HASH_SECRET` | admin panel | Hashes/admin session security material. |
@@ -71,3 +72,5 @@ Recommended shape for staging:
 - The API returns only the extracted token. It does not download, extract, modify, or recompress the correction ZIP.
 - Never log or persist the uploaded license contents or returned token.
 - A fix override may optionally define an HTTPS `coverUrl`. The launcher receives it as `imageUrl` in the corrections catalog; it is presentation metadata only.
+
+`RESEND_QUOTA` (optional): a Full Access Resend key used only for the admin usage lookup. If absent, the lookup uses `RESEND_API_KEY`; the sending key and transport are unchanged.

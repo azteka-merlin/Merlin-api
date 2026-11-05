@@ -58,7 +58,7 @@ function parseBearerToken(request: Request): string | null {
   return scheme === "Bearer" && token ? token : null;
 }
 
-function firstEligibleCorrection(fixes: unknown): { href: string; filename: string; size?: string } | null {
+export function firstEligibleCorrection(fixes: unknown): { href: string; filename: string; size?: string } | null {
   if (!Array.isArray(fixes)) return null;
 
   for (const fix of fixes) {
@@ -67,7 +67,7 @@ function firstEligibleCorrection(fixes: unknown): { href: string; filename: stri
     const badges = Array.isArray(candidate.badges)
       ? candidate.badges.map((value) => String(value || "").trim().toLocaleLowerCase())
       : [];
-    if (badges.includes("hypervisor")) continue;
+    if (badges.includes("hypervisor") || badges.includes("online")) continue;
 
     const href = typeof candidate.href === "string" ? candidate.href.trim() : "";
     const filename = typeof candidate.filename === "string" ? candidate.filename.trim() : "";
@@ -80,7 +80,7 @@ function firstEligibleCorrection(fixes: unknown): { href: string; filename: stri
   return null;
 }
 
-function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> {
+export function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> {
   if (!Array.isArray(entries)) {
     throw new Error("Invalid fixes catalog payload");
   }

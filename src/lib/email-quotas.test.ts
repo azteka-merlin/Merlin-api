@@ -39,8 +39,16 @@ describe('email provider quotas',()=>{
     const request=network();request.mockImplementation(async url=>String(url).includes('resend')?Response.json({message:'secret internal detail'},{status:403}):Response.json(account));
     const result=await getEmailProviderQuotas(env,request);
     expect(result.providers[0].status).toBe('ok');
-    expect(result.providers[1]).toMatchObject({status:'restricted',quotas:[],message:expect.stringContaining('não permite consultar')});
+    expect(result.providers[1]).toMatchObject({status:'restricted',quotas:[],message:expect.stringContaining('acesso completo')});
     expect(JSON.stringify(result)).not.toContain('secret internal detail');
+  });
+
+  it('uses a separate full-access key for Resend usage without changing the sending key',async()=>{
+    const request=network();
+    const envWithUsageKey={...env,RESEND_QUOTA:'usage-only-test'} as AppBindings;
+    await getEmailProviderQuotas(envWithUsageKey,request);
+    const call=request.mock.calls.find(([url])=>String(url).includes('resend'))!;
+    expect(new Headers(call[1]?.headers).get('Authorization')).toBe('Bearer usage-only-test');
   });
 
   it('shows uncapped Resend plans without inventing a remaining balance',async()=>{

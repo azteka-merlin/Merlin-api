@@ -1,0 +1,9 @@
+CREATE TABLE manifest_source_settings_new (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  primary_source TEXT NOT NULL DEFAULT 'hubcap' CHECK (primary_source IN ('hubcap', 'depotbox', 'ryuu', 'steam-api')),
+  updated_at TEXT NOT NULL
+);
+INSERT INTO manifest_source_settings_new (id, primary_source, updated_at)
+SELECT id, 'hubcap', updated_at FROM manifest_source_settings;
+DROP TABLE manifest_source_settings;
+ALTER TABLE manifest_source_settings_new RENAME TO manifest_source_settings;

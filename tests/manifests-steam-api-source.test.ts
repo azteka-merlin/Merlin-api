@@ -15,9 +15,9 @@ describe("Steam API manifest source", () => {
 
     expect(sources.map((source) => source.name)).toEqual([
       "depotbox",
+      "hubcap",
       "ryu",
       "steam-api",
-      "hubcap",
       "skyflare",
       "github-1",
       "github-2",
@@ -46,7 +46,7 @@ describe("Steam API manifest source", () => {
       RYUU_AUTH_CODE: "test-ryuu-code",
     }, "steam-api");
 
-    expect(sources.slice(0, 3).map((source) => source.name)).toEqual(["steam-api", "depotbox", "ryu"]);
+    expect(sources.slice(0, 3).map((source) => source.name)).toEqual(["steam-api", "ryu", "depotbox"]);
   });
 
   test("skips the ZIP when generation reports zero depots", async () => {

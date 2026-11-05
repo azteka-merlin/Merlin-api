@@ -1,10 +1,10 @@
 import type { AppContext } from "../types";
 
-export const MANIFEST_PRIMARY_SOURCES = ["depotbox", "ryuu", "steam-api"] as const;
+export const MANIFEST_PRIMARY_SOURCES = ["hubcap", "ryuu", "depotbox", "steam-api"] as const;
 
 export type ManifestPrimarySource = (typeof MANIFEST_PRIMARY_SOURCES)[number];
 
-export const DEFAULT_MANIFEST_PRIMARY_SOURCE: ManifestPrimarySource = "depotbox";
+export const DEFAULT_MANIFEST_PRIMARY_SOURCE: ManifestPrimarySource = "hubcap";
 
 type ManifestSourceSettingsRow = {
   primary_source: string;

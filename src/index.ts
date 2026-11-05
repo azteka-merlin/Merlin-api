@@ -1,3 +1,4 @@
+import { getHubcapCircuitStatus } from "./lib/hubcap-quota";
 import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { adminIpGuard } from "./lib/admin-ip-guard";
@@ -2458,14 +2459,19 @@ app.post("/panel-api/public-signup/billing/refresh-prices", async (c) => {
 
 app.get("/panel-api/manifest-source-settings", async (c) => {
   await requireAdminSession(c);
-  return c.json({ success: true, settings: await getManifestSourceSettings(c) }, 200);
+  const settings = await getManifestSourceSettings(c);
+  const env = c.env as Env & { HBCP_KEY?: string; HUBCAP_TOKEN?: string };
+  const hubcapCircuit = await getHubcapCircuitStatus(c.env.merlin_db, env.HBCP_KEY?.trim() || env.HUBCAP_TOKEN?.trim());
+  return c.json({ success: true, settings: { ...settings, hubcapCircuit } }, 200);
 });
 
 app.put("/panel-api/manifest-source-settings", async (c) => {
   await requireAdminSession(c, { mutate: true });
   const body = parseBody(manifestSourceSettingsSchema, await c.req.json());
   const settings = await updateManifestSourceSettings(c, body.primarySource);
-  return c.json({ success: true, settings }, 200);
+  const env = c.env as Env & { HBCP_KEY?: string; HUBCAP_TOKEN?: string };
+  const hubcapCircuit = await getHubcapCircuitStatus(c.env.merlin_db, env.HBCP_KEY?.trim() || env.HUBCAP_TOKEN?.trim());
+  return c.json({ success: true, settings: { ...settings, hubcapCircuit } }, 200);
 });
 
 app.get("/panel-api/catalog-enrichment-status", async (c) => {

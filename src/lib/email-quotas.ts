@@ -51,10 +51,16 @@ async function brevo(env: AppBindings, request: typeof fetch): Promise<ProviderQ
 
 async function resend(env: AppBindings, request: typeof fetch): Promise<ProviderQuota> {
   const base: ProviderQuota={provider:'resend',name:'Resend',role:'Reserva',status:'unconfigured',quotas:[],message:null,dashboardUrl:'https://resend.com/usage'};
-  if (!env.RESEND_API_KEY?.trim()) return {...base,message:'Provedor n√£o configurado.'};
+  const usageKey = (env as AppBindings & { RESEND_QUOTA?: string }).RESEND_QUOTA?.trim() || env.RESEND_API_KEY?.trim();
+  if (!usageKey) return {...base, message:'Resend n„o configurado.'};
   try {
-    const result=await query('https://api.resend.com/usage',{Authorization:`Bearer ${env.RESEND_API_KEY.trim()}`,Accept:'application/json'},request);
-    if(!result.ok)return errorResult(base,result.status);
+    const result=await query('https://api.resend.com/usage',{Authorization:`Bearer ${usageKey}`,Accept:'application/json','User-Agent':'Merlin/2.0'},request);
+    if (!result.ok) {
+      const failure = errorResult(base, result.status);
+      return failure.status === 'restricted'
+        ? {...failure, message:'Para ver a cota, configure uma chave Resend com acesso completo.'}
+        : failure;
+    }
     const quotas: EmailQuota[]=[];
     const emails=result.body?.emails as Record<string,{used?:unknown;limit?:unknown;resets_at?:unknown}> | undefined;
     for (const period of ['daily','monthly'] as const) {

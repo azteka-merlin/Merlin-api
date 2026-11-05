@@ -1,5 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
+import { hubcapQuotaAllows } from "../lib/hubcap-quota";
 import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getManifestSourceSettings, manifestPrimarySourceOrder, type ManifestPrimarySource } from "../lib/manifest-source-settings";
@@ -14,6 +15,7 @@ type ManifestEnv = {
 	RYU_API_URL?: string;
 	RYUU_AUTH_CODE?: string;
 	HUBCAP_TOKEN?: string;
+	HBCP_KEY?: string;
 	MERLIN_FILES?: R2Bucket;
 };
 
@@ -224,6 +226,19 @@ export async function fetchSource(source: ManifestSource, appId: string): Promis
 	return { response: null, outcome: lastOutcome };
 }
 
+export async function fetchHubcapSource(source: ManifestSource, appId: string, db: D1Database, token: string): Promise<ManifestFetchResult> {
+	if (!await hubcapQuotaAllows(db, token)) {
+		return { response: null, outcome: { name: source.name, result: "unavailable", kind: "request_failed" } };
+	}
+	const result = await fetchSource(source, appId);
+	// Quota can be consumed between the preflight and the download. Confirm
+	// with the free usage endpoint instead of guessing from an HTTP status.
+	if (!result.response && result.outcome.kind === "http" && result.outcome.status !== 404) {
+		await hubcapQuotaAllows(db, token);
+	}
+	return result;
+}
+
 export function createSources(appId: string, env: ManifestEnv, primarySource: ManifestPrimarySource): ManifestSource[] {
 	const commonHeaders = {
 		"User-Agent": USER_AGENT,
@@ -279,7 +294,17 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 		}
 		: null;
 
+	const hubcapToken = env.HBCP_KEY?.trim() || env.HUBCAP_TOKEN?.trim();
+	const hubcapSource: ManifestSource | null = hubcapToken ? {
+		name: "hubcap",
+		url: `https://hubcapmanifest.com/api/v1/manifest/${encodeURIComponent(appId)}`,
+		init: { headers: { ...commonHeaders, Authorization: `Bearer ${hubcapToken}` } },
+		maxAttempts: 1,
+		timeoutMs: SOURCE_TIMEOUT_MS,
+	} : null;
+
 	const primarySources = {
+		hubcap: hubcapSource,
 		depotbox: depotboxSource,
 		ryuu: ryuuSource,
 		"steam-api": steamApiSource,
@@ -287,21 +312,6 @@ export function createSources(appId: string, env: ManifestEnv, primarySource: Ma
 	for (const sourceName of manifestPrimarySourceOrder(primarySource)) {
 		const source = primarySources[sourceName];
 		if (source) sources.push(source);
-	}
-
-	if (env.HUBCAP_TOKEN) {
-		sources.push({
-			name: "hubcap",
-			url: `https://hubcapmanifest.com/api/v1/manifest/${appId}`,
-			init: {
-				headers: {
-					...commonHeaders,
-					Authorization: `Bearer ${env.HUBCAP_TOKEN}`,
-				},
-			},
-			maxAttempts: 1,
-			timeoutMs: SOURCE_TIMEOUT_MS,
-		});
 	}
 
 	sources.push({
@@ -420,7 +430,10 @@ export class ManifestsRoute extends OpenAPIRoute {
 		const sourceSettings = await getManifestSourceSettings(c);
 		const sourceOutcomes: ManifestSourceOutcome[] = [];
 		for (const source of createSources(appId, env, sourceSettings.primarySource)) {
-			const { response, outcome } = await fetchSource(source, appId);
+			const token = env.HBCP_KEY?.trim() || env.HUBCAP_TOKEN?.trim() || "";
+			const { response, outcome } = source.name === "hubcap"
+				? await fetchHubcapSource(source, appId, env.merlin_db, token)
+				: await fetchSource(source, appId);
 			sourceOutcomes.push(outcome);
 			if (!response || !response.body) continue;
 

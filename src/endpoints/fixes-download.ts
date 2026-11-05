@@ -31,7 +31,7 @@ type RyuuFixEntry = {
 	fixes?: RyuuFix[];
 };
 
-function firstEligibleRyuuFix(fixes: unknown): { href: string; filename: string } | null {
+export function firstEligibleRyuuFix(fixes: unknown): { href: string; filename: string } | null {
 	if (!Array.isArray(fixes)) return null;
 
 	for (const fix of fixes) {
@@ -40,7 +40,7 @@ function firstEligibleRyuuFix(fixes: unknown): { href: string; filename: string 
 		const badges = Array.isArray(candidate.badges)
 			? candidate.badges.map((value) => String(value || "").trim().toLocaleLowerCase())
 			: [];
-		if (badges.includes("hypervisor")) continue;
+		if (badges.includes("hypervisor") || badges.includes("online")) continue;
 
 		const href = typeof candidate.href === "string" ? candidate.href.trim() : "";
 		const filename = typeof candidate.filename === "string" ? candidate.filename.trim() : "";
