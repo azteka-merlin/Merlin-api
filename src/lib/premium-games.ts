@@ -1081,6 +1081,36 @@ export async function listPremiumGames(c: AppContext): Promise<PremiumGame[]> {
   return (rows.results || []).map(mapPremiumGame);
 }
 
+type SlotRetry = { activationId: number; appId: string; status: 'available' | 'processing' | 'review'; activatedAt: string | null };
+
+// Match the public catalog's occupancy rules; slots are a pool, not fixed IDs.
+export function describePremiumSlots(limit: number, rows: PremiumActivationRecord[], retries: SlotRetry[], now = new Date()) {
+  const nowIso = now.toISOString();
+  const entries: Array<{ status: string; availableAt: string | null }> = [];
+  for (const row of rows) {
+    if (occupiesPremiumGameSlot(row, nowIso)) {
+      const retry = retries.find(item => item.activationId === row.id);
+      entries.push({ status: retry ? `retry_${retry.status}` : 'active', availableAt: retry ? null : premiumGameSlotAvailableAt(row.activated_at) });
+    }
+    if (isReservedActivation(row, nowIso) && !row.retry_of) {
+      entries.push({ status: row.status, availableAt: getReservedUntil(row) });
+    }
+  }
+  for (const retry of retries) {
+    const release = premiumGameSlotAvailableAt(retry.activatedAt);
+    if (!release || release <= nowIso) entries.push({ status: `retry_${retry.status}`, availableAt: null });
+  }
+  entries.sort((a, b) => (a.availableAt || '\uffff').localeCompare(b.availableAt || '\uffff'));
+  return { total: limit, occupied: entries.length, available: Math.max(0, limit - entries.length), entries };
+}
+
+export async function getAdminPremiumSlots(c: AppContext, appId: string) {
+  const game = await getPremiumGame(c, appId);
+  if (!game) throw new HTTPException(404, { message: "Premium game not found" });
+  const [rows, retries] = await Promise.all([listCurrentPremiumActivations(c, [game.appId]), listOpenPremiumRetries(c)]);
+  return describePremiumSlots(game.activationLimit, rows, retries.filter(retry => retry.appId === game.appId));
+}
+
 export async function listPremiumGameEarlyAccess(c: AppContext, appId: string): Promise<PremiumGameEarlyAccess[]> {
   const normalizedAppId = normalizeAppId(appId);
   const rows = await c.env.merlin_db

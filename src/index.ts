@@ -144,6 +144,7 @@ import {
   failPremiumActivationReservationForLicense,
   findPremiumActivationReservationForLicense,
   getPremiumGame,
+  getAdminPremiumSlots,
   getBronzePremiumActivationCycleSummary,
   grantPremiumGameEarlyAccess,
   listPremiumCatalog,
@@ -1697,6 +1698,12 @@ app.get("/panel-api/premium/games/:appId", async (c) => {
   }
 
   return c.json({ game }, 200);
+});
+
+app.get("/panel-api/premium/games/:appId/slots", async (c) => {
+  await requireAdminSession(c);
+  const slots = await getAdminPremiumSlots(c, c.req.param("appId"));
+  return c.json({ success: true, slots }, 200);
 });
 
 app.get("/panel-api/premium/games/:appId/early-access", async (c) => {
