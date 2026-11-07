@@ -8,6 +8,7 @@ import { z } from "zod";
 import { FixesCatalogRoute } from "./endpoints/fixes-catalog";
 import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
+import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
@@ -4246,6 +4247,11 @@ app.get("/api/activations/download", async (c) => {
 });
 
 openapi.get("/api/health", HealthRoute);
+app.get('/api/games/catalog-cache',async c=>{
+  await requireLauncherSearchLicense(c);
+  const rows=await c.env.merlin_db.prepare('SELECT app_id,name FROM games_catalog ORDER BY updated_at DESC LIMIT 5000').all<{app_id:string;name:string}>();
+  return c.json({games:(rows.results||[]).map(row=>({appid:row.app_id,name:row.name}))});
+});
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
 openapi.get("/api/public/catalog", PublicCatalogRoute);
@@ -4424,6 +4430,7 @@ openapi.post("/api/public/email-verification/start", PublicEmailVerificationStar
 openapi.post("/api/public/email-verification/verify", PublicEmailVerificationVerifyRoute);
 
 registerCustomGamesRoutes(app);
+registerFixImportRoutes(app);
 
 app.onError((error, c) => {
   const status = getErrorStatus(error);
@@ -4489,6 +4496,10 @@ export default {
     await consumeCustomGameIndexQueue(batch, env);
   },
   async scheduled(controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
+    _ctx.waitUntil(processFixImportQueue(env).catch(() => console.error('[FixImport] processing-failed')));
+    // Staging runs only explicitly selected test imports. Keep billing,
+    // notifications and all the previously disabled scheduled jobs off here.
+    if (env.ENVIRONMENT === 'staging') return;
     const scheduledAt = new Date(controller.scheduledTime);
     _ctx.waitUntil(runPremiumNotificationCron(env,scheduledAt).catch(()=>console.error('[PremiumNotifications] dispatch-failed')));
     _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {

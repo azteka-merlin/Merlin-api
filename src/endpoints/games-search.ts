@@ -188,6 +188,16 @@ export async function resolveSteamGameByAppId(value: string): Promise<SearchItem
 	}
 }
 
+// Installed games use only the Merlin metadata cache: no Ryuu, Hubcap,
+// Steam store or image validation calls are needed to render the library.
+export async function resolveLibraryGameMetadata(c: AppContext, appId: string): Promise<SearchItem[]> {
+  if (!/^\d+$/.test(appId)) throw new HTTPException(400, {message: 'Library metadata requires an AppID'});
+  try {
+    const row = await c.env.merlin_db.prepare('SELECT app_id,name,cover_url,cover_source FROM games_catalog WHERE app_id=? LIMIT 1').bind(appId).first<GamesCatalogRow>();
+    return row?.name?.trim() ? [{appId,name:row.name.trim(),coverUrl:null,coverSource:null}] : [];
+  } catch { return []; }
+}
+
 function normalizeSearchKey(searchTerm: string, limit: number, includeUnavailable: boolean): string {
 	return `${String(searchTerm || "").trim().toLocaleLowerCase()}::${Math.max(1, Math.trunc(Number(limit) || 0))}::${includeUnavailable ? "all" : "available"}`;
 }
@@ -814,6 +824,10 @@ export class GamesSearchRoute extends OpenAPIRoute {
 		const searchTerm = data.body.searchTerm.trim();
 		const limit = data.body.limit;
 		const env = c.env as Env & GameSearchEnv;
+    if (data.body.metadataOnly) {
+      return c.json({success:true,source:'catalog',items:await resolveLibraryGameMetadata(c,searchTerm)},200);
+    }
+
 
 		try {
 			const d1CatalogItems = await searchD1Catalog(c, searchTerm, limit);

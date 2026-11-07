@@ -34,7 +34,7 @@ type CatalogMetadataRow = {
   drm_notice: string | null;
 };
 
-type CorrectionCatalogEntry = {
+export type CorrectionCatalogEntry = {
   appid: string;
   name: string;
   imageUrl?: string;
@@ -123,7 +123,7 @@ function isDepotboxCorrectionHref(href: string): boolean {
   }
 }
 
-async function listCatalogMetadata(c: AppContext, appIds: string[]) {
+export async function listCatalogMetadata(c: AppContext, appIds: string[]) {
   const metadata = new Map<string, CatalogMetadataRow>();
   for (let offset = 0; offset < appIds.length; offset += 100) {
     const chunk = appIds.slice(offset, offset + 100);
@@ -245,18 +245,24 @@ export class FixesCatalogRoute extends OpenAPIRoute {
   };
 
   async handle(c: AppContext) {
-    const remoteResponse = await fetch(DEFAULT_FIXES_URL, {
-      headers: {
-        "User-Agent": "Merlin/2.0",
-        Accept: "application/json",
-      },
-    });
-
     let remoteEntries: Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> = [];
-    if (remoteResponse.ok) {
-      remoteEntries = normalizeRemoteEntries(await remoteResponse.json());
-    } else {
-      console.warn("[fixes] remote catalog returned HTTP", remoteResponse.status);
+    let remoteAvailable = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4_000);
+    try {
+      const remoteResponse = await fetch(DEFAULT_FIXES_URL, {
+        headers: { "User-Agent": "Merlin/2.0", Accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (remoteResponse.ok) {
+        remoteEntries = normalizeRemoteEntries(await remoteResponse.json());
+        remoteAvailable = true;
+      }
+      else console.warn("[fixes] remote catalog returned HTTP", remoteResponse.status);
+    } catch {
+      console.warn("[fixes] remote catalog unavailable; using configured overrides");
+    } finally {
+      clearTimeout(timeout);
     }
 
     const overrides = await readOverrides(c.env);
@@ -379,7 +385,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         };
       }));
 
-    if (!items.length && !remoteResponse.ok) {
+    if (!items.length && !remoteAvailable) {
       return c.json({ error: "Could not load the fixes catalog" }, 502);
     }
 

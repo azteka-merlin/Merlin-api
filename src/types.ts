@@ -93,6 +93,7 @@ export const ManifestQuery = z.object({
 export const GameSearchRequest = z.object({
 	searchTerm: z.string().min(1),
 	limit: z.coerce.number().int().min(1).max(100).optional().default(25),
+	metadataOnly: z.boolean().optional().default(false),
 });
 
 export const GameSearchItem = z.object({

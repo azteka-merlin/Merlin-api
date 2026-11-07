@@ -14,6 +14,7 @@ export type FixOverrideConfig = {
 };
 
 export type OverrideEntry = {
+	migrated?: boolean;
 	addedAt?: string;
 	name?: string;
 	coverUrl?: string;
@@ -27,6 +28,7 @@ export type OverridesDocument = Record<string, OverrideEntry>;
 
 type OverridesEnv = {
 	MERLIN_FILES?: R2Bucket;
+	ENVIRONMENT?: string;
 };
 
 const OVERRIDES_KEY = "overrides.json";
@@ -134,6 +136,7 @@ function validateEntry(
 	options: { allowLegacyNameMissing?: boolean } = {},
 ): OverrideEntry {
 	const nextEntry: OverrideEntry = {};
+	if (entry.migrated === true) nextEntry.migrated = true;
 	const normalizedName = normalizeOverrideName(entry);
 	const legacyAdminNote =
 		typeof (entry.fixOverride as FixOverrideConfig & { adminNote?: string } | undefined)?.adminNote === "string" &&
@@ -201,15 +204,16 @@ export function isZipHeader(bytes: Uint8Array): boolean {
 		byte1 === 0x4b &&
 		byte2 !== undefined &&
 		byte3 !== undefined &&
-		[0x03, 0x05, 0x07].includes(byte2) &&
-		[0x04, 0x06, 0x08].includes(byte3)
+		((byte2 === 0x03 && byte3 === 0x04) ||
+			(byte2 === 0x05 && byte3 === 0x06) ||
+			(byte2 === 0x07 && byte3 === 0x08))
 	);
 }
 
-export async function readOverrides(env: OverridesEnv): Promise<OverridesDocument> {
+async function readOverridesSnapshot(env: OverridesEnv): Promise<{ overrides: OverridesDocument; etag: string | null }> {
 	const bucket = requireBucket(env);
 	const object = await bucket.get(OVERRIDES_KEY);
-	if (!object) return {};
+	if (!object) return { overrides: {}, etag: null };
 
 	let parsed: unknown;
 	try {
@@ -235,7 +239,58 @@ export async function readOverrides(env: OverridesEnv): Promise<OverridesDocumen
 		result[key] = entry;
 	}
 
+	return { overrides: result, etag: object.etag };
+}
+
+export async function readOverrides(env: OverridesEnv): Promise<OverridesDocument> {
+	const primary = (await readOverridesSnapshot(env)).overrides;
+	if (env.ENVIRONMENT !== 'staging') return primary;
+	const staged = (await readOverridesSnapshot(stagingImportOverridesEnv(env))).overrides;
+	const result = { ...primary };
+	for (const [id, entry] of Object.entries(staged)) {
+		if (primary[id]?.hidden || primary[id]?.fixOverride) continue;
+		result[id] = { ...primary[id], ...entry, ...(primary[id]?.manifestOverride ? { manifestOverride: primary[id]!.manifestOverride } : {}) };
+	}
 	return result;
+}
+
+export function stagingImportOverridesEnv(env: OverridesEnv): OverridesEnv {
+	const bucket = requireBucket(env);
+	const key = (value: string) => value === OVERRIDES_KEY ? '_fix-import/staging/overrides.json' : value;
+	return { MERLIN_FILES: {
+		get: (value: string) => bucket.get(key(value)),
+		put: (value: string, body: string, options: R2PutOptions) => bucket.put(key(value), body, options),
+	} as unknown as R2Bucket };
+}
+
+async function overrideEditEnv(env: OverridesEnv, appId: string): Promise<OverridesEnv> {
+	if (env.ENVIRONMENT !== 'staging') return env;
+	const staged = stagingImportOverridesEnv(env);
+	// A production fix may have been added after this test import. Editing the
+	// imported entry must still target the test document, never the primary one.
+	return (await readOverridesSnapshot(staged)).overrides[appId] ? staged : env;
+}
+
+async function updateOverrides<T>(env: OverridesEnv, update: (overrides: OverridesDocument) => { value: T; changed: boolean }): Promise<T> {
+	const bucket = requireBucket(env);
+	for (let attempt = 0; attempt < 8; attempt++) {
+		const { overrides, etag } = await readOverridesSnapshot(env);
+		const result = update(overrides);
+		if (!result.changed) return result.value;
+		try {
+			const saved = await bucket.put(OVERRIDES_KEY, JSON.stringify(overrides, null, 2), {
+				onlyIf: etag ? { etagMatches: etag } : { etagDoesNotMatch: '*' },
+				httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+			});
+			if (saved) return result.value;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : '';
+			const status = Number((error as {status?:number;statusCode?:number}).status || (error as {statusCode?:number}).statusCode);
+			if (![412,429,503].includes(status) && !/\b429\b|\b503\b|too many|SlowDown/i.test(message)) throw error;
+		}
+		await new Promise(resolve => setTimeout(resolve, 1100 + attempt * 100));
+	}
+	throw new HTTPException(409, { message: 'Overrides changed concurrently. Please try again.' });
 }
 
 export async function writeOverrides(env: OverridesEnv, overrides: OverridesDocument): Promise<void> {
@@ -254,24 +309,37 @@ export async function upsertOverride(
 	entry: OverrideEntry,
 ): Promise<OverrideEntry> {
 	const normalizedAppId = normalizeAppId(appId);
-	const overrides = await readOverrides(env);
-	const nextEntry = validateEntry(normalizedAppId, entry);
-	nextEntry.addedAt = nextEntry.addedAt || overrides[normalizedAppId]?.addedAt || new Date().toISOString().slice(0, 10);
-	overrides[normalizedAppId] = nextEntry;
-	await writeOverrides(env, overrides);
-	return nextEntry;
+	// Saving through the normal editor acknowledges review of an imported fix.
+	const nextEntry = validateEntry(normalizedAppId, { ...entry, migrated: undefined });
+	return updateOverrides(await overrideEditEnv(env, normalizedAppId), overrides => {
+		const value = { ...nextEntry, addedAt: nextEntry.addedAt || overrides[normalizedAppId]?.addedAt || new Date().toISOString().slice(0, 10) };
+		overrides[normalizedAppId] = value;
+		return { value, changed: true };
+	});
 }
 
 export async function deleteOverride(env: OverridesEnv, appId: string): Promise<boolean> {
 	const normalizedAppId = normalizeAppId(appId);
-	const overrides = await readOverrides(env);
-	if (!overrides[normalizedAppId]) {
-		return false;
-	}
+	return updateOverrides(await overrideEditEnv(env, normalizedAppId), overrides => {
+		if (!overrides[normalizedAppId]) return { value: false, changed: false };
+		delete overrides[normalizedAppId];
+		return { value: true, changed: true };
+	});
+}
 
-	delete overrides[normalizedAppId];
-	await writeOverrides(env, overrides);
-	return true;
+// Import only fills an empty fix slot. Recheck inside the conditional write so
+// an administrator hiding or editing a game while a download runs wins.
+export async function importFixOverride(env: OverridesEnv, appId: string, name: string, fix: FixOverrideConfig, baseEntry?: OverrideEntry): Promise<'imported' | 'hidden' | 'existing'> {
+	const id = normalizeAppId(appId);
+	return updateOverrides(env, overrides => {
+		const current = overrides[id] || baseEntry;
+		if (current?.hidden) return { value: 'hidden' as const, changed: false };
+		if (current?.fixOverride) return { value: 'existing' as const, changed: false };
+		const entry = validateEntry(id, { ...current, name: current?.name || name, fixOverride: fix, migrated: true });
+		entry.addedAt = current?.addedAt || new Date().toISOString().slice(0, 10);
+		overrides[id] = entry;
+		return { value: 'imported' as const, changed: true };
+	});
 }
 
 export async function getRequiredManifestOverride(
