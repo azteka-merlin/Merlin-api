@@ -4,6 +4,7 @@ import type { Hono } from 'hono';
 import type { AppBindings, AppContext } from '../types';
 import { requireAdminSession } from './admin-security';
 import { fetchFixSource } from './fix-source-fetch';
+import { putKnownLengthR2Stream } from './r2-stream-upload';
 import { readOverrides, importFixOverride, isZipHeader, stagingImportOverridesEnv } from './overrides';
 import { listCorrectionVoteTotals } from './correction-votes';
 import { normalizeRemoteEntries, sortCorrectionCatalog, listCatalogMetadata, isDenuvoMetadata } from '../endpoints/fixes-catalog';
@@ -187,9 +188,15 @@ async function downloadFix(env:AppBindings, job:Job, token:string) {
   const key=relative;
   const url=new URL(job.source_url);url.searchParams.set('auth_code',secret);
   const controller=new AbortController();
-  const timeout=setTimeout(()=>controller.abort(),120_000);
+  const timeout=setTimeout(()=>controller.abort('timeout'),120_000);
+  let checkingCancellation=false;
   const cancellationCheck=setInterval(()=>{
-    void assertJob(env,token,job).catch(()=>controller.abort());
+    if(checkingCancellation)return;
+    checkingCancellation=true;
+    void env.merlin_db.prepare('SELECT status,attempts FROM fix_import_jobs WHERE app_id=?').bind(job.app_id)
+      .first<{status:string;attempts:number}>().then(current=>{
+        if(current?.status!=='processing'||current.attempts!==job.attempts)controller.abort('job-reset');
+      }).catch(()=>{}).finally(()=>{checkingCancellation=false;});
   },2000);
   let upload:R2MultipartUpload|undefined;
   try {
@@ -201,42 +208,67 @@ async function downloadFix(env:AppBindings, job:Job, token:string) {
     await assertJob(env,token,job);
     await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=0,total_bytes=?,phase=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
       AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(declared,'downloading',timestamp(),job.app_id,job.attempts,token,Date.now()).run();
-    upload=await env.MERLIN_FILES.createMultipartUpload(key,{httpMetadata:{contentType:ext==='zip'?'application/zip':'application/vnd.rar',cacheControl:'no-store'}});
     const hash=createHash('sha256');
-    const parts:R2UploadedPart[]=[];
-    const reader=response.body.getReader();
-    let count=0, buffer=new Uint8Array(PART_BYTES), used=0, checked=false, lastProgress=Date.now();
-    try {
-      while(true) {
-        const {value,done}=await reader.read();
-        if(done) break;
-        count+=value.byteLength;
-        if(count>MAX_BYTES) throw new Error('Arquivo acima do limite de 2 GiB.');
-        hash.update(value);
-        let offset=0;
-        while(offset<value.length) {
-          const size=Math.min(buffer.length-used,value.length-offset);
-          buffer.set(value.subarray(offset,offset+size),used);used+=size;offset+=size;
-          if(!checked && used>=8) {
-            if(!validFixHeader(buffer.subarray(0,used),ext)) throw new Error('O conteúdo recebido não é um arquivo ZIP/RAR válido.');
-            checked=true;
-          }
-          if(used===buffer.length) {
-            parts.push(await upload.uploadPart(parts.length+1,buffer));
-            buffer=new Uint8Array(PART_BYTES);used=0;
-          }
-        }
-        if(Date.now()-lastProgress>4000) {
-          await assertJob(env,token,job);
-          await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
-            AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(count,timestamp(),job.app_id,job.attempts,token,Date.now()).run();lastProgress=Date.now();
+    let count=0, checked=false, header=new Uint8Array(8), headerLength=0, lastProgress=Date.now();
+    const trackChunk=async(chunk:Uint8Array)=>{
+      count+=chunk.byteLength;
+      if(count>MAX_BYTES) throw new Error('Arquivo acima do limite de 2 GiB.');
+      hash.update(chunk);
+      if(!checked) {
+        const copy=chunk.subarray(0,Math.min(chunk.byteLength,8-headerLength));
+        header.set(copy,headerLength);headerLength+=copy.byteLength;
+        if(headerLength>=8) {
+          if(!validFixHeader(header,ext)) throw new Error('O conteúdo recebido não é um arquivo ZIP/RAR válido.');
+          checked=true;
         }
       }
-    } finally { await reader.cancel().catch(()=>{});reader.releaseLock(); }
-    if(!checked || count<8 || (declared && declared!==count)) throw new Error('O arquivo recebido está vazio ou incompleto.');
-    if(used) parts.push(await upload.uploadPart(parts.length+1,buffer.subarray(0,used)));
+      if(Date.now()-lastProgress>4000) {
+        await assertJob(env,token,job);
+        const progress=await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
+          AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING app_id`)
+          .bind(count,timestamp(),job.app_id,job.attempts,token,Date.now()).first();
+        if(!progress)throw new FixImportCancelled();
+        lastProgress=Date.now();
+      }
+    };
+    const validateComplete=()=>{
+      if(!checked || count<8 || (declared && declared!==count))throw new Error('O arquivo recebido está vazio ou incompleto.');
+    };
+    const metadata={httpMetadata:{contentType:ext==='zip'?'application/zip':'application/vnd.rar',cacheControl:'no-store'}};
+    if(declared>0 && typeof FixedLengthStream!=='undefined') {
+      // R2 can stream a known-length body directly. This avoids serial 8 MiB
+      // multipart writes and keeps large archives out of Worker memory.
+      const checkedBody=response.body.pipeThrough(new TransformStream<Uint8Array,Uint8Array>({
+        async transform(chunk,stream){await trackChunk(chunk);stream.enqueue(chunk);},
+        flush(){validateComplete();},
+      }));
+      try {await putKnownLengthR2Stream(env.MERLIN_FILES,key,checkedBody,declared,metadata,controller.signal);}
+      catch(error){controller.abort('r2-put-failed');throw error;}
+    } else {
+      // Some origins omit Content-Length. Retain a bounded multipart fallback.
+      upload=await env.MERLIN_FILES.createMultipartUpload(key,metadata);
+      const parts:R2UploadedPart[]=[];
+      const reader=response.body.getReader();
+      let buffer=new Uint8Array(PART_BYTES),used=0;
+      try {
+        while(true) {
+          const {value,done}=await reader.read();
+          if(done)break;
+          await trackChunk(value);
+          let offset=0;
+          while(offset<value.length) {
+            const size=Math.min(buffer.length-used,value.length-offset);
+            buffer.set(value.subarray(offset,offset+size),used);used+=size;offset+=size;
+            if(used===buffer.length) {parts.push(await upload.uploadPart(parts.length+1,buffer));buffer=new Uint8Array(PART_BYTES);used=0;}
+          }
+        }
+      } finally {await reader.cancel().catch(()=>{});reader.releaseLock();}
+      validateComplete();
+      if(used)parts.push(await upload.uploadPart(parts.length+1,buffer.subarray(0,used)));
+      await assertJob(env,token,job);
+      await upload.complete(parts);
+    }
     await assertJob(env,token,job);
-    await upload.complete(parts);
     const sha256=hash.digest('hex');
     const stored=await env.merlin_db.prepare(`UPDATE fix_import_jobs SET object_key=?,sha256=?,processed_bytes=?,total_bytes=?,phase=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
       AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING app_id`)
@@ -249,8 +281,9 @@ async function downloadFix(env:AppBindings, job:Job, token:string) {
   } catch(error) {
     if(upload) await upload.abort().catch(()=>{});
     if(controller.signal.aborted) {
+      if(controller.signal.reason==='job-reset')throw new FixImportCancelled();
       await assertJob(env,token,job);
-      throw new Error('O download demorou demais. Tente novamente.');
+      throw new Error(controller.signal.reason==='timeout'?'O download demorou demais. Tente novamente.':'Não foi possível salvar o arquivo no armazenamento. Tente novamente.');
     }
     // Never persist the URL, secret or raw upstream error in the dashboard.
     if(error instanceof Error && !error.message.includes(secret) && !error.message.includes('http')) throw error;

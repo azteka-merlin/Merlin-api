@@ -37,9 +37,10 @@ No admin: **Fila do catálogo → Importar correções**. Não há menu novo.
 - O cron existente obtém uma reserva atômica por ambiente, válida por 10 minutos.
   São processados até cinco itens por rodada, interrompendo a escolha de novos
   itens após 45 segundos. Um download individual tem timeout de 120 segundos.
-- O arquivo é transferido por partes de 8 MiB, sem carregar o pacote inteiro na
-  memória. O limite atual por arquivo é 2 GiB; acima disso o item falha e pode
-  ser tratado manualmente.
+- Quando a origem declara o tamanho, o arquivo segue em streaming direto para
+  R2, sem armazenar o pacote inteiro na memória ou esperar gravações sequenciais
+  de partes. Se a origem omitir o tamanho, a fila usa multipart em partes de
+  8 MiB. O limite atual por arquivo é 2 GiB; acima disso o item falha.
 - Verificam-se origem, extensão, assinatura ZIP/RAR, tamanho recebido e tamanho
   declarado quando disponível. O SHA-256 é registrado. Isso não substitui uma
   análise do conteúdo de um arquivo do fornecedor.
@@ -97,11 +98,12 @@ ordem, exclusões, seleção manual, concorrência de processadores, falhas e re
 marcação de migrado, revisão ao salvar e isolamento de staging.
 `tests/overrides-concurrency.test.ts` cobre gravações simultâneas de overrides.
 
-`tests/fix-source-fetch-runtime.test.ts` executa o helper real dentro do workerd,
-com a saída de rede interceptada, sem mockar o `fetch` do Worker. Confere sucesso
-HTTP 200 e rejeição de 301/302/303/307/308 com uma única chamada à origem. Os
-testes do fluxo conferem também a configuração manual na consulta e no download,
-preservação da lista e ausência de publicação ao receber redirecionamento.
+`tests/fix-source-fetch-runtime.test.ts` executa os helpers reais dentro do
+workerd, com a saída de rede interceptada, sem mockar o `fetch` do Worker.
+Confere streaming direto para R2, sucesso HTTP 200 e rejeição de
+301/302/303/307/308 com uma única chamada à origem. Os testes do fluxo conferem
+também a configuração manual na consulta e no download, preservação da lista e
+ausência de publicação ao receber redirecionamento.
 
 `npm run test:fix-import` executa essas regressões. Os hooks de publicação de
 staging e produção agora executam esse comando antes da validação Premium.
