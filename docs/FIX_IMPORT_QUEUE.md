@@ -18,7 +18,13 @@ No admin: **Fila do catálogo → Importar correções**. Não há menu novo.
 4. O admin seleciona até 200 jogos por ação e clica em **Colocar na fila**.
    O cron processa somente itens em Aguardando, seguindo a posição registrada.
 5. **Baixando** mostra a fase, bytes e tentativas. **Falhou** permite selecionar
-   jogos para tentar novamente, preservando a posição original. Não existe pausa.
+   jogos para tentar novamente, preservando a posição original. Nas abas
+   **Baixando**, **Aguardando** e **Falhou**, o admin pode devolver um item
+   individual ou vários selecionados para **Não baixados**. Isso zera o progresso
+   e permite escolhê-los novamente; uma tarefa ainda baixando detecta a retirada
+   em até dois segundos, cancela a leitura e não muda o item de volta para Falhou.
+   Um item que já começou a salvar o override termina essa etapa antes de aceitar
+   o reset. Não existe pausa.
 6. Ao concluir, o arquivo fica no R2 e um fix override habilitado é cadastrado.
    O estado da fila passa a **Migrado** e o override recebe `migrated: true`.
 7. O card de Overrides mostra **Migrado · revisar**. Salvar normalmente o

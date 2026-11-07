@@ -111,6 +111,36 @@ describe('fix import workflow with native D1 and R2',()=>{
     await enqueue(['20']);vi.stubGlobal('fetch',vi.fn(async()=>new Response(zip())));
     await processFixImportQueue(env);
     expect((await getFixImportDashboard(env)).summary.migrated).toBe(1);
+  },15000);
+
+  test('admin can return queued, downloading and failed jobs to not downloaded in one selection',async()=>{
+    await scan();await enqueue(['10','20','80']);
+    await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='processing',phase='downloading',attempts=attempts+1,processed_bytes=12,total_bytes=40,object_key='10/fixes/old-import.zip',sha256='old' WHERE app_id='10'").run();
+    await env.MERLIN_FILES.put('10/fixes/old-import.zip',zip());
+    await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='failed',phase='failed',error='Falha anterior',processed_bytes=30,total_bytes=40 WHERE app_id='20'").run();
+
+    const response=await app.request('/panel-api/fix-import/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({appIds:['10','20','80']})},env);
+    expect(response.status).toBe(200);expect(await response.json()).toMatchObject({success:true,reset:3,unchanged:0});
+    const dashboard=await getFixImportDashboard(env);
+    expect(dashboard.summary).toMatchObject({missing:3,queued:0,processing:0,failed:0});
+    expect(dashboard.jobs.every(job=>job.status==='missing'&&job.phase==='missing'&&job.processed_bytes===0&&job.total_bytes===0&&job.object_key===null&&job.sha256===null&&job.error===null)).toBe(true);
+    expect(dashboard.jobs.find(job=>job.app_id==='10')?.attempts).toBe(1);
+    expect(await env.MERLIN_FILES.head('10/fixes/old-import.zip')).toBeNull();
+  });
+
+  test('resetting an in-flight download keeps it not downloaded when the old request finishes',async()=>{
+    await scan();await enqueue(['20']);
+    let finishDownload!:(response:Response)=>void;
+    vi.stubGlobal('fetch',vi.fn(()=>new Promise<Response>(resolve=>{finishDownload=resolve;})));
+    const worker=processFixImportQueue(env);
+    await vi.waitFor(()=>expect(vi.mocked(fetch)).toHaveBeenCalled());
+    const response=await app.request('/panel-api/fix-import/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({appIds:['20']})},env);
+    expect(await response.json()).toMatchObject({reset:1,unchanged:0});
+    finishDownload(new Response(zip()));
+    await worker;
+    expect((await getFixImportDashboard(env)).jobs.find(job=>job.app_id==='20')).toMatchObject({status:'missing',phase:'missing',error:null,object_key:null});
+    expect((await readOverrides(env))['20']).toBeUndefined();
+    expect((await env.MERLIN_FILES.list({prefix:'20/fixes/'})).objects).toHaveLength(0);
   });
 
   test('a redirected catalog preserves the list and a redirected download never publishes an override',async()=>{

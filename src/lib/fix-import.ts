@@ -130,10 +130,46 @@ async function assertLease(env:AppBindings, token:string) {
   const row=await env.merlin_db.prepare('SELECT lease_token,lease_until FROM fix_import_control WHERE id=1').first<{lease_token:string;lease_until:number}>();
   if(row?.lease_token!==token || row.lease_until<=Date.now()) throw new Error('A tarefa perdeu a reserva de processamento.');
 }
-async function setJob(env:AppBindings, token:string, id:string, status:string, phase:string, error:string|null=null) {
-  await env.merlin_db.prepare(`UPDATE fix_import_jobs SET status=?,phase=?,error=?,updated_at=? WHERE app_id=?
-    AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`)
-    .bind(status,phase,error,timestamp(),id,token,Date.now()).run();
+class FixImportCancelled extends Error {
+  constructor() { super('O jogo foi retirado da fila de importação.'); }
+}
+async function assertJob(env:AppBindings, token:string, job:Job) {
+  await assertLease(env,token);
+  const current=await env.merlin_db.prepare('SELECT status,attempts FROM fix_import_jobs WHERE app_id=?')
+    .bind(job.app_id).first<{status:string;attempts:number}>();
+  if(current?.status!=='processing' || current.attempts!==job.attempts)throw new FixImportCancelled();
+}
+async function setJob(env:AppBindings, token:string, job:Job, status:string, phase:string, error:string|null=null, expectedStatus='processing') {
+  return env.merlin_db.prepare(`UPDATE fix_import_jobs SET status=?,phase=?,error=?,updated_at=? WHERE app_id=? AND attempts=? AND status=?
+    AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING app_id`)
+    .bind(status,phase,error,timestamp(),job.app_id,job.attempts,expectedStatus,token,Date.now()).first<{app_id:string}>();
+}
+function selectedAppIds(value:unknown) {
+  if(!Array.isArray(value)||!value.length||value.length>200||value.some(id=>typeof id!=='string'||!/^\d+$/.test(id)))
+    throw new HTTPException(400,{message:'Selecione até 200 jogos.'});
+  return [...new Set(value as string[])];
+}
+export async function resetFixImports(env:AppBindings, selection:unknown) {
+  const ids=selectedAppIds(selection);
+  const marks=ids.map(()=>'?').join(',');
+  const previous=await env.merlin_db.prepare(`SELECT app_id,object_key FROM fix_import_jobs WHERE app_id IN (${marks})
+    AND status IN ('queued','processing','failed') AND phase!='saving'`).bind(...ids).all<{app_id:string;object_key:string|null}>();
+  const previousObjects=new Map(previous.results.map(row=>[row.app_id,row.object_key]));
+  const statements=ids.map(id=>env.merlin_db.prepare(`UPDATE fix_import_jobs
+    SET status='missing',phase='missing',processed_bytes=0,total_bytes=0,object_key=NULL,sha256=NULL,error=NULL,updated_at=?
+    WHERE app_id=? AND status IN ('queued','processing','failed') AND phase!='saving' RETURNING app_id`).bind(timestamp(),id));
+  let reset=0;
+  const obsoleteObjects:string[]=[];
+  for(let offset=0;offset<statements.length;offset+=50) {
+    const results=await env.merlin_db.batch(statements.slice(offset,offset+50));
+    reset+=results.reduce((sum,row)=>sum+row.results.length,0);
+    for(const row of results)for(const result of row.results as Array<{app_id:string}>) {
+      const key=previousObjects.get(result.app_id);
+      if(key)obsoleteObjects.push(key);
+    }
+  }
+  await Promise.all(obsoleteObjects.map(key=>env.MERLIN_FILES.delete(key).catch(()=>{})));
+  return {success:true,reset,unchanged:ids.length-reset};
 }
 export function validFixHeader(bytes:Uint8Array, ext:string) {
   if(ext==='zip') return isZipHeader(bytes);
@@ -152,15 +188,19 @@ async function downloadFix(env:AppBindings, job:Job, token:string) {
   const url=new URL(job.source_url);url.searchParams.set('auth_code',secret);
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),120_000);
+  const cancellationCheck=setInterval(()=>{
+    void assertJob(env,token,job).catch(()=>controller.abort());
+  },2000);
   let upload:R2MultipartUpload|undefined;
   try {
+    await assertJob(env,token,job);
     const response=await fetchFixSource(url,{signal:controller.signal,headers:{'User-Agent':'Merlin/2.0',Accept:'application/zip,application/vnd.rar,application/octet-stream'}});
     if(!response.ok || !response.body) throw new Error(`A Ryuu respondeu com HTTP ${response.status}.`);
     const declared=Number(response.headers.get('content-length')||0);
     if(!Number.isSafeInteger(declared)||declared<0||declared>MAX_BYTES) throw new Error('Arquivo acima do limite de 2 GiB.');
-    await assertLease(env,token);
-    await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=0,total_bytes=?,phase=?,updated_at=? WHERE app_id=?
-      AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(declared,'downloading',timestamp(),job.app_id,token,Date.now()).run();
+    await assertJob(env,token,job);
+    await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=0,total_bytes=?,phase=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
+      AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(declared,'downloading',timestamp(),job.app_id,job.attempts,token,Date.now()).run();
     upload=await env.MERLIN_FILES.createMultipartUpload(key,{httpMetadata:{contentType:ext==='zip'?'application/zip':'application/vnd.rar',cacheControl:'no-store'}});
     const hash=createHash('sha256');
     const parts:R2UploadedPart[]=[];
@@ -187,27 +227,35 @@ async function downloadFix(env:AppBindings, job:Job, token:string) {
           }
         }
         if(Date.now()-lastProgress>4000) {
-          await assertLease(env,token);
-          await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=?,updated_at=? WHERE app_id=?
-            AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(count,timestamp(),job.app_id,token,Date.now()).run();lastProgress=Date.now();
+          await assertJob(env,token,job);
+          await env.merlin_db.prepare(`UPDATE fix_import_jobs SET processed_bytes=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
+            AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`).bind(count,timestamp(),job.app_id,job.attempts,token,Date.now()).run();lastProgress=Date.now();
         }
       }
     } finally { await reader.cancel().catch(()=>{});reader.releaseLock(); }
     if(!checked || count<8 || (declared && declared!==count)) throw new Error('O arquivo recebido está vazio ou incompleto.');
     if(used) parts.push(await upload.uploadPart(parts.length+1,buffer.subarray(0,used)));
-    await assertLease(env,token);
+    await assertJob(env,token,job);
     await upload.complete(parts);
     const sha256=hash.digest('hex');
-    await env.merlin_db.prepare(`UPDATE fix_import_jobs SET object_key=?,sha256=?,processed_bytes=?,total_bytes=?,phase=?,updated_at=? WHERE app_id=?
-      AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?)`)
-      .bind(relative,sha256,count,count,'publishing',timestamp(),job.app_id,token,Date.now()).run();
+    const stored=await env.merlin_db.prepare(`UPDATE fix_import_jobs SET object_key=?,sha256=?,processed_bytes=?,total_bytes=?,phase=?,updated_at=? WHERE app_id=? AND attempts=? AND status='processing'
+      AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING app_id`)
+      .bind(relative,sha256,count,count,'publishing',timestamp(),job.app_id,job.attempts,token,Date.now()).first();
+    if(!stored) {
+      await env.MERLIN_FILES.delete(key).catch(()=>{});
+      throw new FixImportCancelled();
+    }
     return {relative,size:count};
   } catch(error) {
     if(upload) await upload.abort().catch(()=>{});
+    if(controller.signal.aborted) {
+      await assertJob(env,token,job);
+      throw new Error('O download demorou demais. Tente novamente.');
+    }
     // Never persist the URL, secret or raw upstream error in the dashboard.
     if(error instanceof Error && !error.message.includes(secret) && !error.message.includes('http')) throw error;
     throw new Error('Não foi possível concluir o download da Ryuu. Tente novamente.');
-  } finally {clearTimeout(timeout);}
+  } finally {clearTimeout(timeout);clearInterval(cancellationCheck);}
 }
 
 export async function processFixImportQueue(env:AppBindings) {
@@ -217,38 +265,48 @@ export async function processFixImportQueue(env:AppBindings) {
     WHERE id=1 AND lease_until<? AND EXISTS(SELECT 1 FROM fix_import_jobs WHERE status IN ('queued','processing')) RETURNING id`).bind(token,now+LEASE_MS,now).first();
   if(!lock)return;
   try {
-    const interrupted=await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='failed',phase='failed',error='O processamento foi interrompido. Tente novamente.',updated_at=? WHERE status='processing' RETURNING *").bind(timestamp()).all<Job>();
+    const interrupted=await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='failed',phase='failed',error='O processamento foi interrompido. Tente novamente.',updated_at=? WHERE status='processing' AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING *")
+      .bind(timestamp(),token,Date.now()).all<Job>();
     if(interrupted.results.length) {
       const entries=await readOverrides(env);
-      for(const job of interrupted.results)if(job.object_key && entries[job.app_id]?.fixOverride?.file===job.object_key)await setJob(env,token,job.app_id,'migrated','migrated');
+      for(const job of interrupted.results)if(job.object_key && entries[job.app_id]?.fixOverride?.file===job.object_key)await setJob(env,token,job,'migrated','migrated',null,'failed');
     }
     for(let processed=0;processed<5 && Date.now()-now<45_000;processed++) {
-      const job=await env.merlin_db.prepare("SELECT * FROM fix_import_jobs WHERE status='queued' ORDER BY position LIMIT 1").first<Job>();
-      if(!job)break;
+      const candidate=await env.merlin_db.prepare("SELECT app_id,attempts FROM fix_import_jobs WHERE status='queued' ORDER BY position LIMIT 1").first<{app_id:string;attempts:number}>();
+      if(!candidate)break;
       try {
-        await assertLease(env,token);
-        await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='processing',phase='checking',attempts=attempts+1,error=NULL,updated_at=? WHERE app_id=?").bind(timestamp(),job.app_id).run();
+        const job=await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='processing',phase='checking',attempts=attempts+1,error=NULL,updated_at=? WHERE app_id=? AND attempts=? AND status='queued' AND EXISTS(SELECT 1 FROM fix_import_control WHERE id=1 AND lease_token=? AND lease_until>?) RETURNING *")
+          .bind(timestamp(),candidate.app_id,candidate.attempts,token,Date.now()).first<Job>();
+        if(!job)continue;
+        await assertJob(env,token,job);
         const existing=(await readOverrides(env))[job.app_id];
         if(job.object_key && existing?.fixOverride?.file===job.object_key) {
-          await setJob(env,token,job.app_id,'migrated','migrated');continue;
+          await setJob(env,token,job,'migrated','migrated');continue;
         }
         if(hasOwnFixOrHidden(existing)) {
-          await setJob(env,token,job.app_id,'skipped','skipped',existing?.hidden?'Jogo oculto no Merlin.':'O jogo já tem um fix próprio.');continue;
+          await setJob(env,token,job,'skipped','skipped',existing?.hidden?'Jogo oculto no Merlin.':'O jogo já tem um fix próprio.');continue;
         }
         const storage=fixImportStorage(env);
         const previous=(await readOverrides(storage))[job.app_id];
-        if(previous?.hidden||previous?.fixOverride){await setJob(env,token,job.app_id,'skipped','skipped','O jogo já foi importado ou está oculto.');continue;}
+        if(previous?.hidden||previous?.fixOverride){await setJob(env,token,job,'skipped','skipped','O jogo já foi importado ou está oculto.');continue;}
         // Retry may reuse a completely downloaded object from an interrupted publication.
         const cached=job.object_key && job.sha256 ? await env.MERLIN_FILES.head(job.object_key) : null;
         const file=cached && cached.size===job.total_bytes ? {relative:job.object_key!,size:cached.size} : await downloadFix(env,job,token);
         await assertLease(env,token);
         const current=(await readOverrides(env))[job.app_id];
-        if(hasOwnFixOrHidden(current)) {await setJob(env,token,job.app_id,'skipped','skipped','O fix foi alterado ou o jogo foi ocultado durante o download.');continue;}
+        if(hasOwnFixOrHidden(current)) {await setJob(env,token,job,'skipped','skipped','O fix foi alterado ou o jogo foi ocultado durante o download.');continue;}
+        const saving=await setJob(env,token,job,'processing','saving');
+        if(!saving)throw new FixImportCancelled();
         const outcome=await importFixOverride(storage,job.app_id,job.name,{enabled:true,file:file.relative,gameName:job.name,filename:job.filename,size:`${(file.size/1024**2).toFixed(1)} MB`},env.ENVIRONMENT==='staging'?current:undefined);
-        await setJob(env,token,job.app_id,outcome==='imported'?'migrated':'skipped',outcome==='imported'?'migrated':'skipped',outcome==='imported'?null:'O jogo foi ocultado ou já possui override.');
+        await setJob(env,token,job,outcome==='imported'?'migrated':'skipped',outcome==='imported'?'migrated':'skipped',outcome==='imported'?null:'O jogo foi ocultado ou já possui override.');
       } catch(error) {
+        if(error instanceof FixImportCancelled)continue;
+        // A concurrent reset may have won after the claim but before the error was recorded.
+        const current=await env.merlin_db.prepare('SELECT status,attempts FROM fix_import_jobs WHERE app_id=?').bind(candidate.app_id).first<{status:string;attempts:number}>();
+        if(current?.status!=='processing'||current.attempts!==candidate.attempts+1)continue;
         const message=error instanceof Error?error.message:'Falha durante a importação.';
-        await setJob(env,token,job.app_id,'failed','failed',message.includes('http')||message.includes('auth_code')?'Falha na comunicação com a origem.':message.slice(0,250));
+        const claimed={app_id:candidate.app_id,attempts:candidate.attempts+1} as Job;
+        await setJob(env,token,claimed,'failed','failed',message.includes('http')||message.includes('auth_code')?'Falha na comunicação com a origem.':message.slice(0,250));
         // A worker that lost its lease must not select or update another job.
         await assertLease(env,token);
       }
@@ -260,6 +318,11 @@ export async function processFixImportQueue(env:AppBindings) {
 
 export function registerFixImportRoutes(app:Hono<{Bindings:AppBindings}>) {
   app.get(ROOT,async c=>{await requireAdminSession(c);return c.json(await getFixImportDashboard(c.env));});
+  app.post(`${ROOT}/reset`,async c=>{
+    await requireAdminSession(c,{mutate:true});
+    const body=await c.req.json().catch(()=>null);
+    return c.json(await resetFixImports(c.env,body?.appIds));
+  });
   app.post(`${ROOT}/scan`,async c=>{await requireAdminSession(c,{mutate:true});return c.json(await enqueueFixImports(c));});
   app.post(`${ROOT}/enqueue`,async c=>{
     await requireAdminSession(c,{mutate:true});
