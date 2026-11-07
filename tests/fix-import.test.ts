@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { Miniflare } from 'miniflare';
 import { readFileSync } from 'node:fs';
 import { Hono } from 'hono';
@@ -26,8 +27,10 @@ beforeEach(async()=>{
   runtime=new Miniflare({modules:true,script:'export default {fetch(){return new Response("local");}}',
     compatibilityDate:'2026-06-20',d1Databases:['DB'],r2Buckets:['FILES']});
   const db=await runtime.getD1Database('DB');
-  const sql=readFileSync(new URL('../migrations/0096_fix_import_queue.sql',import.meta.url),'utf8');
-  for(const statement of sql.split(';').map(s=>s.trim()).filter(Boolean))await db.prepare(statement).run();
+  for(const migration of ['0096_fix_import_queue.sql','0097_fix_import_local_upload.sql','0098_fix_import_resume.sql','0099_fix_import_source_tags.sql']) {
+    const sql=readFileSync(new URL(`../migrations/${migration}`,import.meta.url),'utf8');
+    for(const statement of sql.split(';').map(s=>s.trim()).filter(Boolean))await db.prepare(statement).run();
+  }
   await db.prepare('CREATE TABLE catalog_game_metadata(app_id TEXT PRIMARY KEY,release_date TEXT,denuvo INTEGER,drm_notice TEXT)').run();
   await db.prepare('CREATE TABLE correction_votes(app_id TEXT,vote TEXT)').run();
   await db.prepare("INSERT INTO catalog_game_metadata VALUES('20','2026-10-01',1,NULL)").run();
@@ -45,6 +48,47 @@ beforeEach(async()=>{
 afterEach(async()=>{vi.unstubAllGlobals();await runtime?.dispose();});
 
 describe('fix import workflow with native D1 and R2',()=>{
+  test('refreshing the catalog fills tags on an existing job without counting it as new',async()=>{
+    await scan();
+    await env.merlin_db.prepare("UPDATE fix_import_jobs SET source_tags=NULL WHERE app_id='20'").run();
+    vi.stubGlobal('fetch',vi.fn(async()=>Response.json([fix('20',[' Tradução ','tradução','DLC']),fix('10')])));
+    expect((await scan()).discovered).toBe(0);
+    const {jobs}=await getFixImportDashboard(env);
+    expect(jobs.find(job=>job.app_id==='20')).toMatchObject({tags:['tradução','dlc'],status:'missing'});
+    expect(jobs.find(job=>job.app_id==='10')?.tags).toEqual([]);
+  });
+
+  test('the local queue keeps confirmed parts, protects finalization and publishes once',async()=>{
+    await scan();
+    const post=(path:string,body:unknown)=>app.request('/panel-api/fix-import/'+path,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
+    },env);
+    expect((await post('local/enqueue',{appIds:['20']})).status).toBe(200);
+    const {leaseToken}=await (await post('local/next',{})).json() as {leaseToken:string};
+    const archive=zip();
+    const metadata={leaseToken,bytes:archive.length,signature:Buffer.from(archive.subarray(0,8)).toString('hex'),
+      sha256:createHash('sha256').update(archive).digest('hex')};
+    expect((await post('local/20/downloaded',metadata)).status).toBe(200);
+    expect((await post('local/20/upload/start',{leaseToken})).status).toBe(200);
+    const part=await app.request('/panel-api/fix-import/local/20/upload/part',{
+      method:'POST',headers:{'X-Fix-Import-Lease':leaseToken,'X-Fix-Import-Part-Number':'1'},body:Buffer.from(archive)
+    },env);
+    expect(part.status).toBe(200);
+    const receipt=await part.json() as R2UploadedPart;
+    expect((await post('local/fail',{leaseToken,appId:'20'})).status).toBe(200);
+    await post('local/enqueue',{appIds:['20']});
+    await post('local/next',{leaseToken});
+    expect((await post('local/20/downloaded',metadata)).status).toBe(200);
+    expect(await (await post('local/20/upload/start',{leaseToken})).json()).toMatchObject({
+      parts:[{partNumber:1,etag:receipt.etag}]
+    });
+    await env.merlin_db.prepare("UPDATE fix_import_jobs SET phase='local_finalizing' WHERE app_id='20'").run();
+    expect(await (await post('reset',{appIds:['20']})).json()).toMatchObject({reset:0});
+    expect(await (await post('local/20/upload/complete',{leaseToken})).json()).toMatchObject({status:'migrated'});
+    expect((await readOverrides(env))['20']?.migrated).toBe(true);
+    expect((await env.MERLIN_FILES.list({prefix:'20/fixes/'})).objects).toHaveLength(1);
+  },15000);
+
   test.each(['network','timeout','http','json','schema'])('catalog %s failure returns a useful upstream error, preserves jobs and releases the scan reservation',async failure=>{
     await scan();
     const before=await getFixImportDashboard(env);
@@ -96,6 +140,35 @@ describe('fix import workflow with native D1 and R2',()=>{
     expect((await getFixImportDashboard(env)).summary.migrated).toBe(2);
     expect((await enqueue(['20'])).status).toBe(200);
     expect((await getFixImportDashboard(env)).summary.queued).toBe(0);
+  });
+
+  test('large archives write multipart parts concurrently with a bounded fan-out',async()=>{
+    await scan();await enqueue(['20']);
+    const archive=new Uint8Array(16*1024**2+1024);
+    archive.set(zip());
+    vi.stubGlobal('fetch',vi.fn(async()=>new Response(archive,{headers:{'Content-Length':String(archive.byteLength)}})));
+    const bucket=env.MERLIN_FILES as R2Bucket;
+    let active=0,maxActive=0;
+    env={...env,MERLIN_FILES:new Proxy(bucket,{get(target,property){
+      if(property==='createMultipartUpload')return async(...args:Parameters<R2Bucket['createMultipartUpload']>)=>{
+        const upload=await target.createMultipartUpload(...args);
+        return new Proxy(upload,{get(uploadTarget,uploadProperty){
+          if(uploadProperty==='uploadPart')return async(partNumber:number,value:Parameters<R2MultipartUpload['uploadPart']>[1],options?:Parameters<R2MultipartUpload['uploadPart']>[2])=>{
+            active++;maxActive=Math.max(maxActive,active);
+            await new Promise(resolve=>setTimeout(resolve,40));
+            try{return await uploadTarget.uploadPart(partNumber,value,options);}finally{active--;}
+          };
+          const value=Reflect.get(uploadTarget,uploadProperty,uploadTarget);
+          return typeof value==='function'?value.bind(uploadTarget):value;
+        }}) as R2MultipartUpload;
+      };
+      const value=Reflect.get(target,property,target);
+      return typeof value==='function'?value.bind(target):value;
+    }})} as AppBindings;
+    await processFixImportQueue(env);
+    expect(maxActive).toBeGreaterThan(1);expect(maxActive).toBeLessThanOrEqual(4);
+    expect((await getFixImportDashboard(env)).summary.migrated).toBe(1);
+    expect((await readOverrides(env))['20']?.fixOverride?.enabled).toBe(true);
   });
 
   test('invalid and truncated downloads fail without publishing; a manual retry succeeds',async()=>{

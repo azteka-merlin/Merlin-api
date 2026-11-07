@@ -51,6 +51,7 @@ import { getBillingSettings, refreshBillingPriceSnapshots, updateBillingSettings
 import { getLauncherUpdatePolicySettings, updateLauncherUpdatePolicySettings } from "./lib/launcher-update-policy-settings";
 import { getManifestSourceSettings, MANIFEST_PRIMARY_SOURCES, updateManifestSourceSettings } from "./lib/manifest-source-settings";
 import { getBillingNotificationsDashboard, getExpirationReminderEligibility, retryFailedBillingNotification, runBillingNotificationCron, sendExpirationReminderForLicense } from "./lib/billing-notifications";
+import { EmailProviderTimeout } from "./lib/email-transport";
 import { createLauncherBillingPortalSession, createPublicBillingPortalSession } from "./lib/billing-portal";
 import { listAdminPaymentLogs } from "./lib/admin-payment-service";
 import { capturePaidSubscriberSnapshot, getAdminFinanceDashboard } from "./lib/admin-finance-dashboard";
@@ -278,10 +279,15 @@ app.use("*", async (c, next) => {
     : "default-src 'self'; script-src 'self' https://www.mercadopago.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
   // The Admin is an SPA: this policy must also allow uploads after navigating
-  // from its login/dashboard document. Permit only the configured private origin.
+  // from its login/dashboard document. The Ryuu probe only needs the fixes path.
   if (!isSwaggerRoute && !isVotingRoute && c.res.headers.get("content-type")?.includes("text/html")) {
     const r2Origin = customGamesR2Origin(c.env);
-    if (r2Origin) csp = csp.replace("connect-src 'self';", `connect-src 'self' ${r2Origin};`);
+    const sources = r2Origin ? [r2Origin] : [];
+    const adminHost = c.env.ADMIN_APP_HOST?.toLowerCase();
+    if (adminHost && new URL(c.req.url).hostname === adminHost) {
+      sources.push("https://generator.ryuu.lol/fixes/");
+    }
+    if (sources.length) csp = csp.replace("connect-src 'self';", `connect-src 'self' ${sources.join(" ")};`);
   }
   const headers = new Headers(c.res.headers);
   headers.set("Content-Security-Policy", csp);
@@ -3198,7 +3204,12 @@ app.post("/panel-api/billing-notifications/:id/retry", async (c) => {
   if (!Number.isSafeInteger(notificationId) || notificationId <= 0) {
     throw new HTTPException(400, { message: "Aviso inválido." });
   }
-  const result = await retryFailedBillingNotification(c.env, notificationId);
+  const result = await retryFailedBillingNotification(c.env, notificationId).catch((error: unknown) => {
+    if (error instanceof EmailProviderTimeout) {
+      throw new HTTPException(504, { message: "O provedor de e-mail demorou para responder. O reenvio não foi confirmado." });
+    }
+    throw error;
+  });
   if (!result.sent) throw new HTTPException(409, { message: result.reason });
   await writeAdminAuditLog(c, {
     adminUserId: session.session.admin_user_id,

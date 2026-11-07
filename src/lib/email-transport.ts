@@ -19,6 +19,13 @@ const DAY_MS = 24 * 60 * 60_000;
 const BREVO_ROLLING_LIMIT = 280;
 const BREVO_CREDIT_MARGIN = 10;
 
+export class EmailProviderTimeout extends Error {
+  constructor() {
+    super('Email provider timeout');
+    this.name = 'EmailProviderTimeout';
+  }
+}
+
 export function hasEmailTransport(env: Pick<AppBindings, 'BREVO_API_KEY' | 'RESEND_API_KEY'>) {
   return Boolean(env.BREVO_API_KEY?.trim() || env.RESEND_API_KEY?.trim());
 }
@@ -42,7 +49,10 @@ async function requestJson(request: typeof fetch, url: string, init: RequestInit
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => { controller.abort(); reject(new Error('Email provider timeout')); }, Math.max(1, milliseconds));
+    timer = setTimeout(() => {
+      reject(new EmailProviderTimeout());
+      controller.abort();
+    }, Math.max(1, milliseconds));
   });
   try {
     return await Promise.race([

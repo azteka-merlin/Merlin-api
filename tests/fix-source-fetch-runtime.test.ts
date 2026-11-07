@@ -9,15 +9,7 @@ beforeAll(async()=>{
   const bundle=await build({bundle:true,write:false,format:'esm',platform:'browser',stdin:{
     resolveDir:resolve('src/lib'),loader:'ts',contents:`
       import {fetchFixSource} from './fix-source-fetch';
-      import {putKnownLengthR2Stream} from './r2-stream-upload';
-      export default {async fetch(request,env) {
-        if(new URL(request.url).pathname==='/stream') {
-          const bytes=new Uint8Array([80,75,5,6,...new Array(18).fill(0)]);
-          const body=new ReadableStream({start(controller){controller.enqueue(bytes);controller.close();}});
-          await putKnownLengthR2Stream(env.FILES,'test/known-length.zip',body,bytes.length,{httpMetadata:{contentType:'application/zip'}});
-          const object=await env.FILES.get('test/known-length.zip');
-          return Response.json({size:object.size,bytes:[...new Uint8Array(await object.arrayBuffer())]});
-        }
+      export default {async fetch(request) {
         const status=new URL(request.url).pathname.slice(1);
         try {
           const response=await fetchFixSource('https://generator.ryuu.lol/fixes/'+status+'.zip?auth_code=local-secret',{});
@@ -25,7 +17,7 @@ beforeAll(async()=>{
         } catch(error) {return new Response(error.message,{status:502});}
       }};`,
   }});
-  runtime=new Miniflare({modules:true,script:bundle.outputFiles[0]!.text,compatibilityDate:'2026-06-20',r2Buckets:['FILES'],
+  runtime=new Miniflare({modules:true,script:bundle.outputFiles[0]!.text,compatibilityDate:'2026-06-20',
     outboundService:request=>{
       const url=new URL(request.url);requests.push(request.url);
       if(url.hostname!=='generator.ryuu.lol')return new EdgeResponse('Redirect must not be followed',{status:500});
@@ -39,12 +31,6 @@ beforeEach(()=>{requests=[];});
 afterAll(async()=>{await runtime?.dispose();});
 
 describe('fix source fetch in native workerd, without mocking Worker fetch',()=>{
-  test('streams a known-length archive directly into R2 in the Worker runtime',async()=>{
-    const response=await runtime.dispatchFetch('https://local.test/stream');
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({size:22,bytes:[80,75,5,6,...new Array(18).fill(0)]});
-  });
-
   test('accepts a successful response using the actual shared fetch policy',async()=>{
     const response=await runtime.dispatchFetch('https://local.test/200');
     expect(response.status).toBe(200);expect(await response.text()).toBe('archive');

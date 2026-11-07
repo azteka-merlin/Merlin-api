@@ -474,8 +474,8 @@ export async function getExpirationReminderEligibility(
   if (sameDay) return { eligible: false as const, reason: "Aviso já enviado hoje para esta licença." };
 
   const sentCount = await c.env.merlin_db
-    .prepare("SELECT COUNT(*) AS count FROM billing_notifications WHERE license_id = ? AND status = 'sent' AND dedupe_key LIKE ?")
-    .bind(license.id, `${dedupeKey}%`)
+    .prepare("SELECT COUNT(*) AS count FROM billing_notifications WHERE license_id = ? AND status = 'sent' AND instr(dedupe_key, ?) = 1")
+    .bind(license.id, dedupeKey)
     .first<{ count: number }>();
   if ((sentCount?.count || 0) >= 4) {
     return { eligible: false as const, reason: "Os quatro avisos deste vencimento já foram enviados." };
@@ -838,10 +838,10 @@ export async function retryFailedBillingNotification(env: AppBindings, notificat
   const newerSent = await env.merlin_db.prepare(`
     SELECT id FROM billing_notifications
     WHERE license_id = ? AND id <> ? AND status = 'sent'
-      AND dedupe_key LIKE ? AND sent_at > ?
+      AND instr(dedupe_key, ?) = 1 AND sent_at > ?
     LIMIT 1
   `).bind(record.id, record.notification_id,
-    `${isExpired ? "access_expired" : "expiration_reminder"}:license:${record.id}:expires:${dateOnly(record.expires_at)}%`,
+    `${isExpired ? "access_expired" : "expiration_reminder"}:license:${record.id}:expires:${dateOnly(record.expires_at)}`,
     record.notification_updated_at).first<{ id: number }>();
   if (newerSent) return { sent: false, reason: "Um aviso mais recente já foi entregue." };
   const sent = await sendOnce(c, {

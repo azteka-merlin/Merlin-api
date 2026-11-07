@@ -58,14 +58,17 @@ function parseBearerToken(request: Request): string | null {
   return scheme === "Bearer" && token ? token : null;
 }
 
-export function firstEligibleCorrection(fixes: unknown): { href: string; filename: string; size?: string } | null {
+type NormalizedRemoteFix = { href: string; filename: string; size?: string; badges?: string[] };
+
+export function firstEligibleCorrection(fixes: unknown, includeBadges = false): NormalizedRemoteFix | null {
   if (!Array.isArray(fixes)) return null;
 
   for (const fix of fixes) {
     if (!fix || typeof fix !== "object" || Array.isArray(fix)) continue;
     const candidate = fix as RemoteFix;
     const badges = Array.isArray(candidate.badges)
-      ? candidate.badges.map((value) => String(value || "").trim().toLocaleLowerCase())
+      ? candidate.badges.filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim().toLocaleLowerCase())
       : [];
     if (badges.includes("hypervisor") || badges.includes("online")) continue;
 
@@ -74,13 +77,17 @@ export function firstEligibleCorrection(fixes: unknown): { href: string; filenam
     const size = typeof candidate.size === "string" ? candidate.size.trim() : "";
     if (!href || !filename) continue;
 
-    return { href, filename, size: size || undefined };
+    const normalized: NormalizedRemoteFix = { href, filename, size: size || undefined };
+    if (includeBadges) {
+      normalized.badges = [...new Set(badges.filter(Boolean))];
+    }
+    return normalized;
   }
 
   return null;
 }
 
-export function normalizeRemoteEntries(entries: unknown): Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> {
+export function normalizeRemoteEntries(entries: unknown, includeBadges = false) {
   if (!Array.isArray(entries)) {
     throw new Error("Invalid fixes catalog payload");
   }
@@ -93,7 +100,7 @@ export function normalizeRemoteEntries(entries: unknown): Array<{ appid: string;
       const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
       if (!/^\d+$/.test(appid) || !name) return null;
 
-      const fix = firstEligibleCorrection(candidate.fixes);
+      const fix = firstEligibleCorrection(candidate.fixes, includeBadges);
       if (!fix) return null;
 
       return {
@@ -102,7 +109,7 @@ export function normalizeRemoteEntries(entries: unknown): Array<{ appid: string;
         fixes: [fix],
       };
     })
-    .filter((entry): entry is { appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> } => Boolean(entry));
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 }
 
 function buildDownloadHref(request: Request, appId: string): string {
@@ -162,7 +169,7 @@ function voteCount(item: CorrectionCatalogEntry) {
   return Math.max(0, Number(fix?.upvotes || 0)) + Math.max(0, Number(fix?.downvotes || 0));
 }
 
-export function sortCorrectionCatalog(items: CorrectionCatalogEntry[]) {
+export function sortCorrectionCatalog<T extends CorrectionCatalogEntry>(items: T[]) {
   return [...items].sort((left, right) => {
     const groupDelta = correctionPriorityGroup(left) - correctionPriorityGroup(right);
     if (groupDelta !== 0) return groupDelta;
