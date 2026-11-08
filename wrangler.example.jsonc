@@ -16,6 +16,8 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "your-merlin-api-worker",
 	"main": "src/index.ts",
+	"durable_objects": { "bindings": [{ "name": "STATUS_COORDINATOR", "class_name": "MerlinStatus" }] },
+	"migrations": [{ "tag": "merlin-status-v1", "new_sqlite_classes": ["MerlinStatus"] }],
 	"compatibility_date": "2026-06-20",
 	"observability": {
 		"enabled": true
@@ -31,6 +33,8 @@
 	],
 	"vars": {
 		"ENVIRONMENT": "production",
+		"STATUS_V1": "1",
+		"STATUS_PROBES_ENABLED": "0",
 		"PUBLIC_APP_ORIGIN": "https://your-public-domain.example.com",
 		"BREVO_EMAIL_FROM": "Merlin <no-reply@your-domain.example.com>",
 		"PIX_ENABLED": "false",
@@ -159,6 +163,8 @@
 	// ],
 	"env": {
 		"staging": {
+			"durable_objects": { "bindings": [{ "name": "STATUS_COORDINATOR", "class_name": "MerlinStatus" }] },
+			"migrations": [{ "tag": "merlin-status-v1", "new_sqlite_classes": ["MerlinStatus"] }],
 			"name": "your-merlin-api-worker-stage",
 			"limits": {
 				"subrequests": 25000,
@@ -181,6 +187,8 @@
 			},
 			"vars": {
 				"ENVIRONMENT": "staging",
+				"STATUS_V1": "1",
+				"STATUS_PROBES_ENABLED": "0",
 				"PUBLIC_APP_ORIGIN": "https://your-staging-public-domain.example.com",
 				"BREVO_EMAIL_FROM": "Merlin <no-reply@your-domain.example.com>",
 				"PIX_ENABLED": "false",

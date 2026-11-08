@@ -2,6 +2,8 @@ import { OpenAPIRoute } from "chanfana";
 import { verifyAccessToken } from "../lib/auth";
 import { listCorrectionVoteTotals, listViewerVotes } from "../lib/correction-votes";
 import { readOverrides } from "../lib/overrides";
+import { observeCorrectionsCatalog } from "../lib/service-status-evidence";
+import { ryuuCorrectionsEnabled } from "../lib/ryuu-corrections-source";
 import type { AppContext } from "../types";
 import { specialCorrectionMetadata } from "../lib/special-correction";
 
@@ -254,22 +256,25 @@ export class FixesCatalogRoute extends OpenAPIRoute {
   async handle(c: AppContext) {
     let remoteEntries: Array<{ appid: string; name: string; fixes: Array<{ href: string; filename: string; size?: string; adminNote?: string }> }> = [];
     let remoteAvailable = false;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4_000);
-    try {
-      const remoteResponse = await fetch(DEFAULT_FIXES_URL, {
-        headers: { "User-Agent": "Merlin/2.0", Accept: "application/json" },
-        signal: controller.signal,
-      });
-      if (remoteResponse.ok) {
-        remoteEntries = normalizeRemoteEntries(await remoteResponse.json());
-        remoteAvailable = true;
+    const ryuuEnabled = await ryuuCorrectionsEnabled(c);
+    if (ryuuEnabled) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4_000);
+      try {
+        const remoteResponse = await fetch(DEFAULT_FIXES_URL, {
+          headers: { "User-Agent": "Merlin/2.0", Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (remoteResponse.ok) {
+          remoteEntries = normalizeRemoteEntries(await remoteResponse.json());
+          remoteAvailable = true;
+        }
+        else console.warn("[fixes] remote catalog returned HTTP", remoteResponse.status);
+      } catch {
+        console.warn("[fixes] remote catalog unavailable; using configured overrides");
+      } finally {
+        clearTimeout(timeout);
       }
-      else console.warn("[fixes] remote catalog returned HTTP", remoteResponse.status);
-    } catch {
-      console.warn("[fixes] remote catalog unavailable; using configured overrides");
-    } finally {
-      clearTimeout(timeout);
     }
 
     const overrides = await readOverrides(c.env);
@@ -392,6 +397,9 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         };
       }));
 
+    const overrideCount = Object.entries(overrides).filter(([appId, entry]) =>
+      entry.hidden !== true && entry.fixOverride?.enabled && byAppId.has(appId)).length;
+    observeCorrectionsCatalog(c, remoteAvailable, items.length, remoteEntries.length, overrideCount, !ryuuEnabled);
     if (!items.length && !remoteAvailable) {
       return c.json({ error: "Could not load the fixes catalog" }, 502);
     }

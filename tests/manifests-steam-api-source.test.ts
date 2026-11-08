@@ -28,7 +28,7 @@ describe("Steam API manifest source", () => {
     expect(steamApi).toMatchObject({
       url: "https://api.steamtools.app/api/manifest/271590",
       maxAttempts: 1,
-      timeoutMs: 10_000,
+      timeoutMs: 5_000,
     });
     expect(new Headers(steamApi?.init.headers).get("x-api-key")).toBe("test-steam-api-key");
   });

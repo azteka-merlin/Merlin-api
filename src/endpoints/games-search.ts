@@ -412,7 +412,10 @@ async function finalizeCatalogItems(items: SearchItem[]): Promise<SearchItem[]> 
 			})
 	)];
 
-	if (appIdsToFetch.length > 0) {
+	// The Steam Store appdetails basic endpoint rejects multiple app IDs.
+	// For several missing covers retain the existing image fallback instead of
+	// issuing a request that returns 400 or multiplying provider calls.
+	if (appIdsToFetch.length === 1) {
 		try {
 			const url = new URL(STEAM_APPDETAILS_URL);
 			url.searchParams.set("appids", appIdsToFetch.join(","));
@@ -501,7 +504,10 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 	)];
 
 	let steamFetchSucceeded = appIdsToFetch.length === 0;
-	if (appIdsToFetch.length > 0) {
+	// The basic appdetails endpoint does not accept several IDs in one call.
+	// Keep the existing conservative name filter for multi-result searches;
+	// do not replace one invalid request with a burst of per-game requests.
+	if (appIdsToFetch.length === 1) {
 		try {
 			const url = new URL(STEAM_APPDETAILS_URL);
 			url.searchParams.set("appids", appIdsToFetch.join(","));
@@ -574,7 +580,7 @@ async function validateDepotboxResultsWithSteam(items: SearchItem[]): Promise<Se
 		});
 	});
 
-	if (!steamFetchSucceeded && validatedItems.length > 0) {
+	if (!steamFetchSucceeded && appIdsToFetch.length === 1 && validatedItems.length > 0) {
 		console.warn("[games-search] depotbox fallback is using heavy-filtered results because Steam validation is unavailable");
 	}
 
@@ -851,6 +857,14 @@ export class GamesSearchRoute extends OpenAPIRoute {
 
 		const depotboxResult = await searchDepotbox(env, searchTerm, limit, true);
 		if (depotboxResult.ok) {
+			if (depotboxResult.items.length > 0) {
+				c.executionCtx.waitUntil(upsertGamesCatalogItems(c, depotboxResult.items.map((item) => ({
+					...item,
+					catalogSource: "depotbox",
+				}))).catch((error) => {
+					console.warn("[games-search] DepotBox catalog save failed:", error instanceof Error ? error.message : "unknown error");
+				}));
+			}
 			return c.json({
 				success: true,
 				source: "depotbox",

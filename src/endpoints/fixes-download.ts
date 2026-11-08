@@ -3,6 +3,8 @@ import { HTTPException } from "hono/http-exception";
 import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getFixOverrideFile, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
+import { observeCorrectionFailure, observeCorrectionStream } from "../lib/service-status-evidence";
+import { ryuuCorrectionsEnabled } from "../lib/ryuu-corrections-source";
 import { FixDownloadQuery, type AppContext } from "../types";
 import {
 	SPECIAL_CORRECTION_APP_ID,
@@ -61,21 +63,23 @@ export function firstEligibleRyuuFix(fixes: unknown): { href: string; filename: 
 	return null;
 }
 
-async function findRyuuFix(appId: string): Promise<{ href: string; filename: string } | null> {
+async function findRyuuFix(appId: string, c: AppContext): Promise<{ href: string; filename: string } | null> {
 	const response = await fetch(RYUU_FIXES_CATALOG_URL, {
 		headers: {
 			"User-Agent": "Merlin/2.0",
 			Accept: "application/json",
 		},
-	});
+	}).catch(error => { observeCorrectionFailure(c, 'ryuu', appId); throw error; });
 
 	if (!response.ok) {
+		if (response.status >= 500 || response.status === 429) observeCorrectionFailure(c, 'ryuu', appId);
 		console.warn("[fixes-download] ryuu catalog returned HTTP", response.status);
 		throw new HTTPException(502, { message: "Could not load the correction file" });
 	}
 
 	const entries = await response.json();
 	if (!Array.isArray(entries)) {
+		observeCorrectionFailure(c, 'ryuu', appId);
 		throw new HTTPException(502, { message: "Could not load the correction file" });
 	}
 
@@ -95,7 +99,7 @@ async function proxyRyuuArchive(c: AppContext, appId: string) {
 		throw new HTTPException(502, { message: "Ryuu auth code is not configured" });
 	}
 
-	const fix = await findRyuuFix(appId);
+	const fix = await findRyuuFix(appId, c);
 	if (!fix) {
 		throw new HTTPException(404, { message: "Correction not found" });
 	}
@@ -108,9 +112,10 @@ async function proxyRyuuArchive(c: AppContext, appId: string) {
 			"User-Agent": "Merlin/2.0",
 			Accept: "application/zip, application/vnd.rar, application/octet-stream",
 		},
-	});
+	}).catch(error => { observeCorrectionFailure(c, 'ryuu', appId); throw error; });
 
 	if (!response.ok || !response.body) {
+		if (response.status >= 500 || response.status === 429 || (response.ok && !response.body)) observeCorrectionFailure(c, 'ryuu', appId);
 		console.warn("[fixes-download] ryuu returned HTTP", response.status);
 		throw new HTTPException(502, { message: "Could not load the correction file" });
 	}
@@ -126,7 +131,7 @@ async function proxyRyuuArchive(c: AppContext, appId: string) {
 		headers.set("content-length", contentLength);
 	}
 
-	return new Response(response.body, { status: 200, headers });
+	return new Response(observeCorrectionStream(c, response.body, appId), { status: 200, headers });
 }
 
 async function proxyDepotboxArchive(c: AppContext, appId: string) {
@@ -222,6 +227,9 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 		}
 
 		if (source === "ryuu") {
+			if (!await ryuuCorrectionsEnabled(c)) {
+				throw new HTTPException(503, { message: "Ryuu corrections are paused; refresh the corrections catalog" });
+			}
 			return proxyRyuuArchive(c, appId);
 		}
 

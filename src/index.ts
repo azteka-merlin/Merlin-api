@@ -1,4 +1,5 @@
 import { getHubcapCircuitStatus } from "./lib/hubcap-quota";
+export { MerlinStatus } from "./lib/service-status";
 import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { adminIpGuard } from "./lib/admin-ip-guard";
@@ -269,6 +270,9 @@ app.use("*", async (c, next) => {
 
 app.use("*", async (c, next) => {
   await next();
+
+  // Preserve the WebSocket upgrade rather than rebuilding it as an ordinary Response.
+  if (c.res.status === 101) return;
 
   const isSwaggerRoute = c.req.path === "/doc" || c.req.path.startsWith("/doc/") || c.req.path.startsWith("/openapi.json");
   const isVotingRoute = c.req.path === "/votacao" || c.req.path.startsWith("/votacao/");
@@ -1477,6 +1481,58 @@ app.get("/panel-api/alerts", async (c) => {
     limit: Number(c.req.query("limit") || "50"),
     offset: Number(c.req.query("offset") || "0"),
   }), 200);
+});
+
+app.get('/panel-api/service-status', async c => {
+  await requireAdminSession(c);
+  if (c.env.STATUS_V1 !== '1' || !c.env.STATUS_COORDINATOR) return c.json({ enabled: false }, 200);
+  const stub = c.env.STATUS_COORDINATOR.get(c.env.STATUS_COORDINATOR.idFromName('global'));
+  return stub.fetch('https://status.internal/admin');
+});
+
+app.post('/panel-api/service-status/corrections-source', async c => {
+  await requireAdminSession(c, { mutate: true });
+  if (c.env.STATUS_V1 !== '1' || !c.env.STATUS_COORDINATOR) return c.json({ enabled: false }, 404);
+  let payload: unknown;
+  try { payload = await c.req.json(); } catch { return c.json({ error: 'Invalid request' }, 400); }
+  const parsed = z.object({ enabled: z.boolean() }).strict().safeParse(payload);
+  if (!parsed.success) return c.json({ error: 'Invalid request' }, 400);
+  const stub = c.env.STATUS_COORDINATOR.get(c.env.STATUS_COORDINATOR.idFromName('global'));
+  return stub.fetch('https://status.internal/corrections-source', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(parsed.data) });
+});
+
+app.get('/api/service-status', async c => {
+  if (c.env.STATUS_V1 !== '1' || !c.env.STATUS_COORDINATOR) {
+    c.header('Access-Control-Allow-Origin', '*');
+    return c.json({ enabled: false }, 200);
+  }
+  const stub = c.env.STATUS_COORDINATOR.get(c.env.STATUS_COORDINATOR.idFromName('global'));
+  const response = await stub.fetch('https://status.internal/snapshot');
+  const headers = new Headers(response.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  return new Response(response.body, { status: response.status, headers });
+});
+
+app.get('/api/service-status/ws', async c => {
+  if (c.env.STATUS_V1 !== '1' || !c.env.STATUS_COORDINATOR) return c.json({ enabled: false }, 404);
+  const limiter = (c.env as typeof c.env & { MANIFESTS_RATE_LIMITER?: { limit(input: { key: string }): Promise<{ success: boolean }> } }).MANIFESTS_RATE_LIMITER;
+  if (!limiter || !(await limiter.limit({ key: `status-ws:${c.req.header('cf-connecting-ip') || 'unknown'}` })).success) return c.json({ ok: false }, 429);
+  const stub = c.env.STATUS_COORDINATOR.get(c.env.STATUS_COORDINATOR.idFromName('global'));
+  return stub.fetch(new Request('https://status.internal/ws', c.req.raw));
+});
+
+app.post('/api/service-status/evidence', async c => {
+  if (c.env.STATUS_V1 !== '1' || !c.env.STATUS_COORDINATOR) return c.json({ enabled: false }, 404);
+  const license = await requireLauncherLicense(c);
+  const limiter = (c.env as typeof c.env & { MANIFESTS_RATE_LIMITER?: { limit(input: { key: string }): Promise<{ success: boolean }> } }).MANIFESTS_RATE_LIMITER;
+  if (!limiter || !(await limiter.limit({ key: `status-evidence:${license.id}` })).success) return c.json({ ok: false }, 429);
+  let payload: unknown;
+  try { payload = await c.req.json(); } catch { return c.json({ ok: false }, 400); }
+  const schema = z.object({ appId: z.string().regex(/^\d{1,16}$/), operation: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/), status: z.number().int().refine(value => value === 429 || (value >= 500 && value <= 599)) }).strict();
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) return c.json({ ok: false }, 400);
+  const stub = c.env.STATUS_COORDINATOR.get(c.env.STATUS_COORDINATOR.idFromName('global'));
+  return stub.fetch('https://status.internal/evidence', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ feature: 'corrections', source: 'ryuu', result: 'failure', subject: parsed.data.appId, operation: parsed.data.operation, trusted: false }) });
 });
 
 app.get("/panel-api/alerts/push-config", async (c) => {
@@ -4268,6 +4324,20 @@ openapi.post("/api/games/search", GamesSearchRoute);
 openapi.get("/api/public/catalog", PublicCatalogRoute);
 openapi.get("/api/public/catalog/:appId/cover", PublicCatalogCoverRoute);
 openapi.post("/api/public/catalog/consult", PublicCatalogConsultRoute);
+app.post("/api/manifests/status-batch", async (c) => {
+  await requireLauncherLicense(c);
+  const schema = z.object({ appIds: z.array(z.string().regex(/^\d+$/)).min(1).max(20) }).strict();
+  let payload: unknown;
+  try { payload = await c.req.json(); } catch { throw new HTTPException(400, { message: "Invalid request" }); }
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) throw new HTTPException(400, { message: "Invalid appIds" });
+  const [overrides, updatePolicy] = await Promise.all([readOverrides(c.env), getLauncherUpdatePolicySettings(c)]);
+  return c.json({ success: true, items: [...new Set(parsed.data.appIds)].map(appId => ({
+    appId,
+    requiresVersionPin: !updatePolicy.automaticUpdatesEnabled || Boolean(overrides[appId]?.manifestOverride?.enabled),
+  })) }, 200);
+});
+
 app.get("/api/manifests/status", async (c) => {
   await requireLauncherLicense(c);
 

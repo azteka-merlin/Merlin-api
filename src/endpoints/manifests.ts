@@ -6,6 +6,7 @@ import { requireLauncherLicense } from "../lib/launcher-auth";
 import { getManifestSourceSettings, manifestPrimarySourceOrder, type ManifestPrimarySource } from "../lib/manifest-source-settings";
 import { getRequiredManifestOverride, isZipHeader } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
+import { observeManifestFailure, observeManifestStream, observeRyuuManifestTimeout } from "../lib/service-status-evidence";
 import { writeUserActivityLog } from "../lib/user-activity-service";
 import { type AppContext, ManifestQuery } from "../types";
 
@@ -50,7 +51,7 @@ function logSelectedManifestSource(appId: string, source: string) {
 
 const USER_AGENT = "Merlin/2.0";
 const RETRY_DELAY_MS = 750;
-const SOURCE_TIMEOUT_MS = 10_000;
+const SOURCE_TIMEOUT_MS = 5_000;
 const FALLBACK_SOURCE_TIMEOUT_MS = 5_000;
 const DEPOTBOX_DIRECT_DOWNLOAD_URL = "https://depotbox.org/api/direct-download";
 const STEAMTOOLS_MANIFEST_URL = "https://api.steamtools.app/api/manifest";
@@ -435,6 +436,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				? await fetchHubcapSource(source, appId, env.merlin_db, token)
 				: await fetchSource(source, appId);
 			sourceOutcomes.push(outcome);
+			if (source.name === "ryu" && outcome.kind === "timeout") observeRyuuManifestTimeout(c);
 			if (!response || !response.body) continue;
 
 			await writeUserActivityLog(c, {
@@ -451,7 +453,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 			});
 			logSelectedManifestSource(appId, source.name);
 
-			return buildZipResponse(response.body, appId, source.name);
+			return buildZipResponse(observeManifestStream(c, response.body, appId, source.name === "ryu"), appId, source.name);
 		}
 
 		const allSourcesReportedMissing = sourceOutcomes.length > 0
@@ -459,6 +461,11 @@ export class ManifestsRoute extends OpenAPIRoute {
 		const reason = allSourcesReportedMissing ? "manifest_unavailable" : "manifest_sources_unavailable";
 		const outcomeSummary = sourceOutcomes.map(({ name, result, kind, status }) => ({ name, result, kind, ...(status ? { status } : {}) }));
 		const sourceFailures = outcomeSummary.filter((outcome) => outcome.result === "unavailable");
+		// Only the final failed cascade can contribute suspicion. A successful
+		// fallback returns above; missing games and ambiguous depot metadata do not.
+		if (sourceFailures.length === sourceOutcomes.length && sourceFailures.length > 0 && sourceFailures.every(outcome => outcome.kind === 'timeout' || outcome.kind === 'request_failed' || (outcome.kind === 'http' && (outcome.status === 429 || (outcome.status || 0) >= 500)))) {
+			observeManifestFailure(c, appId);
+		}
 		if (sourceFailures.length > 0) {
 			console.warn("[manifests] manifest source failures", { appId, sources: sourceFailures });
 		}

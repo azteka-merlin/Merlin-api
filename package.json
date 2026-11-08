@@ -8,7 +8,7 @@
         "dev": "wrangler dev",
         "start": "wrangler dev",
         "typecheck": "tsc --noEmit",
-        "test": "vitest run && node --test scripts/custom-game-indexer.test.mjs",
+        "test": "vitest run && node --test scripts/custom-game-indexer.test.mjs tests/service-status-do.test.mjs",
         "test:premium": "vitest run premium",
         "test:fix-import": "vitest run tests/fix-import.test.ts tests/fix-source-fetch-runtime.test.ts tests/fix-import-scheduler.test.ts tests/overrides-concurrency.test.ts",
         "test:premium:proof": "node scripts/prove-premium-regression.mjs",
