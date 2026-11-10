@@ -28,9 +28,24 @@ export class MerlinStatus extends DurableObject<MonitorEnv> {
     if (!Object.keys(this.diagnostics).length) this.diagnostics = await this.ctx.storage.get<Record<string, Diagnostic>>('diagnostics') || {};
     return this.diagnostics;
   }
-  private async load(): Promise<Stored> { return await this.ctx.storage.get<Stored>('state') || structuredClone(INITIAL); }
+  private async load(): Promise<Stored> {
+    const state = await this.ctx.storage.get<Stored>('state') || structuredClone(INITIAL);
+    if (state.catalog?.paused) {
+      const remaining = state.incidents.filter(correctionIncidentStillRelevantWithOverrides);
+      if (remaining.length !== state.incidents.length) {
+        state.incidents = remaining;
+        state.revision++;
+        state.history.push({ revision: state.revision, feature: 'corrections', action: 'mitigated_by_overrides', at: new Date().toISOString() });
+        state.history = state.history.slice(-100);
+        await this.ctx.storage.put('state', state);
+        this.broadcast(state);
+      }
+    }
+    return state;
+  }
   private publicSnapshot(state: Stored) {
-    return { schemaVersion: 1, revision: state.revision, incidents: state.incidents.map(({ source: _source, lastEvidenceAt: _lastEvidenceAt, affectedSubjects: _affected, recoveredSubjects: _recovered, ...item }) => item), correctionsSource: { ryuuEnabled: !state.catalog?.paused } };
+    const incidents = state.catalog?.paused ? state.incidents.filter(correctionIncidentStillRelevantWithOverrides) : state.incidents;
+    return { schemaVersion: 1, revision: state.revision, incidents: incidents.map(({ source: _source, lastEvidenceAt: _lastEvidenceAt, affectedSubjects: _affected, recoveredSubjects: _recovered, ...item }) => item), correctionsSource: { ryuuEnabled: !state.catalog?.paused } };
   }
   private broadcast(state: Stored) {
     const payload = JSON.stringify(this.publicSnapshot(state));
@@ -101,10 +116,11 @@ export class MerlinStatus extends DurableObject<MonitorEnv> {
         const state = await this.load(), now = Date.now(), count = event.itemCount as number;
         const remoteCount = event.remoteCount as number, overrideCount = event.overrideCount as number;
         const catalog = state.catalog || { baselineCount: 0, baselineAt: 0, failures: [], recovery: 0 };
+        const skipped = event.skipped === true || catalog.paused === true;
         const incident = state.incidents.find(item => item.feature === 'corrections' && item.source === 'ryuu_catalog');
         let dirty = false, changed = false;
         const catalogAvailable = event.available === true && (remoteCount > 0 || !catalog.baselineRemoteCount || now - catalog.baselineAt >= 3600000);
-        if (event.skipped) {
+        if (skipped) {
           if (incident && now - incident.lastEvidenceAt >= 300000) { incident.lastEvidenceAt = now; dirty = true; }
           if (!catalog.latest || now - catalog.latest.at >= 300000 || !catalog.latest.skipped) dirty = true;
         } else if (catalogAvailable) {
@@ -147,7 +163,7 @@ export class MerlinStatus extends DurableObject<MonitorEnv> {
           }
           await this.schedule(true);
         }
-        if (!event.skipped && (catalog.confirmedFailures || 0) >= 10 && !catalog.paused) {
+        if (!skipped && (catalog.confirmedFailures || 0) >= 10 && !catalog.paused) {
           catalog.paused = true; catalog.pausedAt = now; catalog.pausedBy = 'automatic';
           state.revision++; state.history.push({ revision: state.revision, feature: 'corrections', action: 'ryuu_paused_automatic', at: new Date(now).toISOString() });
           const remaining = state.incidents.filter(correctionIncidentStillRelevantWithOverrides);
@@ -158,10 +174,10 @@ export class MerlinStatus extends DurableObject<MonitorEnv> {
           }
           changed = true; dirty = true;
         }
-        const probeHealth = (event.skipped === true || !event.available) && (!catalog.healthProbeAt || now - catalog.healthProbeAt >= 30000);
+        const probeHealth = (skipped || !event.available) && (!catalog.healthProbeAt || now - catalog.healthProbeAt >= 30000);
         if (probeHealth) { catalog.healthProbeAt = now; dirty = true; }
         if (dirty) {
-          catalog.latest = { available: catalogAvailable, itemCount: count, remoteCount, overrideCount, at: now, skipped: event.skipped === true };
+          catalog.latest = { available: catalogAvailable, itemCount: count, remoteCount, overrideCount, at: now, skipped };
           state.catalog = catalog; state.history = state.history.slice(-100); await this.ctx.storage.put('state', state);
         }
         if (changed) this.broadcast(state);

@@ -239,5 +239,26 @@ test('Durable Object provides a snapshot and does not infer an incident without 
     await mf.dispatchFetch('http://localhost/ryuu-manifest-success', { method: 'POST' });
     assert.equal((await (await mf.dispatchFetch('http://localhost/corrections-source')).json()).confirmedFailures, 0);
     assert.equal((await (await mf.dispatchFetch('http://localhost/admin')).json()).catalog.counterRecovery, 0);
+    await mf.dispatchFetch('http://localhost/__seed', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        revision: 25, failures: {}, recovery: {}, history: [], incidents: [
+          { id: 'late-catalog', feature: 'corrections', impact: 'limited', messageKey: 'corrections_catalog_limited', source: 'ryuu_catalog', startedAt: new Date().toISOString(), lastEvidenceAt: Date.now() },
+          { id: 'other-incident', feature: 'add_games', impact: 'limited', messageKey: 'add_games_limited', source: 'r2', startedAt: new Date().toISOString(), lastEvidenceAt: Date.now() },
+        ],
+        catalog: { baselineCount: 12, baselineRemoteCount: 10, baselineAt: Date.now(), failures: [], recovery: 0, confirmedFailures: 11, paused: true, pausedAt: Date.now(), pausedBy: 'automatic' },
+      }),
+    });
+    const reconciled = await (await mf.dispatchFetch('http://localhost/snapshot')).json();
+    assert.equal(reconciled.revision, 26);
+    assert.deepEqual(reconciled.incidents.map(item => item.id), ['other-incident']);
+    assert.equal(reconciled.correctionsSource.ryuuEnabled, false);
+    assert.equal((await (await mf.dispatchFetch('http://localhost/admin')).json()).history.at(-1).action, 'mitigated_by_overrides');
+    const lateCatalogFailure = await (await catalogEvent(false, 3, 0, 3)).json();
+    assert.equal(lateCatalogFailure.probeHealth, true);
+    const afterLateFailure = await (await mf.dispatchFetch('http://localhost/admin')).json();
+    assert.equal(afterLateFailure.catalog.confirmedFailures, 11);
+    assert.equal(afterLateFailure.catalog.latest.skipped, true);
+    assert.deepEqual(afterLateFailure.incidents.map(item => item.id), ['other-incident']);
   } finally { await mf.dispose(); }
 });
