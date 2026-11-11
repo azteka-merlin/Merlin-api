@@ -19,6 +19,7 @@ export type OverrideEntry = {
 	name?: string;
 	coverUrl?: string;
 	adminNote?: string;
+	specialCorrectionEnabled?: boolean;
 	hidden?: boolean;
 	manifestOverride?: ManifestOverrideConfig;
 	fixOverride?: FixOverrideConfig;
@@ -165,6 +166,9 @@ function validateEntry(
 	if (normalizedAdminNote) {
 		nextEntry.adminNote = normalizedAdminNote;
 	}
+	if (appId === "4407750" && entry.specialCorrectionEnabled !== undefined) {
+		nextEntry.specialCorrectionEnabled = entry.specialCorrectionEnabled === true;
+	}
 
 	if (entry.hidden !== undefined) {
 		nextEntry.hidden = Boolean(entry.hidden);
@@ -248,6 +252,7 @@ export async function readOverrides(env: OverridesEnv): Promise<OverridesDocumen
 	const staged = (await readOverridesSnapshot(stagingImportOverridesEnv(env))).overrides;
 	const result = { ...primary };
 	for (const [id, entry] of Object.entries(staged)) {
+		if (id === "4407750") { result[id] = entry; continue; }
 		if (primary[id]?.hidden || primary[id]?.fixOverride) continue;
 		result[id] = { ...primary[id], ...entry, ...(primary[id]?.manifestOverride ? { manifestOverride: primary[id]!.manifestOverride } : {}) };
 	}
@@ -266,6 +271,7 @@ export function stagingImportOverridesEnv(env: OverridesEnv): OverridesEnv {
 async function overrideEditEnv(env: OverridesEnv, appId: string): Promise<OverridesEnv> {
 	if (env.ENVIRONMENT !== 'staging') return env;
 	const staged = stagingImportOverridesEnv(env);
+	if (appId === "4407750") return staged;
 	// A production fix may have been added after this test import. Editing the
 	// imported entry must still target the test document, never the primary one.
 	return (await readOverridesSnapshot(staged)).overrides[appId] ? staged : env;

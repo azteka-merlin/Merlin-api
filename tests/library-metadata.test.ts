@@ -14,21 +14,21 @@ function context(row: unknown, fail = false) {
 }
 
 describe("Library metadata without Ryuu", () => {
-  test("uses cached names without returning photos or making external requests", async () => {
+  test("uses cached names and photos without making external requests", async () => {
     const request = vi.fn(() => { throw new Error("External providers must not be probed"); });
     vi.stubGlobal("fetch", request);
     const items = await resolveLibraryGameMetadata(context({ app_id: "10", name: "Cached game",
       cover_url: "https://generator.ryuu.lol/files/images/10.jpg", cover_source: "header_image" }), "10");
     expect(items).toEqual([{ appId: "10", name: "Cached game",
-      coverUrl: null, coverSource: null }]);
+      coverUrl: "https://generator.ryuu.lol/files/images/10.jpg", coverSource: "header_image" }]);
     expect(request).not.toHaveBeenCalled();
   });
 
-  test("old photo metadata cannot cause an external lookup", async () => {
+  test("stored photo metadata cannot cause an external lookup", async () => {
     const request = vi.fn(); vi.stubGlobal("fetch", request);
     const items = await resolveLibraryGameMetadata(context({ app_id: "20", name: "Game",
       cover_url: "https://example.test/cover.jpg", cover_source: "custom" }), "20");
-    expect(items[0].coverUrl).toBeNull();
+    expect(items[0].coverUrl).toBe("https://example.test/cover.jpg");
     expect(request).not.toHaveBeenCalled();
   });
 

@@ -22,11 +22,11 @@ export function supportsSpecialCorrection(value: string | null | undefined): boo
 	return true;
 }
 
-export function specialCorrectionMetadata(appId: string) {
+export function specialCorrectionMetadata(appId: string, enabled = true) {
 	return appId === SPECIAL_CORRECTION_APP_ID
-		? {
+		? enabled ? {
 			activationType: SPECIAL_CORRECTION_ACTIVATION_TYPE,
 			minimumLauncherVersion: SPECIAL_CORRECTION_MINIMUM_VERSION,
-		}
+		} : { activationType: "standard" }
 		: {};
 }

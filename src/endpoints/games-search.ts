@@ -188,13 +188,13 @@ export async function resolveSteamGameByAppId(value: string): Promise<SearchItem
 	}
 }
 
-// Installed games use only the Merlin metadata cache: no Ryuu, Hubcap,
-// Steam store or image validation calls are needed to render the library.
+// Installed games use only the Merlin metadata cache: no provider or image
+// validation calls are needed to render the library.
 export async function resolveLibraryGameMetadata(c: AppContext, appId: string): Promise<SearchItem[]> {
   if (!/^\d+$/.test(appId)) throw new HTTPException(400, {message: 'Library metadata requires an AppID'});
   try {
     const row = await c.env.merlin_db.prepare('SELECT app_id,name,cover_url,cover_source FROM games_catalog WHERE app_id=? LIMIT 1').bind(appId).first<GamesCatalogRow>();
-    return row?.name?.trim() ? [{appId,name:row.name.trim(),coverUrl:null,coverSource:null}] : [];
+    return row?.name?.trim() ? [{appId,name:row.name.trim(),coverUrl:row.cover_source === 'ryuu_image' ? null : row.cover_url || null,coverSource:row.cover_source === 'ryuu_image' ? null : row.cover_source || null}] : [];
   } catch { return []; }
 }
 

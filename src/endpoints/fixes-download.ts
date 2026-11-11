@@ -1,7 +1,7 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
 import { requireLauncherLicense } from "../lib/launcher-auth";
-import { getFixOverrideFile, isZipHeader } from "../lib/overrides";
+import { getFixOverrideFile, isZipHeader, readOverrides } from "../lib/overrides";
 import { enforceManifestsRateLimit } from "../lib/rate-limit";
 import { observeCorrectionFailure, observeCorrectionStream } from "../lib/service-status-evidence";
 import { ryuuCorrectionsEnabled } from "../lib/ryuu-corrections-source";
@@ -209,7 +209,7 @@ export class FixesDownloadRoute extends OpenAPIRoute {
 		if (!appId) {
 			throw new HTTPException(400, { message: "Missing appid" });
 		}
-		if (appId === SPECIAL_CORRECTION_APP_ID && !supportsSpecialCorrection(c.req.header("x-merlin-version"))) {
+		if (appId === SPECIAL_CORRECTION_APP_ID && (await readOverrides(c.env))[appId]?.specialCorrectionEnabled !== false && !supportsSpecialCorrection(c.req.header("x-merlin-version"))) {
 			const error = new HTTPException(426, { message: "Update Merlin to use this correction" }) as HTTPException & {
 				code?: string;
 				minimumVersion?: string;

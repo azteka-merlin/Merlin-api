@@ -381,7 +381,7 @@ export class FixesCatalogRoute extends OpenAPIRoute {
         const metadata = metadataByAppId.get(entry.appid);
         return {
           ...entry,
-          ...specialCorrectionMetadata(entry.appid),
+          ...specialCorrectionMetadata(entry.appid, overrides[entry.appid]?.specialCorrectionEnabled !== false),
           releaseDate: metadata?.release_date || null,
           manualAddedAt: entry.manualAddedAt || null,
           // `drm_notice` can refer to BattlEye, Easy Anti-Cheat, or other DRM.

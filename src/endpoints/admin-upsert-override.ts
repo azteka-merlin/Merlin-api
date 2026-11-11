@@ -59,6 +59,7 @@ export class AdminUpsertOverrideRoute extends OpenAPIRoute {
 			name: body?.name,
 			coverUrl: body?.coverUrl,
 			adminNote: body?.adminNote,
+			specialCorrectionEnabled: body?.specialCorrectionEnabled,
 			hidden: body?.hidden,
 			manifestOverride: body?.manifestOverride,
 			fixOverride: body?.fixOverride,

@@ -1266,7 +1266,7 @@ const MERLIN_UPDATE_LATEST_JSON_KEY = "_updates/latest.json";
 const PUBLIC_UPDATE_LATEST_URL = "https://api-merlin.com/api/updates/latest";
 const PUBLIC_UPDATE_DOWNLOAD_URL = "https://api-merlin.com/api/updates/download";
 
-function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", uploadName: string) {
+function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", uploadName: string, environment?: string) {
   if (!/^\d+$/.test(appId)) {
     throw new HTTPException(400, { message: "Informe um appId numerico valido." });
   }
@@ -1288,7 +1288,7 @@ function resolveOverrideUploadTarget(appId: string, kind: "manifest" | "fix", up
   return {
     safeName,
     folder,
-    objectKey: `${appId}/${folder}/${safeName}`,
+    objectKey: `${appId}/${folder}/${environment === "staging" && appId === SPECIAL_CORRECTION_APP_ID ? "_staging/" : ""}${safeName}`,
   };
 }
 
@@ -1345,25 +1345,25 @@ async function readMerlinUpdateMetadata(env: AppBindings) {
   }
 }
 
-function validateOverrideUploadObjectKey(appId: string, kind: "manifest" | "fix", objectKey: string) {
+function validateOverrideUploadObjectKey(appId: string, kind: "manifest" | "fix", objectKey: string, environment?: string) {
   const normalized = String(objectKey || "").trim().replace(/\\/g, "/");
   if (!normalized || normalized.includes("..") || normalized.startsWith("/")) {
     throw new HTTPException(400, { message: "Invalid override object key" });
   }
 
   const folder = kind === "manifest" ? "manifests" : "fixes";
-  const expectedPrefix = `${appId}/${folder}/`;
+  const expectedPrefix = `${appId}/${folder}/${environment === "staging" && appId === SPECIAL_CORRECTION_APP_ID ? "_staging/" : ""}`;
   if (!normalized.startsWith(expectedPrefix)) {
     throw new HTTPException(400, { message: "Invalid override object key" });
   }
 
-  const safeName = sanitizeOverrideFilename(normalized);
+  const safeName = sanitizeOverrideFilename(normalized.slice(expectedPrefix.length));
   const canonical = `${expectedPrefix}${safeName}`;
   if (canonical !== normalized) {
     throw new HTTPException(400, { message: "Invalid override object key" });
   }
 
-  return resolveOverrideUploadTarget(appId, kind, safeName);
+  return resolveOverrideUploadTarget(appId, kind, safeName, environment);
 }
 
 function validatePremiumGameUploadObjectKey(appId: string, objectKey: string) {
@@ -2041,6 +2041,7 @@ app.post("/panel-api/overrides", async (c) => {
     name: body.name,
     coverUrl: body.coverUrl,
     adminNote: body.adminNote,
+    specialCorrectionEnabled: body.specialCorrectionEnabled,
     hidden: body.hidden,
     manifestOverride: body.manifestOverride,
     fixOverride: body.fixOverride,
@@ -2052,7 +2053,7 @@ app.post("/panel-api/overrides/upload/initiate", async (c) => {
   await requireAdminSession(c, { mutate: true });
 
   const body = parseBody(overrideUploadInitSchema, await c.req.json());
-  const target = resolveOverrideUploadTarget(body.appId, body.kind, body.filename);
+  const target = resolveOverrideUploadTarget(body.appId, body.kind, body.filename, c.env.ENVIRONMENT);
 
   const upload = await c.env.MERLIN_FILES.createMultipartUpload(target.objectKey, {
     httpMetadata: {
@@ -2087,7 +2088,7 @@ app.post("/panel-api/overrides/upload/part", async (c) => {
     throw new HTTPException(400, { message: "Invalid multipart upload request" });
   }
 
-  const target = validateOverrideUploadObjectKey(appId, kind, objectKey);
+  const target = validateOverrideUploadObjectKey(appId, kind, objectKey, c.env.ENVIRONMENT);
   const body = c.req.raw.body;
   if (!body) {
     throw new HTTPException(400, { message: "Selecione um arquivo para enviar." });
@@ -2102,9 +2103,9 @@ app.post("/panel-api/overrides/upload/complete", async (c) => {
   await requireAdminSession(c, { mutate: true });
 
   const body = parseBody(overrideUploadCompleteSchema, await c.req.json());
-  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey);
+  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey, c.env.ENVIRONMENT);
 
-  if (target.safeName !== resolveOverrideUploadTarget(body.appId, body.kind, body.filename).safeName) {
+  if (target.safeName !== resolveOverrideUploadTarget(body.appId, body.kind, body.filename, c.env.ENVIRONMENT).safeName) {
     throw new HTTPException(400, { message: "Invalid override file name" });
   }
 
@@ -2127,7 +2128,7 @@ app.post("/panel-api/overrides/upload/abort", async (c) => {
   await requireAdminSession(c, { mutate: true });
 
   const body = parseBody(overrideUploadAbortSchema, await c.req.json());
-  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey);
+  const target = validateOverrideUploadObjectKey(body.appId, body.kind, body.objectKey, c.env.ENVIRONMENT);
   const upload = c.env.MERLIN_FILES.resumeMultipartUpload(target.objectKey, body.uploadId);
   await upload.abort();
 
@@ -2198,7 +2199,7 @@ app.post("/panel-api/overrides/upload", async (c) => {
   }
 
   const folder = kind === "manifest" ? "manifests" : "fixes";
-  const objectKey = `${appId}/${folder}/${safeName}`;
+  const objectKey = resolveOverrideUploadTarget(appId, kind, safeName, c.env.ENVIRONMENT).objectKey;
 
   await c.env.MERLIN_FILES.put(objectKey, uploadBody, {
     httpMetadata: {
@@ -4316,8 +4317,16 @@ app.get("/api/activations/download", async (c) => {
 openapi.get("/api/health", HealthRoute);
 app.get('/api/games/catalog-cache',async c=>{
   await requireLauncherSearchLicense(c);
-  const rows=await c.env.merlin_db.prepare('SELECT app_id,name FROM games_catalog ORDER BY updated_at DESC LIMIT 5000').all<{app_id:string;name:string}>();
-  return c.json({games:(rows.results||[]).map(row=>({appid:row.app_id,name:row.name}))});
+  const requested=c.req.query('appIds');
+  let rows;
+  if(requested!==undefined){
+    const ids=[...new Set(requested.split(',').map(value=>value.trim()))];
+    if(ids.length<1||ids.length>100||ids.some(value=>!/^\d+$/.test(value)))throw new HTTPException(400,{message:'Invalid appIds'});
+    rows=await c.env.merlin_db.prepare(`SELECT app_id,name,cover_url,cover_source FROM games_catalog WHERE app_id IN (${ids.map(()=>'?').join(',')})`).bind(...ids).all<{app_id:string;name:string;cover_url:string|null;cover_source:string|null}>();
+  }else{
+    rows=await c.env.merlin_db.prepare('SELECT app_id,name,cover_url,cover_source FROM games_catalog ORDER BY updated_at DESC LIMIT 5000').all<{app_id:string;name:string;cover_url:string|null;cover_source:string|null}>();
+  }
+  return c.json({games:(rows.results||[]).map(row=>({appid:row.app_id,name:row.name,header_image:row.cover_source==='ryuu_image'?null:row.cover_url}))});
 });
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
@@ -4467,7 +4476,7 @@ app.post("/api/fixes/license-token", async (c) => {
   await enforceManifestsRateLimit(c, license.id);
 
   const overrides = await readOverrides(c.env);
-  if (!overrides[appId]?.fixOverride?.enabled) {
+  if (!overrides[appId]?.fixOverride?.enabled || overrides[appId]?.specialCorrectionEnabled === false) {
     throw new HTTPException(404, { message: "Correction not found" });
   }
 

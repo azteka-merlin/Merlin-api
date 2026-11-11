@@ -28,5 +28,6 @@ describe("special correction compatibility", () => {
       minimumLauncherVersion: SPECIAL_CORRECTION_MINIMUM_VERSION,
     });
     expect(specialCorrectionMetadata("123")).toEqual({});
+    expect(specialCorrectionMetadata(SPECIAL_CORRECTION_APP_ID, false)).toEqual({ activationType: "standard" });
   });
 });
