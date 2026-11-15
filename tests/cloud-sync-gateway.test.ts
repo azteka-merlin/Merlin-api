@@ -41,7 +41,8 @@ function fakeContext(request: Request) {
   const bucket = {
     async get(key: string) {
       const bytes = objects.get(key);
-      return bytes ? { body: new Blob([bytes]).stream(), etag: "etag", httpEtag: '"etag"', size: bytes.length } : null;
+      return bytes ? { body: new Blob([bytes]).stream(), etag: "etag", httpEtag: '"etag"', size: bytes.length,
+        uploaded: new Date(), text: async () => new TextDecoder().decode(bytes) } : null;
     },
     async head(key: string) {
       const bytes = objects.get(key);
@@ -50,7 +51,7 @@ function fakeContext(request: Request) {
     async put(key: string, body: Uint8Array | ReadableStream) {
       const bytes = body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
       objects.set(key, bytes);
-      return { httpEtag: '"etag"' };
+      return { httpEtag: '"etag"', etag: "etag" };
     },
     async delete(key: string) { objects.delete(key); },
     async list({ prefix }: { prefix: string }) {
@@ -104,6 +105,34 @@ function fakeContext(request: Request) {
 }
 
 describe("stage cloud gateway roundtrip", () => {
+  it("captures a complete v2 snapshot only after a changed state is published", async () => {
+    const firstSha = "a".repeat(40);
+    const secondSha = "b".repeat(40);
+    const base = "/merlin-cloud/steam/123456/730/";
+    const fixture = fakeContext(signed("PUT", `${base}blobs/save.dat/${firstSha}`, "old-save"));
+    const send = async (method: string, key: string, body?: string) => {
+      fixture.context.req.raw = signed(method, `${base}${key}`, body);
+      return handleCloudGateway(fixture.context);
+    };
+    expect((await handleCloudGateway(fixture.context)).status).toBe(200);
+    const state = (sha: string, cn: number) => JSON.stringify({ cn, files: { "save.dat": { sha, size: 8 } } });
+    expect((await send("PUT", "state.cloudredirect", state(firstSha, 1))).status).toBe(200);
+    const currentMarker = "cloud-sync/stage/history-v2/steam/123456/730/current.json";
+    expect(fixture.objects.has(currentMarker)).toBe(true);
+    fixture.objects.delete(currentMarker);
+    expect((await send("PUT", "state.cloudredirect", state(firstSha, 1))).status).toBe(200);
+    expect(fixture.objects.has(currentMarker)).toBe(false);
+    expect((await send("PUT", `blobs/save.dat/${secondSha}`, "new-save")).status).toBe(200);
+    const visiblePrefix = "cloud-sync/stage/history-v2/steam/123456/730/visible/";
+    expect([...fixture.objects.keys()].filter((key) => key.startsWith(visiblePrefix))).toHaveLength(0);
+    expect((await send("DELETE", `blobs/save.dat/${firstSha}`)).status).toBe(204);
+    expect((await send("PUT", "state.cloudredirect", state(secondSha, 2))).status).toBe(200);
+    expect(fixture.objects.has(currentMarker)).toBe(true);
+    const versions = [...fixture.objects.keys()].filter((key) => key.startsWith(visiblePrefix));
+    expect(versions).toHaveLength(1);
+    const snapshot = JSON.parse(new TextDecoder().decode(fixture.objects.get(versions[0]!)!));
+    expect(snapshot.state.files["save.dat"].sha).toBe(firstSha);
+  });
   it("routes signed saves through the public host after admin domain separation", async () => {
     const key = "/merlin-cloud/steam/123456/730/blobs/routing-test.dat";
     const fixture = fakeContext(signed("PUT", key, "save-through-public-host"));
@@ -124,7 +153,7 @@ describe("stage cloud gateway roundtrip", () => {
     expect(await listing.text()).toContain("routing-test.dat");
   });
 
-  it("stores, lists and retrieves a signed save; keeps only the latest recovery copies", async () => {
+  it("stores, lists and retrieves a signed save without creating new legacy copies", async () => {
     const key = "/merlin-cloud/steam/123456/730/blobs/save.dat";
     const first = signed("PUT", key, "save-v1");
     const fixture = fakeContext(first);
@@ -134,7 +163,7 @@ describe("stage cloud gateway roundtrip", () => {
       expect((await handleCloudGateway(fixture.context)).status).toBe(200);
     }
     const recovery = [...fixture.objects.keys()].filter((item) => item.startsWith("cloud-sync/stage/recovery/"));
-    expect(recovery).toHaveLength(2);
+    expect(recovery).toHaveLength(0);
     fixture.context.req.raw = signed("GET", "/merlin-cloud?list-type=2&prefix=steam%2F123456%2F730%2F");
     const listing = await handleCloudGateway(fixture.context);
     expect(listing.status).toBe(200);

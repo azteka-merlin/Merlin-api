@@ -75,7 +75,7 @@ export function mapLicense(record: LicenseRecord) {
     activationUsageResetAt: record.activation_usage_reset_at || null,
     hasRecoveryPin: Boolean(record.recovery_pin_hash),
     recoveryNoticeAcceptedAt: record.recovery_notice_accepted_at,
-    phone: record.contact,
+    phone: record.profile_phone || (record.contact_type === "phone" ? record.contact : ""),
     hwid: record.hwid,
 		hwidResetAt: record.hwid_reset_at || null,
     expiresAt: toDateOnly(record.expires_at),
@@ -112,7 +112,7 @@ export async function listLicenses(c: AppContext) {
   const result = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source,
+        SELECT id, license_key, name, contact, contact_type, profile_phone, source,
           ${licenseActivationSelect},
           recovery_pin_hash, recovery_notice_accepted_at, hwid, hwid_reset_at, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           plan_tier,
@@ -131,7 +131,7 @@ export async function getLicense(c: AppContext, id: number) {
   const license = await c.env.merlin_db
     .prepare(
       `
-        SELECT id, license_key, name, contact, contact_type, source,
+        SELECT id, license_key, name, contact, contact_type, profile_phone, source,
           ${licenseActivationSelect},
           recovery_pin_hash, recovery_notice_accepted_at, hwid, hwid_reset_at, expires_at, status, revoked_reason, revoked_origin, revoked_event_id,
           plan_tier,

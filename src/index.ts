@@ -119,6 +119,8 @@ import { dispatchPendingIntegrityQueue } from "./lib/custom-game-integrity";
 import type { IntegrityQueueMessage } from "./lib/custom-game-cloudflare-indexer";
 import {
   getCloudGame,
+  getCloudExport,
+  getCloudExportFile,
   handleCloudGateway,
   issueCloudCredentials,
   listCloudGames,
@@ -183,6 +185,7 @@ import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-
 import { getUsageAnalytics } from "./lib/usage-analytics";
 import { enforceLoginRateLimit, enforceManifestsRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
+import { getLauncherProfile, startLauncherProfileEmailChange, updateLauncherProfile } from "./lib/launcher-profile";
 import { setCheckoutProof } from "./lib/checkout-proof";
 import { sendRecoveredAccessKeyEmail, sendWelcomeAccessKeyEmail } from "./lib/access-key-emails";
 import {
@@ -4160,6 +4163,8 @@ app.post("/api/launcher/cloud/credentials", issueCloudCredentials);
 app.post("/api/launcher/cloud/revoke", revokeCloudCredentials);
 app.get("/api/launcher/cloud/games", listCloudGames);
 app.get("/api/launcher/cloud/games/:appId", getCloudGame);
+app.get("/api/launcher/cloud/export/:appId/:versionId", getCloudExport);
+app.get("/api/launcher/cloud/export/:appId/:versionId/file", getCloudExportFile);
 app.post("/api/launcher/cloud/restore", restoreCloudGame);
 app.all("/merlin-cloud", handleCloudGateway);
 app.all("/merlin-cloud/*", handleCloudGateway);
@@ -4410,6 +4415,24 @@ app.get("/api/launcher/access-notice", async (c) => {
       },
     },
   }, 200);
+});
+
+const launcherProfileSchema = z.object({
+  name: z.string().trim().min(2).max(100),
+  email: z.string().trim().email().max(254),
+  phone: z.string().trim().max(32).nullable().refine(value => !value || /^\+?[\d\s().-]+$/.test(value) &&
+    value.replace(/\D/g, "").length >= 8 && value.replace(/\D/g, "").length <= 15),
+  emailCode: z.string().trim().regex(/^(?:\d{6}|12345)$/).optional(),
+}).strict();
+
+app.get("/api/launcher/profile", async (c) => c.json({ success: true, profile: await getLauncherProfile(c) }, 200));
+app.post("/api/launcher/profile/email-verification", async (c) => {
+  const body = parseBody(z.object({ email: z.string().trim().email().max(254) }).strict(), await c.req.json());
+  return c.json(await startLauncherProfileEmailChange(c, body.email), 200);
+});
+app.put("/api/launcher/profile", async (c) => {
+  const body = parseBody(launcherProfileSchema, await c.req.json());
+  return c.json({ success: true, profile: await updateLauncherProfile(c, body) }, 200);
 });
 
 app.post("/api/auth/reset-hwid", async (c) => {

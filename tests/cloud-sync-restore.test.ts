@@ -4,7 +4,8 @@ import type { AppContext } from "../src/types";
 
 vi.mock("../src/lib/launcher-auth", () => ({ requireLauncherLicense: async () => ({ id: 1 }) }));
 
-import { getCloudGame, listCloudGames, restoreCloudGame } from "../src/lib/cloud-sync";
+import { getCloudGame, getCloudExport, getCloudExportFile, listCloudGames, restoreCloudGame } from "../src/lib/cloud-sync";
+import { captureCurrentExportSnapshot, captureVisibleSnapshot, protectBlob, pruneHistory } from "../src/lib/cloud-save-history-v2";
 
 const prefix = "cloud-sync/stage/steam/123456/730/";
 const recoveryPrefix = "cloud-sync/stage/recovery/steam/123456/730/";
@@ -50,6 +51,7 @@ function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, 
       if (!object) return null;
       return {
         body: new Blob([object.bytes]).stream(), size: object.bytes.length,
+        etag: createHash("md5").update(object.bytes).digest("hex"),
         uploaded: object.uploaded, customMetadata: object.metadata,
         text: async () => new TextDecoder().decode(object.bytes),
       };
@@ -59,10 +61,15 @@ function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, 
       const object = objects.get(key);
       return object ? { size: object.bytes.length, customMetadata: object.metadata } : null;
     },
-    async put(key: string, body: string | Uint8Array | ReadableStream, options?: { customMetadata?: Record<string, string> }) {
+    async put(key: string, body: string | Uint8Array | ReadableStream,
+      options?: { customMetadata?: Record<string, string>; onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) {
+      const previous = objects.get(key);
+      if (options?.onlyIf?.etagMatches && (!previous || createHash("md5").update(previous.bytes).digest("hex") !== options.onlyIf.etagMatches)) return null;
+      if (options?.onlyIf?.etagDoesNotMatch === "*" && previous) return null;
       const bytes = typeof body === "string" ? new TextEncoder().encode(body)
         : body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
       objects.set(key, { bytes, metadata: options?.customMetadata || {}, uploaded: new Date() });
+      return { etag: createHash("md5").update(bytes).digest("hex") };
     },
     async delete(key: string) { objects.delete(key); },
     async list({ prefix: listPrefix, delimiter, include, cursor, limit = 1000 }:
@@ -105,12 +112,29 @@ function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, 
 }
 
 describe("cloud save restoration", () => {
+  it("exports only explicitly captured complete V2 versions, never legacy recovery groups", async () => {
+    const { context, current } = fixture();
+    const req = { ...context.req, param: (name: string) => name === "appId" ? "730" : "current",
+      query: (name: string) => name === "accountId" ? "123456" : "save.dat" };
+    const exportContext = { ...context, req } as AppContext;
+    expect((await getCloudExport(exportContext)).status).toBe(404);
+    const scope = { accountId: "123456", appId: "730", prefix };
+    await captureCurrentExportSnapshot(context, scope, current);
+    const manifest = await (await getCloudExport(exportContext)).json() as { files: { name: string }[] };
+    expect(manifest.files.map((file) => file.name)).toContain("save.dat");
+    const file = await getCloudExportFile(exportContext);
+    expect(file.status).toBe(200);
+    expect(await file.text()).toBe("new-save");
+  });
+
   it("lists only the two overwritten save files, not unrelated state metadata", async () => {
     const { context, recoveryId, calls } = fixture();
     const response = await getCloudGame(context);
     expect(response.status).toBe(200);
-    const result = await response.json() as { game: { backups: { id: string; fileCount: number; totalSize: number }[] } };
+    const result = await response.json() as { game: { backups: { id: string; fileCount: number; totalSize: number }[];
+      localSaveHints: string[] } };
     expect(result.game.backups).toEqual([{ id: recoveryId, createdAt: expect.any(String), fileCount: 2, totalSize: 17 }]);
+    expect(result.game.localSaveHints).toEqual(["save.dat", "index.dat", "settings.dat"]);
     expect(calls.heads).toBe(0);
     expect(calls.lists.some((call) => call.include?.includes("customMetadata"))).toBe(true);
   });
@@ -198,5 +222,82 @@ describe("cloud save restoration", () => {
     expect(response.status).toBe(409);
     expect((await response.json()).code).toBe("recovery_incomplete");
     expect(JSON.parse(new TextDecoder().decode(objects.get(`${prefix}state.cloudredirect`)!.bytes))).toEqual(current);
+  });
+
+  it("restores every file in a complete v2 snapshot and preserves legacy backups", async () => {
+    const { context, objects, current, recoveryId } = fixture();
+    const scope = { accountId: "123456", appId: "730", prefix };
+    await captureVisibleSnapshot(context, scope, current);
+    const oldState = structuredClone(current);
+    oldState.files["save.dat"] = { sha: oldSaveSha, size: 8, ts: 3 };
+    objects.set(`${prefix}blobs/save.dat/${oldSaveSha}`, {
+      bytes: new TextEncoder().encode("old-save"), metadata: {}, uploaded: new Date(),
+    });
+    objects.set(`${prefix}state.cloudredirect`, {
+      bytes: new TextEncoder().encode(JSON.stringify(oldState)), metadata: {}, uploaded: new Date(),
+    });
+    const details = await (await getCloudGame(context)).json() as { game: { backups: { id: string; version?: number }[] } };
+    expect(details.game.backups).toHaveLength(2);
+    const v2 = details.game.backups.find((item) => item.version === 2)!;
+    const response = await restoreCloudGame({ ...context, req: { ...context.req,
+      json: async () => ({ accountId: "123456", appId: "730", recoveryId: v2.id }),
+    } } as AppContext);
+    expect(response.status).toBe(200);
+    const restored = JSON.parse(new TextDecoder().decode(objects.get(`${prefix}state.cloudredirect`)!.bytes));
+    expect(restored.files).toEqual(current.files);
+    const after = await (await getCloudGame(context)).json() as { game: { backups: { id: string }[];
+      currentVersion: { version?: number } } };
+    expect(after.game.currentVersion.version).toBe(2);
+    expect(after.game.backups.some((item) => item.id === recoveryId)).toBe(true);
+    expect(objects.has("cloud-sync/stage/history-v2/steam/123456/730/hidden/current.json")).toBe(true);
+  });
+
+  it("keeps only ten visible v2 versions while preserving protected blobs", async () => {
+    const { context, current, objects } = fixture();
+    const scope = { accountId: "123456", appId: "730", prefix };
+    for (let index = 0; index < 11; index++) {
+      const state = structuredClone(current);
+      state.cn = index + 10;
+      state.files["save.dat"].size = index + 10;
+      await captureVisibleSnapshot(context, scope, state);
+    }
+    await pruneHistory(context, scope);
+    const keys = [...objects.keys()].filter((key) => key.includes("/history-v2/steam/123456/730/visible/"));
+    expect(keys).toHaveLength(10);
+  });
+
+  it("archives a referenced blob before deletion and restores it from the archive", async () => {
+    const { context, current, objects } = fixture();
+    const scope = { accountId: "123456", appId: "730", prefix };
+    await captureVisibleSnapshot(context, scope, current);
+    const key = `${prefix}blobs/save.dat/${newSaveSha}`;
+    await protectBlob(context, scope, key);
+    objects.delete(key);
+    expect(objects.has("cloud-sync/stage/history-v2/steam/123456/730/blobs/blobs/save.dat/" + newSaveSha)).toBe(true);
+    const other = structuredClone(current);
+    other.files["save.dat"] = { sha: oldSaveSha, size: 8, ts: 3 };
+    objects.set(`${prefix}blobs/save.dat/${oldSaveSha}`, {
+      bytes: new TextEncoder().encode("old-save"), metadata: {}, uploaded: new Date(),
+    });
+    objects.set(`${prefix}state.cloudredirect`, {
+      bytes: new TextEncoder().encode(JSON.stringify(other)), metadata: {}, uploaded: new Date(),
+    });
+    const details = await (await getCloudGame(context)).json() as { game: { backups: { id: string; version?: number }[] } };
+    const id = details.game.backups.find((item) => item.version === 2)!.id;
+    const response = await restoreCloudGame({ ...context, req: { ...context.req,
+      json: async () => ({ accountId: "123456", appId: "730", recoveryId: id }),
+    } } as AppContext);
+    expect(response.status).toBe(200);
+    expect(objects.has(key)).toBe(true);
+  });
+
+  it("keeps legacy recovery objects when restoring in v2 staging", async () => {
+    const { context, objects } = fixture();
+    const before = [...objects.keys()].filter((key) => key.startsWith(recoveryPrefix)).sort();
+    const response = await restoreCloudGame(context);
+    expect(response.status).toBe(200);
+    const after = [...objects.keys()].filter((key) => key.startsWith(recoveryPrefix)).sort();
+    expect(after).toEqual(before);
+    expect(objects.has("cloud-sync/stage/history-v2/steam/123456/730/hidden/current.json")).toBe(true);
   });
 });

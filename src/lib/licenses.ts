@@ -11,6 +11,7 @@ export type LicenseRecord = {
 	name: string;
 	contact: string;
 	contact_type: "phone" | "email" | "discord" | "none";
+	profile_phone?: string | null;
 	source: "admin" | "public_signup" | "purchase" | "gift" | "manual_import" | "stripe" | "mercadopago_pix";
 	license_type?: "normal" | "test" | null;
 	plan_tier?: "bronze" | "prata" | "ouro" | null;

@@ -1,5 +1,9 @@
 import type { AppContext } from "../types";
 import { requireLauncherLicense } from "./launcher-auth";
+import { historyEnabled, listVisibleSnapshots, captureVisibleSnapshot, captureHiddenSnapshot,
+  capturePendingSnapshot, clearPendingSnapshot, pruneHistory, protectBlob, prepareRestore,
+  sameSaveFiles, loadCurrentExportSnapshot, captureCurrentExportSnapshot, getExportSource,
+  type SaveState } from "./cloud-save-history-v2";
 
 // CloudRedirect speaks path-style S3. This facade never exposes R2 credentials
 // to clients. Stage and production use separate prefixes in the shared bucket.
@@ -392,6 +396,23 @@ function stateSummary(state: CloudState, updatedAt: Date) {
   };
 }
 
+function localSaveHints(state: CloudState): string[] {
+  const perDirectory = new Map<string, number>();
+  const hints: string[] = [];
+  for (const name of Object.keys(state.files || {})) {
+    if (hints.length >= 64) break;
+    if (!name || name.startsWith("/") || name.includes("\\") || /[\x00-\x1f]/.test(name)
+      || name.split("/").some((part) => !part || part === "." || part === "..")) continue;
+    const separator = name.lastIndexOf("/");
+    const directory = separator < 0 ? "" : name.slice(0, separator);
+    const count = perDirectory.get(directory) || 0;
+    if (count >= 8) continue;
+    perDirectory.set(directory, count + 1);
+    hints.push(name);
+  }
+  return hints;
+}
+
 export async function listCloudGames(c: AppContext): Promise<Response> {
   const storage = storagePrefix(c);
   if (!storage) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
@@ -422,6 +443,7 @@ export async function listCloudGames(c: AppContext): Promise<Response> {
       const current = await readCloudState(c.env.MERLIN_FILES, scope);
       if (!current) return null;
       const backups = await listRecoveryGroups(c, scope, current.state);
+      const versions = historyEnabled(c) ? await listVisibleSnapshots(c, scope) : [];
       const game = names.get(appId);
       return {
         appId,
@@ -430,7 +452,7 @@ export async function listCloudGames(c: AppContext): Promise<Response> {
         lastSyncAt: current.object.uploaded.toISOString(),
         synced: true,
         currentVersion: stateSummary(current.state, current.object.uploaded),
-        backupCount: backups.length,
+        backupCount: backups.length + versions.length,
       };
     });
     const games = resolved.filter((game): game is NonNullable<typeof game> => game !== null);
@@ -456,6 +478,8 @@ export async function getCloudGame(c: AppContext): Promise<Response> {
   const current = await readCloudState(c.env.MERLIN_FILES, scope);
   if (!current) return c.json({ success: false, error: "Cloud game not found" }, 404);
   const backups = await listRecoveryGroups(c, scope, current.state);
+  const versions = historyEnabled(c) ? await listVisibleSnapshots(c, scope) : [];
+  const currentExport = historyEnabled(c) ? await loadCurrentExportSnapshot(c, scope, current.state) : null;
   const game = await c.env.merlin_db.prepare(
     "SELECT name, cover_url FROM catalog_games WHERE app_id = ? LIMIT 1",
   ).bind(appId).first<{ name?: string; cover_url?: string | null }>();
@@ -466,15 +490,68 @@ export async function getCloudGame(c: AppContext): Promise<Response> {
       name: game?.name || `Steam App ${appId}`,
       coverUrl: game?.cover_url || null,
       synced: true,
-      currentVersion: stateSummary(current.state, current.object.uploaded),
-      backups: backups.map((backup) => ({
+      currentVersion: { ...stateSummary(current.state, current.object.uploaded),
+        ...(currentExport ? { version: 2 } : {}) },
+      localSaveHints: localSaveHints(current.state),
+      ...(historyEnabled(c) ? { historyVersion: 2 } : {}),
+      backups: [...versions.map((version) => ({
+        id: version.id,
+        version: 2,
+        ...stateSummary(version.snapshot.state, new Date(version.snapshot.createdAt)),
+      })), ...backups.map((backup) => ({
         id: backup.id,
         createdAt: backup.createdAt.toISOString(),
         fileCount: backup.fileCount,
         totalSize: backup.totalSize,
-      })),
+      }))],
     },
   }, 200, { "Cache-Control": "no-store" });
+}
+
+async function selectedExport(c: AppContext): Promise<{ scope: NonNullable<ReturnType<typeof parseCloudScope>>;
+  state: SaveState; createdAt: string } | null> {
+  if (!historyEnabled(c)) return null;
+  const scope = parseCloudScope(c, c.req.query("accountId") || "", c.req.param("appId") || "");
+  const versionId = c.req.param("versionId") || "";
+  if (!scope || (versionId !== "current" && !/^[a-f0-9]{64}$/.test(versionId))) return null;
+  if (versionId === "current") {
+    const current = await readCloudState(c.env.MERLIN_FILES, scope);
+    if (!current) return null;
+    const snapshot = await loadCurrentExportSnapshot(c, scope, current.state);
+    return snapshot ? { scope, state: snapshot.state, createdAt: snapshot.createdAt } : null;
+  }
+  const version = (await listVisibleSnapshots(c, scope)).find((item) => item.id === versionId);
+  return version ? { scope, state: version.snapshot.state, createdAt: version.snapshot.createdAt } : null;
+}
+
+export async function getCloudExport(c: AppContext): Promise<Response> {
+  await requireLauncherLicense(c);
+  const selected = await selectedExport(c);
+  if (!selected) return c.json({ success: false, code: "export_not_found" }, 404);
+  return c.json({ success: true, format: 2, appId: selected.scope.appId, createdAt: selected.createdAt,
+    files: Object.entries(selected.state.files || {}).map(([name, file]) => ({
+      name, sha: file?.sha, size: file?.size,
+    })) }, 200, { "Cache-Control": "no-store" });
+}
+
+export async function getCloudExportFile(c: AppContext): Promise<Response> {
+  await requireLauncherLicense(c);
+  const selected = await selectedExport(c);
+  if (!selected) return c.json({ success: false, code: "export_not_found" }, 404);
+  const name = c.req.query("name") || "";
+  if (!name || name.length > 2048 || !Object.prototype.hasOwnProperty.call(selected.state.files, name)) {
+    return c.json({ success: false, code: "export_file_not_found" }, 404);
+  }
+  const source = await getExportSource(c, selected.scope, selected.state, name);
+  if (!source) return c.json({ success: false, code: "recovery_incomplete" }, 409);
+  const file = await c.env.MERLIN_FILES.get(source);
+  if (!file || file.size !== selected.state.files![name]!.size) {
+    return c.json({ success: false, code: "recovery_incomplete" }, 409);
+  }
+  return new Response(file.body, { status: 200, headers: {
+    "content-type": "application/octet-stream", "content-length": String(file.size),
+    "cache-control": "no-store", "x-content-type-options": "nosniff",
+  } });
 }
 
 export async function restoreCloudGame(c: AppContext): Promise<Response> {
@@ -491,8 +568,36 @@ export async function restoreCloudGame(c: AppContext): Promise<Response> {
   if (current.state.session?.client_id && current.state.session.op) {
     return c.json({ success: false, code: "game_active", error: "Close the game before restoring its save" }, 409);
   }
+  if (historyEnabled(c)) {
+    const version = (await listVisibleSnapshots(c, scope)).find((item) => item.id === recoveryId);
+    if (version) {
+      if (!await captureHiddenSnapshot(c, scope, current.state)) {
+        return c.json({ success: false, code: "recovery_incomplete" }, 409);
+      }
+      if (!await prepareRestore(c, scope, version.snapshot.state)) {
+        return c.json({ success: false, code: "recovery_incomplete" }, 409);
+      }
+      const nextState: SaveState = structuredClone(version.snapshot.state);
+      nextState.cn = (Number.isSafeInteger(current.state.cn) ? Number(current.state.cn) : 0) + 1;
+      delete nextState.session;
+      const updated = await c.env.MERLIN_FILES.put(`${scope.prefix}state.cloudredirect`, JSON.stringify(nextState), {
+        httpMetadata: { contentType: "application/json" }, onlyIf: { etagMatches: current.object.etag },
+      });
+      if (!updated) return c.json({ success: false, code: "recovery_conflict" }, 409);
+      await c.env.MERLIN_FILES.put(`${scope.prefix}cn.cloudredirect`, String(nextState.cn));
+      try { await captureCurrentExportSnapshot(c, scope, nextState); }
+      catch (error) {
+        console.error("[cloud-sync:current-export-index]", { errorType: error instanceof Error ? error.name : "unknown" });
+      }
+      return c.json({ success: true, restoredAt: new Date().toISOString(), fileCount: Object.keys(nextState.files || {}).length,
+        version: 2, restartSteam: true }, 200, { "Cache-Control": "no-store" });
+    }
+  }
   const backup = (await listRecoveryGroups(c, scope, current.state)).find((item) => item.id === recoveryId);
   if (!backup) return c.json({ success: false, code: "recovery_not_found", error: "Recovery not found" }, 404);
+  if (historyEnabled(c) && !await captureHiddenSnapshot(c, scope, current.state)) {
+    return c.json({ success: false, code: "recovery_incomplete" }, 409);
+  }
   const nextState: CloudState = JSON.parse(JSON.stringify(current.state));
   delete nextState.session;
   // A recovery group holds only the files replaced in that save operation.
@@ -512,7 +617,7 @@ export async function restoreCloudGame(c: AppContext): Promise<Response> {
   for (const file of backup.files) {
     const currentDigest = current.state.files?.[file.filePath]?.sha;
     if (typeof currentDigest === "string" && /^[a-f0-9]{40}$/.test(currentDigest)) {
-      await backupExisting(c, `${scope.prefix}blobs/${file.filePath}/${currentDigest}`);
+      if (!historyEnabled(c)) await backupExisting(c, `${scope.prefix}blobs/${file.filePath}/${currentDigest}`);
     }
     const oldCopy = await c.env.MERLIN_FILES.get(file.objectKey);
     if (!oldCopy) return c.json({ success: false, code: "recovery_incomplete", error: "Recovery blob is unavailable" }, 409);
@@ -522,12 +627,15 @@ export async function restoreCloudGame(c: AppContext): Promise<Response> {
     };
   }
   nextState.cn = (Number.isSafeInteger(current.state.cn) ? Number(current.state.cn) : 0) + 1;
-  await backupExisting(c, `${scope.prefix}state.cloudredirect`);
-  await c.env.MERLIN_FILES.put(`${scope.prefix}state.cloudredirect`, JSON.stringify(nextState), {
+  if (!historyEnabled(c)) await backupExisting(c, `${scope.prefix}state.cloudredirect`);
+  const updated = await c.env.MERLIN_FILES.put(`${scope.prefix}state.cloudredirect`, JSON.stringify(nextState), {
     httpMetadata: { contentType: "application/json" },
+    ...(historyEnabled(c) ? { onlyIf: { etagMatches: current.object.etag } } : {}),
   });
+  if (historyEnabled(c) && !updated) return c.json({ success: false, code: "recovery_conflict" }, 409);
   await c.env.MERLIN_FILES.put(`${scope.prefix}cn.cloudredirect`, String(nextState.cn));
-  return c.json({ success: true, restoredAt: new Date().toISOString(), fileCount: backup.fileCount }, 200, { "Cache-Control": "no-store" });
+  return c.json({ success: true, restoredAt: new Date().toISOString(), fileCount: backup.fileCount,
+    ...(historyEnabled(c) ? { restartSteam: true } : {}) }, 200, { "Cache-Control": "no-store" });
 }
 
 async function chargeUpload(c: AppContext, accessKeyId: string, bytes: number): Promise<boolean> {
@@ -632,6 +740,10 @@ export async function handleCloudGateway(c: AppContext): Promise<Response> {
   }
   if (!key) return s3Error(400, "InvalidArgument", "Invalid object key");
   const storageKey = storage + key;
+  const gameKey = /^steam\/([1-9]\d{0,9})\/([1-9]\d{0,9})\/(.+)$/.exec(key);
+  const gameScope = gameKey && historyEnabled(c) ? parseCloudScope(c, gameKey[1]!, gameKey[2]!) : null;
+  const isGameBlob = Boolean(gameScope && gameKey?.[3]?.startsWith("blobs/"));
+  const isGameState = Boolean(gameScope && gameKey?.[3] === "state.cloudredirect");
   const uploadId = query.get("uploadId");
 
   try {
@@ -656,7 +768,13 @@ export async function handleCloudGateway(c: AppContext): Promise<Response> {
       if (completionBody instanceof Response) return completionBody;
       const parts = parseCompletionParts(new TextDecoder().decode(completionBody));
       if (!parts) return s3Error(400, "MalformedXML", "Invalid multipart completion");
-      await backupExisting(c, storageKey);
+      if (isGameBlob && gameScope) {
+        const current = await readCloudState(bucket, gameScope);
+        if (current) await capturePendingSnapshot(c, gameScope, current.state);
+        if (await bucket.head(storageKey)) await protectBlob(c, gameScope, storageKey);
+      } else {
+        await backupExisting(c, storageKey);
+      }
       const object = await bucket.resumeMultipartUpload(storageKey, uploadId).complete(parts);
       return xmlResponse(`<CompleteMultipartUploadResult><Bucket>${VIRTUAL_BUCKET}</Bucket><Key>${xmlEscape(key)}</Key><ETag>${xmlEscape(object.httpEtag)}</ETag></CompleteMultipartUploadResult>`);
     }
@@ -669,8 +787,41 @@ export async function handleCloudGateway(c: AppContext): Promise<Response> {
       const body = await readCheckedBody(request);
       if (body instanceof Response) return body;
       if (!await chargeUpload(c, signature.accessKeyId, body.byteLength)) return s3Error(429, "SlowDown", "Daily cloud upload limit reached");
-      await backupExisting(c, storageKey);
+      let committedSaveChange = false;
+      let shouldMarkCurrentExport = false;
+      if (isGameBlob && gameScope) {
+        const current = await readCloudState(bucket, gameScope);
+        if (current) await capturePendingSnapshot(c, gameScope, current.state);
+        if (await bucket.head(storageKey)) await protectBlob(c, gameScope, storageKey);
+      } else if (isGameState && gameScope) {
+        const current = await readCloudState(bucket, gameScope);
+        let next: SaveState | null = null;
+        try { next = JSON.parse(new TextDecoder().decode(body)) as SaveState; } catch { /* Preserve gateway behavior. */ }
+        shouldMarkCurrentExport = Boolean(next && (!current || !sameSaveFiles(current.state, next)));
+        if (current && next && !sameSaveFiles(current.state, next)) {
+          await captureVisibleSnapshot(c, gameScope, current.state);
+          committedSaveChange = true;
+        }
+      } else {
+        await backupExisting(c, storageKey);
+      }
       const object = await bucket.put(storageKey, body);
+      if (isGameState && gameScope && object && shouldMarkCurrentExport) {
+        try {
+          const saved = JSON.parse(new TextDecoder().decode(body)) as SaveState;
+          await captureCurrentExportSnapshot(c, gameScope, saved);
+        } catch (error) {
+          console.error("[cloud-sync:current-export-index]", { errorType: error instanceof Error ? error.name : "unknown" });
+        }
+      }
+      if (isGameState && gameScope && object && committedSaveChange) {
+        try {
+          await clearPendingSnapshot(c, gameScope);
+          await pruneHistory(c, gameScope);
+        } catch (error) {
+          console.error("[cloud-sync:history-cleanup]", { errorType: error instanceof Error ? error.name : "unknown" });
+        }
+      }
       return new Response(null, { status: 200, headers: { ETag: object?.httpEtag || "", "cache-control": "no-store" } });
     }
     if (request.method === "GET") {
@@ -683,7 +834,13 @@ export async function handleCloudGateway(c: AppContext): Promise<Response> {
       return new Response(null, { status: object ? 200 : 404, headers: object ? { ETag: object.httpEtag, "content-length": String(object.size), "cache-control": "no-store" } : { "cache-control": "no-store" } });
     }
     if (request.method === "DELETE") {
-      await backupExisting(c, storageKey);
+      if (isGameBlob && gameScope) {
+        const current = await readCloudState(bucket, gameScope);
+        if (current) await capturePendingSnapshot(c, gameScope, current.state);
+        await protectBlob(c, gameScope, storageKey);
+      } else {
+        await backupExisting(c, storageKey);
+      }
       await bucket.delete(storageKey);
       return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
     }
