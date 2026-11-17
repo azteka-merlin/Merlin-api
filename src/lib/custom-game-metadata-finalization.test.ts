@@ -219,8 +219,12 @@ describe("bounded folder metadata finalization", () => {
       expect(index).not.toBeNull();
       expect(Object.keys(index!.objects)).toHaveLength(Math.ceil(count / 3000));
       expect(index!.parts).toHaveLength(batchIndex);
+      h.bucket.get.mockClear();
       const manifestResult = await streamPathCount(streamShardedFolderManifest(h.env, index!, GAME_ID, outcome.key));
+      expect(h.bucket.get.mock.calls.map(([key]) => key)).toEqual(index!.parts.map(part => part.key));
+      h.bucket.get.mockClear();
       const integrityResult = await streamPathCount(streamShardedIntegrityManifest(h.env, index!, GAME_ID, outcome.key));
+      expect(h.bucket.get.mock.calls.map(([key]) => key)).toEqual(index!.parts.map(part => part.key));
       expect(manifestResult.count).toBe(count);
       expect(integrityResult.count).toBe(count);
       expect(manifestResult.totalBytes).toBeGreaterThan(totalBytes * 0.5);

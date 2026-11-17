@@ -7,6 +7,8 @@ export type ShardedFolderIndex = { version: 4; totalSizeBytes: number; parts: Pa
 type Entry = { kind: "file" | "bundle"; id?: string; key: string; path?: string; sizeBytes: number; sha256: string; etag?: string;
   files?: { path: string; sizeBytes: number; sha256: string }[]; fragmentIndex?: number; fragmentCount?: number };
 
+const PART_READ_CONCURRENCY = 6;
+
 function invalid(): never { throw new HTTPException(409, { message: "Manifesto de pasta inválido." }); }
 
 /** Index reads remain bounded by the number of uploaded objects, not game files. */
@@ -47,27 +49,34 @@ async function readPart(env: AppBindings, descriptor: Part): Promise<Entry[]> {
   return value.entries;
 }
 
-/** Stream the historical JSON contract; only one bounded part is held at a time. */
+/** Read a bounded window in parallel and consume it in manifest order. */
+async function* readEntries(env: AppBindings, parts: Part[]): AsyncGenerator<Entry> {
+  for (let start = 0; start < parts.length; start += PART_READ_CONCURRENCY) {
+    const window = parts.slice(start, start + PART_READ_CONCURRENCY);
+    const entries = await Promise.all(window.map(part => readPart(env, part)));
+    for (const part of entries) yield* part;
+  }
+}
+
+/** Stream the historical JSON contract in one pass over the parts. */
 export function streamShardedFolderManifest(env: AppBindings, index: ShardedFolderIndex,
   gameId: string, archiveKey: string): ReadableStream<Uint8Array> {
   async function* chunks(): AsyncGenerator<string> {
-    yield `{"success":true,"gameId":${JSON.stringify(gameId)},"archiveKey":${JSON.stringify(archiveKey)},"totalSizeBytes":${index.totalSizeBytes},"files":[`;
+    yield `{"success":true,"gameId":${JSON.stringify(gameId)},"archiveKey":${JSON.stringify(archiveKey)},"totalSizeBytes":${index.totalSizeBytes},"bundles":[`;
+    // Bundle members dominate the manifest. Stream them immediately and keep
+    // just the paths for direct objects, whose remaining metadata is in the index.
+    const directPaths = new Map<string, string>();
     let first = true;
-    for (const part of index.parts) for (const entry of await readPart(env, part)) {
-      if (entry.kind !== "file") continue;
-      const id = entry.key.slice(-36); const ref = index.objects[id];
-      if (!ref || ref.kind !== "file" || ref.key !== entry.key || ref.sizeBytes !== entry.sizeBytes || ref.sha256 !== entry.sha256 || typeof entry.path !== "string") invalid();
-      yield `${first ? "" : ","}${JSON.stringify({ id, path: entry.path, sizeBytes: entry.sizeBytes, etag: ref.etag, sha256: entry.sha256 })}`;
-      first = false;
-    }
-    yield '],"bundles":[';
-    first = true;
     let active = ""; let expected = 0; let total = 0; let memberFirst = true;
-    for (const part of index.parts) for (const entry of await readPart(env, part)) {
-      if (entry.kind !== "bundle") { if (active) invalid(); continue; }
+    for await (const entry of readEntries(env, index.parts)) {
       const id = entry.key.slice(-36); const ref = index.objects[id];
-      if (!ref || ref.kind !== "bundle" || ref.key !== entry.key || ref.sizeBytes !== entry.sizeBytes || ref.sha256 !== entry.sha256 ||
-          !Array.isArray(entry.files) || !Number.isSafeInteger(entry.fragmentIndex) || !Number.isSafeInteger(entry.fragmentCount) ||
+      if (!ref || ref.kind !== entry.kind || ref.key !== entry.key || ref.sizeBytes !== entry.sizeBytes || ref.sha256 !== entry.sha256) invalid();
+      if (entry.kind === "file") {
+        if (active || typeof entry.path !== "string" || directPaths.has(id)) invalid();
+        directPaths.set(id, entry.path);
+        continue;
+      }
+      if (!Array.isArray(entry.files) || !Number.isSafeInteger(entry.fragmentIndex) || !Number.isSafeInteger(entry.fragmentCount) ||
           !entry.fragmentCount || entry.fragmentCount < 1) invalid();
       if (!active) {
         if (entry.fragmentIndex !== 0) invalid();
@@ -84,6 +93,13 @@ export function streamShardedFolderManifest(env: AppBindings, index: ShardedFold
       if (expected === total) { yield "]}"; active = ""; }
     }
     if (active) invalid();
+    yield '],"files":[';
+    first = true;
+    for (const [id, path] of directPaths) {
+      const ref = index.objects[id]!;
+      yield `${first ? "" : ","}${JSON.stringify({ id, path, sizeBytes: ref.sizeBytes, etag: ref.etag, sha256: ref.sha256 })}`;
+      first = false;
+    }
     yield "]}";
   }
   const iterator = chunks();
@@ -107,7 +123,7 @@ export function streamShardedIntegrityManifest(env: AppBindings, index: ShardedF
   async function* chunks(): AsyncGenerator<string> {
     yield `{"success":true,"version":1,"gameId":${JSON.stringify(gameId)},"archiveKey":${JSON.stringify(archiveKey)},"totalSizeBytes":${index.totalSizeBytes},"files":[`;
     let first = true;
-    for (const part of index.parts) for (const entry of await readPart(env, part)) {
+    for await (const entry of readEntries(env, index.parts)) {
       const id = entry.key.slice(-36); const ref = index.objects[id];
       if (!ref || ref.key !== entry.key || ref.kind !== entry.kind || ref.sizeBytes !== entry.sizeBytes || ref.sha256 !== entry.sha256) invalid();
       const members = entry.kind === "file" ? [entry] : entry.files;
