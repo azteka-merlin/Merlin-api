@@ -4,29 +4,35 @@ import type { AppBindings } from "../types";
 
 vi.mock("./admin-security", () => ({ requireAdminSession: vi.fn() }));
 import { requireAdminSession } from "./admin-security";
-import { cleanupExpiredGameUploads, registerGameUploadSessionRoutes } from "./custom-game-upload-sessions";
+import { cleanupExpiredGameUploads, finishGameUploadFinalization, registerGameUploadSessionRoutes } from "./custom-game-upload-sessions";
 import { registerCustomGamesRoutes } from "./custom-games";
+import { installFixedLengthStreamMock } from "./test-support/install-fixed-length-stream-mock";
+
+installFixedLengthStreamMock();
 
 const gameId = "11111111-1111-4111-8111-111111111111";
 const emptySha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 function harness(direct = false) {
   let counter = 0;
-  const objects = new Map<string, { bytes: Uint8Array; etag: string; size: number }>();
+  const cancelledMetadataSessions = new Set<string>();
+  const objects = new Map<string, { bytes: Uint8Array; etag: string; size: number; customMetadata?: Record<string, string> }>();
   const multiparts = new Map<string, { key: string; parts: Map<number, Uint8Array> }>();
   const completedParts: { partNumber: number; etag: string }[][] = [];
   const bucket = {
-    put: vi.fn(async (key: string, value: string | Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
+    put: vi.fn(async (key: string, input: string | Uint8Array | ReadableStream<Uint8Array>, options: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string }; customMetadata?: Record<string, string> } = {}) => {
       const prior = objects.get(key);
       if (options?.onlyIf?.etagMatches && prior?.etag !== options.onlyIf.etagMatches) return null;
       if (options?.onlyIf?.etagDoesNotMatch === "*" && prior) return null;
+      const value = input instanceof ReadableStream ? new Uint8Array(await new Response(input).arrayBuffer()) : input;
       const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-      const result = { bytes, etag: `etag-${++counter}`, size: bytes.byteLength };
+      const result = { bytes, etag: `etag-${++counter}`, size: bytes.byteLength, customMetadata: options.customMetadata };
       objects.set(key, result); return result;
     }),
     get: vi.fn(async (key: string) => {
       const value = objects.get(key);
-      return value ? { ...value, json: async () => JSON.parse(new TextDecoder().decode(value.bytes)) } : null;
+      return value ? { ...value, body: new Blob([value.bytes]).stream(),
+        json: async () => JSON.parse(new TextDecoder().decode(value.bytes)) } : null;
     }),
     head: vi.fn(async (key: string) => objects.get(key) || null),
     delete: vi.fn(async (keys: string | string[]) => { for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key); }),
@@ -59,7 +65,28 @@ function harness(direct = false) {
   };
   const app = new Hono<{ Bindings: AppBindings }>();
   registerCustomGamesRoutes(app);
-  const env = { CUSTOM_GAMES: bucket, ...(direct ? { CUSTOM_GAMES_R2_ACCOUNT_ID: "a".repeat(32),
+  const env = { CUSTOM_GAMES: bucket, merlin_db: {
+    prepare: (sql: string) => {
+      let values: unknown[] = [];
+      const statement = {
+        sql,
+        get values() { return values; },
+        bind(...input: unknown[]) { values = input; return statement; },
+        first: async () => sql.includes("SELECT 1 AS found FROM custom_game_metadata_cancelled_sessions") &&
+          cancelledMetadataSessions.has(String(values[0])) ? { found: 1 } : null,
+        run: async () => ({}), all: async () => ({ results: [] }),
+      };
+      return statement;
+    },
+    batch: async (statements: any[]) => {
+      for (const statement of statements) {
+        if (String(statement.sql).includes("INSERT INTO custom_game_metadata_cancelled_sessions")) {
+          cancelledMetadataSessions.add(String(statement.values?.[0]));
+        }
+      }
+      return [];
+    },
+  }, ...(direct ? { CUSTOM_GAMES_R2_ACCOUNT_ID: "a".repeat(32),
     CUSTOM_GAMES_R2_ACCESS_KEY_ID: "ACCESS-EXAMPLE", CUSTOM_GAMES_R2_SECRET_ACCESS_KEY: "secret-example" } : {}) } as unknown as AppBindings;
   async function request(path: string, body?: unknown, method = "POST") {
     const response = await app.request(`http://localhost/panel-api/custom-games/upload/${path}`, {
@@ -188,6 +215,22 @@ describe("persistent custom-game upload sessions", () => {
     await cleanupExpiredGameUploads(h.bucket as unknown as R2Bucket, Date.now() + 8 * 86400_000);
     expect(h.multiparts.has(secondObject.uploadId)).toBe(false);
     expect(h.objects.has(arbitrary)).toBe(true);
+  });
+
+  it("preserves safe cancellation for a stale legacy finalizer and removes its late unreferenced manifest", async () => {
+    const h = harness(); const session = await h.session();
+    const stateKey = `_upload-sessions/${session.sessionId}/session.json`;
+    const current = JSON.parse(new TextDecoder().decode(h.objects.get(stateKey)!.bytes));
+    const manifestId = "22222222-2222-4222-8222-222222222222";
+    await h.bucket.put(stateKey, JSON.stringify({ ...current, status: "finalizing", manifestId,
+      finalizingAt: Date.now() - 11 * 60_000 }));
+    expect((await h.request(`sessions/${session.sessionId}/cancel`)).status).toBe(200);
+
+    const manifestKey = `${gameId}/manifests/${manifestId}.json`;
+    await h.bucket.put(manifestKey, JSON.stringify({ version: 3, files: [], bundles: [], totalSizeBytes: 1 }));
+    await expect(finishGameUploadFinalization({ env: h.env } as any,
+      { ...current, status: "finalizing", manifestId }, manifestKey)).rejects.toMatchObject({ status: 409 });
+    expect(h.objects.has(manifestKey)).toBe(false);
   });
 
   it("does not let expired finalizing sessions block cleanup of later abandoned sessions", async () => {

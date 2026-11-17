@@ -4,6 +4,7 @@ import type { AppBindings, AppContext } from "../types";
 import { requireAdminSession } from "./admin-security";
 import { requireGoldLauncherLicense } from "./launcher-auth";
 import { MAX_FOLDER_GAME_FILES, MAX_INTEGRITY_MANIFEST_BYTES } from './custom-game-limits';
+import { readShardedFolderIndex, streamShardedIntegrityManifest } from "./custom-game-sharded-download";
 
 const JOB_PREFIX = "_integrity-jobs/";
 const MAX_MANIFEST_BYTES = MAX_INTEGRITY_MANIFEST_BYTES;
@@ -58,6 +59,41 @@ export async function integrityJobId(gameId: string, archiveKey: string): Promis
 export async function integrityManifestKey(gameId: string, archiveKey: string): Promise<string> {
   if (!GAME_PATTERN.test(gameId)) fail("Identificador do jogo inválido.");
   return `${gameId}/integrity/${await integrityJobId(gameId, archiveKey)}.json`;
+}
+
+/** Save a bounded-memory integrity baseline before reclaiming a sharded package. */
+export async function ensureShardedIntegrityBaseline(env: AppBindings, game: IntegrityGame): Promise<boolean> {
+  const key = await integrityManifestKey(game.id, game.archive_key);
+  const previous = await env.CUSTOM_GAMES.head(key);
+  if (previous) return previous.customMetadata?.format === "sharded-baseline-v1";
+  const index = await readShardedFolderIndex(env, game.archive_key);
+  if (!index || index.totalSizeBytes !== game.archive_size) return false;
+  const reader = streamShardedIntegrityManifest(env, index, game.id, game.archive_key).getReader();
+  let length = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      length += chunk.value.byteLength;
+      if (length > MAX_MANIFEST_BYTES) return false;
+    }
+  } finally { await reader.cancel().catch(() => {}); }
+  const stream = new FixedLengthStream(length);
+  const writing = streamShardedIntegrityManifest(env, index, game.id, game.archive_key).pipeTo(stream.writable);
+  const created = await env.CUSTOM_GAMES.put(key, stream.readable, {
+    onlyIf: { etagDoesNotMatch: "*" },
+    customMetadata: { gameId: game.id, format: "sharded-baseline-v1", indexedAt: new Date().toISOString() },
+    httpMetadata: { contentType: "application/json", cacheControl: "private, no-store" },
+  }).catch(async error => {
+    await stream.readable.cancel(error).catch(() => {});
+    await writing.catch(() => {});
+    throw error;
+  });
+  if (!created) await stream.readable.cancel().catch(() => {});
+  await writing.catch(error => { if (created) throw error; });
+  if (created) return true;
+  const existing = await env.CUSTOM_GAMES.head(key);
+  return existing?.customMetadata?.format === "sharded-baseline-v1";
 }
 function indexNamespace(env: Pick<AppBindings, "ENVIRONMENT">) { return env.ENVIRONMENT === "staging" ? "staging" : "production"; }
 function jobPrefix(env: Pick<AppBindings, "ENVIRONMENT">) { return `${JOB_PREFIX}${indexNamespace(env)}/`; }
@@ -276,6 +312,13 @@ export async function getIntegrityManifest(c: AppContext, game: IntegrityGame, d
 export async function enqueueGameIntegrity(c: AppContext, game: IntegrityGame, deps: IntegrityDependencies, { force = false } = {}) {
   if (!game.archive_key || game.archive_key.startsWith("draft/")) return { queued: false, skipped: true, reason: "no_package" };
   const packageType = game.package_type || "zip";
+  if (packageType === "folder") {
+    const sharded = await readShardedFolderIndex(c.env, game.archive_key);
+    if (sharded) {
+      if (sharded.totalSizeBytes !== game.archive_size) fail("Manifesto não corresponde ao catálogo.", 409);
+      return { queued: false, skipped: true, reason: "ready" };
+    }
+  }
   const existingManifest = await getIntegrityManifest(c, game, deps);
   if (existingManifest && (!force || packageType === "folder")) return { queued: false, skipped: true, reason: "ready" };
   const source = await c.env.CUSTOM_GAMES.head(game.archive_key);
@@ -360,6 +403,11 @@ export function registerCustomGameIntegrityRoutes(app: Hono<{ Bindings: AppBindi
       const job = lookup.get(id);
       let meta = await c.env.CUSTOM_GAMES.head(await integrityManifestKey(game.id, game.archive_key));
       if (!meta && (game.package_type || "zip") === "folder" && !game.archive_key.startsWith("draft/")) {
+        const sharded = await readShardedFolderIndex(c.env, game.archive_key);
+        if (sharded) {
+          games.push({ id: game.id, name: game.name || game.id, packageType: "folder", indexStatus: "ready" });
+          continue;
+        }
         const manifest = await getIntegrityManifest(c, game, deps);
         if (manifest) meta = await c.env.CUSTOM_GAMES.head(await integrityManifestKey(game.id, game.archive_key));
       }
@@ -456,6 +504,20 @@ export function registerCustomGameIntegrityRoutes(app: Hono<{ Bindings: AppBindi
       const resolved = await deps.resolveIntegrityPackage?.(c, game, requested);
       if (!resolved) fail("A versão solicitada não possui manifesto disponível.", 409);
       game = resolved;
+    }
+    if ((game.package_type || "zip") === "folder") {
+      const baseline = await c.env.CUSTOM_GAMES.get(await integrityManifestKey(game.id, game.archive_key));
+      if (baseline?.customMetadata?.format === "sharded-baseline-v1") {
+        if (baseline.size > MAX_MANIFEST_BYTES) fail("Manifesto de integridade inválido.", 409);
+        return new Response(baseline.body, { headers: { "content-type": "application/json; charset=UTF-8", "cache-control": "private, no-store" } });
+      }
+      const sharded = await readShardedFolderIndex(c.env, game.archive_key);
+      if (sharded) {
+        if (sharded.totalSizeBytes !== game.archive_size) fail("Manifesto não corresponde ao catálogo.", 409);
+        return new Response(streamShardedIntegrityManifest(c.env, sharded, game.id, game.archive_key), {
+          headers: { "content-type": "application/json; charset=UTF-8", "cache-control": "private, no-store" },
+        });
+      }
     }
     const manifest = await getIntegrityManifest(c, game, deps);
     if (!manifest) fail("A integridade desta versão ainda não foi indexada.", 409);

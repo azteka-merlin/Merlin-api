@@ -1,15 +1,26 @@
 # Custom-game upload sessions
 
-The folder upload pipeline uses the existing `CUSTOM_GAMES` R2 binding. No D1
-migration is required. Legacy upload endpoints remain available for requests
-started by an older Admin bundle.
+The folder upload pipeline keeps game data in the existing `CUSTOM_GAMES` R2
+binding. It uses D1 temporarily to detect path conflicts across metadata batches;
+apply migration `0101_custom_game_metadata_batches.sql` before publishing the
+new Admin. Legacy upload endpoints remain available for older Admin bundles.
 
 ## Admin pipeline and recovery
 
 The Admin creates a recoverable unpublished game record before sending a new
 folder. It deterministically groups complete files into stored ZIPs up to
-200 MiB (3,000 members maximum); larger files stay individual objects. Manifest
-v3 and the Launcher package format are unchanged.
+200 MiB (3,000 members maximum); larger files stay individual objects. The
+Admin uploads metadata in requests capped by both byte and entry counts, with
+no more than four metadata requests in flight. Package data still uploads in
+binary parts; the metadata change does not alter its 200 MiB bundle plan or
+file upload protocol.
+
+New folder uploads use a v4 index object and immutable metadata parts. The index
+contains only the logical size, object lookup table, and part keys. Each part
+contains one bounded group of file and bundle metadata. The existing Launcher
+manifest endpoint streams those parts back using the v3 JSON response shape, so
+the Launcher does not need a protocol change. Stored v1-v3 manifests continue
+to use their existing read paths.
 
 Two Web Workers prepare packages while two objects upload. A global limiter
 allows four binary requests at once, irrespective of which objects own them.
@@ -86,21 +97,38 @@ user and game ID, and expire seven days after creation.
   parts: [{ partNumber, etag }] }`. SHA-256 is required. Completion checks R2
   size and persists the object checkpoint. A lost completion response is safe
   to retry: an existing object or completed checkpoint is recognized.
+- `POST /sessions/:id/metadata/batches/:index`: `{ manifestId, entries }`.
+  Each request is limited to 256 KiB and 500 file entries; the Admin targets
+  240 KiB and 400 entries to leave framing room. Replaying an identical batch
+  is safe and repairs a missing R2 metadata object. A different payload at an
+  existing index is rejected. D1 tracks normalized paths and rejects duplicates
+  and file-versus-directory conflicts across requests. The API streams the
+  request body through the byte limit before parsing it, including when the
+  caller omits `Content-Length`.
+- `POST /sessions/:id/metadata/complete`: `{ manifestId, batchCount }`.
+  The API requires every sequential batch, then processes up to 32 batches in a
+  request while checking no more than 400 distinct uploaded objects in that
+  invocation. It returns `status: "processing"` with progress until all
+  immutable parts are present, then writes the v4 index and returns the manifest
+  key. Retries resume at the last committed batch. The index is published only
+  after validation and all parts are complete.
 - `POST /folder/complete`: existing manifest payload, plus optional `sessionId`.
   For session uploads, all reserved objects must be completed and correspond
   exactly to the submitted keys, sizes, and hashes. The finalizing session locks
   the manifest ID; retries with that same ID can finish after response loss.
 - `POST /sessions/:id/cancel`: marks an open session cancelled, aborts its
-  incomplete multiparts, and deletes only the objects reserved by that session.
-  A finalizing or finalized session cannot be cancelled.
+  incomplete multiparts, and deletes only objects owned by that session. A
+  finalizing session can be discarded after ten minutes only when its manifest
+  has not been written or linked to a game/version. Finalized sessions cannot
+  be cancelled.
 
 ## Expiration and observations
 
-Call `cleanupExpiredGameUploads(CUSTOM_GAMES)` from the existing scheduled
-handler. It processes at most ten expired sessions by default, using a compact
+Call `cleanupExpiredGameUploads(CUSTOM_GAMES, Date.now(), 10, merlin_db)` from
+the existing scheduled handler. It processes at most ten expired sessions by default, using a compact
 expiry index rather than scanning game files. Only cancelled or expired open
-sessions lose their own upload objects. Finalizing and finalized game packages
-are never removed by this cleanup. Expired finalizing sessions emit a recovery
+sessions lose their own upload objects and temporary metadata/path-index rows.
+Finalizing and finalized game packages are never removed by this cleanup. Expired finalizing sessions emit a recovery
 warning and leave the expiry queue, allowing later sessions to be cleaned. Small session/checkpoint records remain for
 recovery and diagnosis after the expiry marker is removed.
 
@@ -113,3 +141,17 @@ expiration enabled.
 Logs include session/game/client IDs, byte counts, and elapsed times for proxied
 parts, completed objects, finalization, cancellation, and expiration cleanup.
 They never include S3 credentials, signed URLs, or file contents.
+
+## Synthetic large-folder validation
+
+Run `npx vitest run src/lib/custom-game-metadata-finalization.test.ts` to exercise
+the real Hono upload/finalization handlers with SQLite as a D1-compatible local
+database and an in-memory R2 fake. On Node 22, 277,000 paths completed in 5.4 s
+with 739 metadata batches, 24 finalization requests and 39.6 MB total request
+JSON; 500,000 paths completed in 10.5 s with 1,333 batches, 42 finalization
+requests and 71.4 MB of request JSON. The harness also streams both Launcher
+manifest contracts and verifies cleanup, replay recovery and path collisions.
+Boundary-sampled Node RSS reached about 580 MB and 1.01 GB, respectively; the
+local harness retains fake R2 objects and SQLite state in process memory. These
+timings and memory samples do not measure Cloudflare Worker CPU/memory or real
+R2/D1 latency and must not be used as production throughput estimates.

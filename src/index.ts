@@ -4631,7 +4631,7 @@ export default {
     const billingHour = new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Sao_Paulo", hour: "2-digit", hourCycle: "h23",
     }).format(scheduledAt);
-    _ctx.waitUntil(cleanupExpiredGameUploads(env.CUSTOM_GAMES).catch(error => {
+    _ctx.waitUntil(cleanupExpiredGameUploads(env.CUSTOM_GAMES, Date.now(), 10, env.merlin_db).catch(error => {
       console.error("[CustomGamesUpload] cleanup-failed", { message: error instanceof Error ? error.message : "Unknown error" });
     }));
     if (billingHour === "09" || billingHour === "19") await runBillingNotificationCron(env, scheduledAt);

@@ -6,6 +6,9 @@ import { Hono } from "hono";
 import type { AppBindings } from "../types";
 import { cleanupCustomGamePackages, registerCustomGamesRoutes } from "./custom-games";
 import { integrityManifestKey } from "./custom-game-integrity";
+import { installFixedLengthStreamMock } from "./test-support/install-fixed-length-stream-mock";
+
+installFixedLengthStreamMock();
 
 vi.mock("./admin-security", () => ({ requireAdminSession: vi.fn(async () => ({ session: { admin_user_id: 1 } })) }));
 vi.mock("./launcher-auth", () => ({ requireGoldLauncherLicense: vi.fn(async () => ({ id: 1, planTier: "ouro" })) }));
@@ -27,12 +30,16 @@ function harness() {
     uploaded: new Date(), customMetadata: value.customMetadata });
   const bucket = {
     async head(key: string) { const value = stored.get(key); return value ? metadata(key, value) : null; },
-    async get(key: string) {
+    async get(key: string, options: any = {}) {
       const value = stored.get(key); if (!value) return null;
-      return { ...metadata(key, value), json: async () => JSON.parse(String(value.value)), text: async () => String(value.value) };
+      const completeBytes = typeof value.value === "string" ? new TextEncoder().encode(value.value) : value.value;
+      const bytes = options.range ? completeBytes.slice(options.range.offset, options.range.offset + options.range.length) : completeBytes;
+      return { ...metadata(key, value), body: new Blob([bytes]).stream(),
+        json: async () => JSON.parse(new TextDecoder().decode(bytes)), text: async () => new TextDecoder().decode(bytes) };
     },
-    async put(key: string, value: string | Uint8Array, options: any = {}) {
+    async put(key: string, input: string | Uint8Array | ReadableStream<Uint8Array>, options: any = {}) {
       if (options.onlyIf?.etagDoesNotMatch === "*" && stored.has(key)) return null;
+      const value = input instanceof ReadableStream ? new Uint8Array(await new Response(input).arrayBuffer()) : input;
       const entry = { value, etag: `etag-${++revision}`, customMetadata: options.customMetadata || {} };
       stored.set(key, entry); return metadata(key, entry);
     },
@@ -76,6 +83,48 @@ function harness() {
 beforeEach(() => vi.clearAllMocks());
 
 describe("custom game package lifecycle adversarial cases", () => {
+  it("publishes a v4 package and serves existing Launcher manifest, file-range and integrity contracts", async () => {
+    const h = harness();
+    const manifestId = crypto.randomUUID();
+    const manifestKey = `${h.gameId}/manifests/${manifestId}.json`;
+    const partKey = `${h.gameId}/manifest-parts/${manifestId}/000000.json`;
+    const file = h.file("bin/game.exe");
+    const bytes = new Uint8Array([11, 22, 33, 44]);
+    const uploaded = await h.bucket.put(file.key, bytes);
+    if (!uploaded) throw new Error("synthetic object PUT failed");
+    const fileId = file.id;
+    await h.bucket.put(partKey, JSON.stringify({ entries: [{ kind: "file", id: fileId, path: file.path,
+      key: file.key, sizeBytes: bytes.length, sha256: SHA, etag: uploaded.etag }] }));
+    await h.bucket.put(manifestKey, JSON.stringify({ version: 4, totalSizeBytes: bytes.length, parts: [{ key: partKey }], objects: {
+      [fileId]: { key: file.key, sizeBytes: bytes.length, sha256: SHA, etag: uploaded.etag, kind: "file", parts: [0] },
+    } }));
+
+    const form = new FormData();
+    form.set("gameId", h.gameId); form.set("name", "Large Folder Fixture"); form.set("origin", "native");
+    form.set("protectedPaths", "[]"); form.set("adminNote", ""); form.set("adminNotes", "{}");
+    form.set("executablePath", "bin/game.exe"); form.set("packageType", "folder");
+    form.set("archiveKey", manifestKey); form.set("published", "true");
+    form.set("image", new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "cover.png", { type: "image/png" }));
+    const saved = await h.app.request("https://localhost/panel-api/custom-games", { method: "POST", body: form }, h.env);
+    expect(saved.status).toBe(201);
+    expect(h.db.prepare("SELECT archive_key,archive_size,package_type,published FROM custom_games WHERE id=?").get(h.gameId))
+      .toMatchObject({ archive_key: manifestKey, archive_size: bytes.length, package_type: "folder", published: 1 });
+
+    const response = await h.app.request(`https://localhost/api/custom-games/${h.gameId}/manifest`, {}, h.env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ gameId: h.gameId, archiveKey: manifestKey, totalSizeBytes: 4,
+      files: [{ id: fileId, path: "bin/game.exe", sizeBytes: 4, sha256: SHA }] });
+    const range = await h.app.request(`https://localhost/api/custom-games/${h.gameId}/files/${fileId}`, {
+      headers: { range: "bytes=1-2" },
+    }, h.env);
+    expect(range.status).toBe(206);
+    expect(new Uint8Array(await range.arrayBuffer())).toEqual(new Uint8Array([22, 33]));
+    const integrity = await h.app.request(`https://localhost/api/custom-games/${h.gameId}/integrity`, {}, h.env);
+    expect(integrity.status).toBe(200);
+    expect(await integrity.json()).toMatchObject({ gameId: h.gameId, archiveKey: manifestKey,
+      files: [{ path: "bin/game.exe", sizeBytes: 4, sha256: SHA }] });
+  });
+
   it("never overwrites a published folder key and accepts a replay with identical content", async () => {
     const h = harness();
     const file = h.file("main.exe"); await h.bucket.put(file.key, new Uint8Array([1, 2, 3]));

@@ -10,6 +10,9 @@ vi.mock("./launcher-auth", () => ({
 
 import { registerCustomGamesRoutes } from "./custom-games";
 import { requireAdminSession } from "./admin-security";
+import { installFixedLengthStreamMock } from "./test-support/install-fixed-length-stream-mock";
+
+installFixedLengthStreamMock();
 
 const key = "00000000-0000-4000-8000-000000000000/files/00000000-0000-4000-8000-000000000001";
 
@@ -137,7 +140,10 @@ describe("hybrid folder manifest", () => {
     const gameId = "00000000-0000-4000-8000-000000000000";
     const bundleKey = `${gameId}/files/00000000-0000-4000-8000-000000000002`;
     const head = vi.fn(async (objectKey: string) => ({ size: objectKey === key ? 5 : 128, etag: "etag" }));
-    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    let savedManifest = "";
+    const put = vi.fn(async (_objectKey: string, input: string | ReadableStream<Uint8Array>) => ({
+      etag: "manifest", size: typeof input === "string" ? new TextEncoder().encode(input).byteLength : await new Response(input).text().then(value => { savedManifest = value; return new TextEncoder().encode(value).byteLength; }),
+    }));
     const app = new Hono<{ Bindings: AppBindings }>();
     registerCustomGamesRoutes(app);
     const env = { CUSTOM_GAMES: { head, put } } as unknown as AppBindings;
@@ -150,7 +156,7 @@ describe("hybrid folder manifest", () => {
     }, env);
     expect(response.status).toBe(201);
     expect(head).toHaveBeenCalledTimes(2);
-    const manifest = JSON.parse(put.mock.calls[0]![1] as string);
+    const manifest = JSON.parse(savedManifest);
     expect(manifest.version).toBe(3);
     expect(manifest.totalSizeBytes).toBe(9);
     expect(manifest.bundles[0].files[0].path).toBe("Game/small.dat");
@@ -159,13 +165,16 @@ describe("hybrid folder manifest", () => {
   it("accepts more than 100 packages with members larger than 1 MiB", async () => {
     const gameId = "00000000-0000-4000-8000-000000000000";
     const memberSize = 2 * 1024 * 1024;
+    let savedManifest = "";
     const bundles = Array.from({ length: 101 }, (_, index) => ({
       key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
       sizeBytes: memberSize + 1024,
       sha256: "b".repeat(64),
       files: [{ path: `Game/file-${index}.dat`, sizeBytes: memberSize, sha256: "c".repeat(64) }],
     }));
-    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    const put = vi.fn(async (_objectKey: string, input: string | ReadableStream<Uint8Array>) => ({
+      etag: "manifest", size: typeof input === "string" ? new TextEncoder().encode(input).byteLength : await new Response(input).text().then(value => { savedManifest = value; return new TextEncoder().encode(value).byteLength; }),
+    }));
     const app = new Hono<{ Bindings: AppBindings }>();
     registerCustomGamesRoutes(app);
     const env = { CUSTOM_GAMES: {
@@ -177,7 +186,7 @@ describe("hybrid folder manifest", () => {
       }),
     }, env);
     expect(response.status).toBe(201);
-    expect(JSON.parse(put.mock.calls[0]![1] as string).bundles).toHaveLength(101);
+    expect(JSON.parse(savedManifest).bundles).toHaveLength(101);
   });
 
   it("validates thousands of legacy objects with paginated R2 listings", async () => {
@@ -187,6 +196,7 @@ describe("hybrid folder manifest", () => {
       key: `${gameId}/files/00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
       sizeBytes: 1, sha256: "a".repeat(64),
     }));
+    let savedManifest = "";
     const list = vi.fn(async (options: { prefix: string; limit: number; cursor?: string }) => {
       expect(options.prefix).toBe(`${gameId}/files/`);
       expect(options.limit).toBe(1000);
@@ -196,7 +206,9 @@ describe("hybrid folder manifest", () => {
         truncated: end < files.length, cursor: end < files.length ? String(end) : undefined };
     });
     const head = vi.fn();
-    const put = vi.fn(async (_objectKey: string, _body: string) => ({ etag: "manifest" }));
+    const put = vi.fn(async (_objectKey: string, input: string | ReadableStream<Uint8Array>) => ({
+      etag: "manifest", size: typeof input === "string" ? new TextEncoder().encode(input).byteLength : await new Response(input).text().then(value => { savedManifest = value; return new TextEncoder().encode(value).byteLength; }),
+    }));
     const app = new Hono<{ Bindings: AppBindings }>();
     registerCustomGamesRoutes(app);
     const env = { CUSTOM_GAMES: { list, head, put } } as unknown as AppBindings;
@@ -208,7 +220,7 @@ describe("hybrid folder manifest", () => {
     expect(response.status).toBe(201);
     expect(list).toHaveBeenCalledTimes(3);
     expect(head).not.toHaveBeenCalled();
-    expect(JSON.parse(put.mock.calls[0]![1] as string).files).toHaveLength(2501);
+    expect(JSON.parse(savedManifest).files).toHaveLength(2501);
   });
 
   it.each(["missing", "wrong size"])("does not publish a manifest with a %s object", async problem => {
@@ -246,6 +258,7 @@ describe("discarding unused folder uploads", () => {
     const app = new Hono<{ Bindings: AppBindings }>();
     registerCustomGamesRoutes(app);
     const env = { CUSTOM_GAMES: {
+      head: vi.fn(async (key: string) => key === manifestKey ? { size: 100 } : null),
       get: vi.fn(async () => ({ json: async () => ({ files, bundles: [] }) })),
       delete: vi.fn(async (keys: string | string[]) => { deleted.push(keys); }),
     }, merlin_db: { prepare: vi.fn(() => ({ bind: () => ({

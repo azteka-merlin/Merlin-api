@@ -8,9 +8,10 @@ import { beginGameUploadFinalization, completeGameMultipart, finishGameUploadFin
 import { metadataFromRow, readCustomGameMetadata, type MetadataRow } from "./custom-game-metadata";
 import { ensureGameVersion, gameVersionInsertStatement, getLegacyGamePackage, resolveGamePackage,
   registerGameVersionRoutes, findGameVersion, cleanupRetiredGameVersions } from "./custom-game-versions";
-import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, integrityManifestKey, integrityJobKey, integrityJobId, readJob, writeJob } from "./custom-game-integrity";
+import { registerCustomGameIntegrityRoutes, enqueueGameIntegrity, getIntegrityManifest, ensureShardedIntegrityBaseline, integrityManifestKey, integrityJobKey, integrityJobId, readJob, writeJob } from "./custom-game-integrity";
 import { consumeCloudflareIntegrityBatch, type IntegrityQueueMessage } from "./custom-game-cloudflare-indexer";
 import { folderManifestObjectKeys, putImmutableFolderManifest, referencedGameFileKeys } from "./custom-game-package-lifecycle";
+import { readShardedFolderIndex, streamShardedFolderManifest } from "./custom-game-sharded-download";
 import { MAX_FOLDER_GAME_FILES, MAX_FOLDER_MANIFEST_BYTES } from './custom-game-limits';
 
 const PART_SIZE = 64 * 1024 * 1024;
@@ -104,6 +105,26 @@ export function validateSha256(value: unknown): string {
   return checksum;
 }
 
+// Sorted adjacency alone misses conflicts such as `a`, `a-b`, `a/file`.
+// Binary-search each parent in the sorted paths without building another Set
+// containing hundreds of thousands of strings.
+export function validateSortedFolderPaths(paths: string[], messages: { duplicate: string; conflict: string }): void {
+  paths.sort();
+  for (let index = 0; index < paths.length; index++) {
+    const path = paths[index]!;
+    if (index && path === paths[index - 1]) fail(messages.duplicate);
+    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+      const parent = path.slice(0, slash);
+      let low = 0; let high = paths.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (paths[middle]! < parent) low = middle + 1; else high = middle;
+      }
+      if (paths[low] === parent) fail(messages.conflict);
+    }
+  }
+}
+
 async function loadFolderManifest(c: AppContext, key: string): Promise<FolderManifest> {
   const cached = folderManifestCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.manifest;
@@ -122,7 +143,7 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
     sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0);
   if (memberCount < 1 || memberCount > MAX_GAME_FILES) fail("Manifesto do jogo inválido.");
   let totalSizeBytes = 0;
-  const paths = new Set<string>();
+  const paths: string[] = [];
   for (const file of manifest.files) {
     file.path = validateGameFilePath(file.path);
     file.key = validGameFileKey(file.key);
@@ -132,11 +153,11 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
     if (file.sha256 != null) file.sha256 = validateSha256(file.sha256);
     if (file.sizeBytes === 0 && file.sha256 !== EMPTY_SHA256) fail("Manifesto do jogo inválido.");
     const normalized = file.path.toLocaleLowerCase("en-US");
-    if (paths.has(normalized)) fail("Manifesto contém caminhos duplicados.");
-    paths.add(normalized);
+    paths.push(normalized);
     totalSizeBytes += file.sizeBytes;
   }
-  const objectIds = new Set(manifest.files.map(file => file.id.toLowerCase()));
+  const objectIds = new Set<string>();
+  for (const file of manifest.files) objectIds.add(file.id.toLowerCase());
   for (const bundle of manifest.bundles || []) {
     if (!bundle || typeof bundle !== "object") fail("Manifesto do jogo inválido.");
     bundle.key = validGameFileKey(bundle.key);
@@ -153,17 +174,12 @@ async function loadFolderManifest(c: AppContext, key: string): Promise<FolderMan
       if (!Number.isSafeInteger(member.sizeBytes) || member.sizeBytes < 0 || member.sizeBytes > MAX_BUNDLE_MEMBER_SIZE ||
           (member.sizeBytes === 0 && member.sha256 !== EMPTY_SHA256)) fail("Manifesto do jogo inválido.");
       const normalized = member.path.toLocaleLowerCase("en-US");
-      if (paths.has(normalized)) fail("Manifesto contém caminhos duplicados.");
-      paths.add(normalized);
+      paths.push(normalized);
       totalSizeBytes += member.sizeBytes;
     }
   }
-  for (const normalized of paths) {
-    const parts = normalized.split("/");
-    for (let index = 1; index < parts.length; index++) {
-      if (paths.has(parts.slice(0, index).join("/"))) fail("Manifesto contém conflito entre arquivo e pasta.");
-    }
-  }
+  validateSortedFolderPaths(paths, { duplicate: "Manifesto contém caminhos duplicados.",
+    conflict: "Manifesto contém conflito entre arquivo e pasta." });
   if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE || manifest.totalSizeBytes !== totalSizeBytes) fail("Tamanho do manifesto inválido.");
   const validated: FolderManifest = { version: manifest.version, files: manifest.files,
     ...(manifest.bundles ? { bundles: manifest.bundles } : {}), totalSizeBytes };
@@ -192,30 +208,64 @@ async function mapConcurrent<T, R>(items: T[], limit: number, mapper: (item: T, 
 }
 
 async function inspectFolderObjects(bucket: R2Bucket, gameId: string,
-  objects: { key: string; sizeBytes: number }[]): Promise<(R2Object | null)[]> {
-  // A few objects are cheaper to check directly. Older folder uploads can have
-  // thousands; R2's strongly consistent, paginated listing avoids one HEAD per file.
+  objects: { key: string; sizeBytes: number; etag?: string }[]): Promise<void> {
   if (objects.length <= 128) {
-    return mapConcurrent(objects, 6, file => file.sizeBytes === 0 ? Promise.resolve(null) : bucket.head(file.key));
+    await mapConcurrent(objects, 6, async expected => {
+      if (expected.sizeBytes === 0) return;
+      const object = await bucket.head(expected.key);
+      if (!object || object.size !== expected.sizeBytes || (expected.etag && expected.etag !== object.etag)) {
+        fail("Um ou mais arquivos enviados estão incompletos.", 409);
+      }
+      expected.etag = object.etag;
+    });
+    return;
   }
-  const remaining = new Set(objects.filter(file => file.sizeBytes > 0).map(file => file.key));
-  const found = new Map<string, R2Object>();
+  // Sort the caller-owned references and compare them to the ordered R2 listing.
+  // Keeping one array of R2Object results for every file can exceed Worker memory.
+  objects.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  let expectedIndex = 0;
+  while (expectedIndex < objects.length && objects[expectedIndex]!.sizeBytes === 0) expectedIndex++;
   let cursor: string | undefined;
-  for (let pageNumber = 0; remaining.size && pageNumber < 1000; pageNumber++) {
+  for (let pageNumber = 0; expectedIndex < objects.length && pageNumber < 1000; pageNumber++) {
     const page = await bucket.list({ prefix: `${gameId}/files/`, limit: 1000, ...(cursor ? { cursor } : {}) });
     for (const object of page.objects) {
-      if (remaining.delete(object.key)) found.set(object.key, object);
+      while (expectedIndex < objects.length && objects[expectedIndex]!.key < object.key) {
+        if (objects[expectedIndex]!.sizeBytes !== 0) fail("Um ou mais arquivos enviados estão incompletos.", 409);
+        expectedIndex++;
+      }
+      const expected = objects[expectedIndex];
+      if (expected?.key === object.key) {
+        if (expected.sizeBytes !== object.size || (expected.etag && expected.etag !== object.etag)) {
+          fail("Um ou mais arquivos enviados estão incompletos.", 409);
+        }
+        expected.etag = object.etag;
+        expectedIndex++;
+        while (expectedIndex < objects.length && objects[expectedIndex]!.sizeBytes === 0) expectedIndex++;
+      }
     }
     if (!page.truncated) break;
     if (!page.cursor || page.cursor === cursor) fail("Não foi possível concluir a conferência dos arquivos.", 409);
     cursor = page.cursor;
   }
-  return objects.map(file => file.sizeBytes === 0 ? null : found.get(file.key) || null);
+  while (expectedIndex < objects.length && objects[expectedIndex]!.sizeBytes === 0) expectedIndex++;
+  if (expectedIndex < objects.length) fail("Um ou mais arquivos enviados estão incompletos.", 409);
 }
 
 async function deletePackage(c: AppContext, packageType: "zip" | "folder", key: string) {
   if (!key || DRAFT_KEY_PATTERN.test(key)) return;
   if (packageType === "zip") return c.env.CUSTOM_GAMES.delete(key);
+  const sharded = await readShardedFolderIndex(c.env, key);
+  if (sharded) {
+    const keys = Object.values(sharded.objects).map(ref => ref.key);
+    const shared = await referencedGameFileKeys(c.env, keys, { excludingManifestKey: key });
+    const unique = keys.filter(member => !shared.has(member));
+    for (let index = 0; index < unique.length; index += 1000) await c.env.CUSTOM_GAMES.delete(unique.slice(index, index + 1000));
+    for (let index = 0; index < sharded.parts.length; index += 1000) {
+      await c.env.CUSTOM_GAMES.delete(sharded.parts.slice(index, index + 1000).map(part => part.key));
+    }
+    await c.env.CUSTOM_GAMES.delete(key);
+    return;
+  }
   const object = await c.env.CUSTOM_GAMES.get(key);
   if (!object) return;
   let manifest: FolderManifest | null = null;
@@ -331,6 +381,9 @@ export async function cleanupCustomGamePackages(env: AppBindings) {
       }
       const snapshot = { id: version.id, archive_key: version.archiveKey, package_type: version.packageType,
         archive_size: version.archiveSize, published: 1 };
+      if (version.packageType === "folder" && await readShardedFolderIndex(env, version.archiveKey)) {
+        return ensureShardedIntegrityBaseline(env, snapshot);
+      }
       // Keep the small integrity baseline after removing obsolete download objects.
       return Boolean(await getIntegrityManifest(c, snapshot, integrityDependencies));
     },
@@ -393,13 +446,19 @@ export async function readGameForm(c: AppContext, id: string, prior?: GameRow | 
         }
       }
     } else {
-      const manifest = await loadFolderManifest(c, archiveKey);
-      archiveSize = manifest.totalSizeBytes;
-      if (archiveKey !== prior?.archive_key) {
-        const objects = [...manifest.files, ...(manifest.bundles || [])];
-        const heads = await inspectFolderObjects(c.env.CUSTOM_GAMES, id, objects);
-        if (heads.some((head, index) => objects[index]!.sizeBytes > 0 && (!head || head.size !== objects[index]!.sizeBytes ||
-            (objects[index]!.etag && objects[index]!.etag !== head.etag)))) fail("Os arquivos deste pacote não estão mais disponíveis. Faça um novo envio.", 409);
+      const sharded = await readShardedFolderIndex(c.env, archiveKey);
+      if (sharded) {
+        archiveSize = sharded.totalSizeBytes;
+        // The v4 finalizer already checked every completed R2 object while
+        // creating its immutable parts. Avoid repeating hundreds of HEADs or
+        // listing the full game prefix while the admin saves the draft.
+      } else {
+        const manifest = await loadFolderManifest(c, archiveKey);
+        archiveSize = manifest.totalSizeBytes;
+        if (archiveKey !== prior?.archive_key) {
+          const objects = [...manifest.files, ...(manifest.bundles || [])];
+          await inspectFolderObjects(c.env.CUSTOM_GAMES, id, objects);
+        }
       }
     }
   } else if (published) fail("Envie o pacote do jogo antes de publicar.");
@@ -686,8 +745,8 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
 
   app.post("/panel-api/custom-games/upload/folder/complete", async c => {
     const admin = await requireAdminSession(c, { mutate: true });
-    const body = await c.req.json<{ gameId?: string; manifestId?: string; sessionId?: string; files?: { path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[];
-      bundles?: { key?: string; sizeBytes?: number; sha256?: string; files?: { path?: string; sizeBytes?: number; sha256?: string }[] }[] }>();
+    const body = await c.req.json<{ gameId?: string; manifestId?: string; sessionId?: string; files?: { id?: string; path?: string; key?: string; sizeBytes?: number; etag?: string; sha256?: string }[];
+      bundles?: { id?: string; key?: string; sizeBytes?: number; sha256?: string; etag?: string; files?: { path?: string; sizeBytes?: number; sha256?: string }[] }[] }>();
     const gameId = validGameId(body.gameId);
     const manifestId = String(body.manifestId || crypto.randomUUID());
     if (!GAME_ID_PATTERN.test(manifestId)) fail("Identificador do pacote inválido.");
@@ -696,71 +755,69 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (!Array.isArray(files) || !Array.isArray(bundles) || bundles.length > MAX_GAME_BUNDLES ||
         files.length + bundles.reduce((sum, bundle) => sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0) < 1 ||
         files.length + bundles.reduce((sum, bundle) => sum + (Array.isArray(bundle?.files) ? bundle.files.length : 0), 0) > MAX_GAME_FILES) fail("Quantidade de arquivos inválida.");
-    const paths = new Set<string>();
-    const objectKeys = new Set<string>();
+    const paths: string[] = [];
     let totalSizeBytes = 0;
-    const validated = files.map(file => {
+    for (const file of files) {
       const relativePath = validateGameFilePath(file.path);
       const key = validGameFileKey(file.key);
       if (!key.startsWith(`${gameId}/files/`)) fail("Arquivo pertence a outro jogo.");
-      if (objectKeys.has(key)) fail("A pasta contém um arquivo duplicado.");
-      objectKeys.add(key);
       const sizeBytes = Number(file.sizeBytes);
       if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || sizeBytes > MAX_GAME_FILE_SIZE) fail("Tamanho de arquivo inválido.");
       const sha256 = validateSha256(file.sha256);
       if (sizeBytes === 0 && sha256 !== EMPTY_SHA256) fail("Hash do arquivo vazio inválido.");
-      const normalized = relativePath.toLocaleLowerCase("en-US");
-      if (paths.has(normalized)) fail("A pasta contém caminhos duplicados.");
-      paths.add(normalized);
+      paths.push(relativePath.toLocaleLowerCase("en-US"));
       totalSizeBytes += sizeBytes;
-      return { id: key.slice(key.lastIndexOf("/") + 1), path: relativePath, key, sizeBytes, sha256 };
-    });
-    const validatedBundles = bundles.map(bundle => {
+      file.id = key.slice(key.lastIndexOf("/") + 1);
+      file.path = relativePath;
+      file.key = key;
+      file.sizeBytes = sizeBytes;
+      file.sha256 = sha256;
+    }
+    for (const bundle of bundles) {
       if (!bundle || typeof bundle !== "object") fail("Pacote de arquivos inválido.");
       const key = validGameFileKey(bundle.key);
-      if (!key.startsWith(`${gameId}/files/`) || objectKeys.has(key)) fail("Pacote duplicado ou de outro jogo.");
-      objectKeys.add(key);
+      if (!key.startsWith(`${gameId}/files/`)) fail("Pacote duplicado ou de outro jogo.");
       const sizeBytes = Number(bundle.sizeBytes);
       if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > MAX_NEW_BUNDLE_SIZE ||
           !Array.isArray(bundle.files) || bundle.files.length < 1 || bundle.files.length > 3000) fail("Pacote de arquivos inválido.");
-      const members = bundle.files.map(member => {
+      bundle.id = key.slice(-36);
+      bundle.key = key;
+      bundle.sizeBytes = sizeBytes;
+      bundle.sha256 = validateSha256(bundle.sha256);
+      for (const member of bundle.files) {
         const path = validateGameFilePath(member.path);
         const memberSize = Number(member.sizeBytes);
         const sha256 = validateSha256(member.sha256);
         if (!Number.isSafeInteger(memberSize) || memberSize < 0 || memberSize > MAX_BUNDLE_MEMBER_SIZE ||
             (memberSize === 0 && sha256 !== EMPTY_SHA256)) fail("Arquivo do pacote inválido.");
-        const normalized = path.toLocaleLowerCase("en-US");
-        if (paths.has(normalized)) fail("A pasta contém caminhos duplicados.");
-        paths.add(normalized);
+        paths.push(path.toLocaleLowerCase("en-US"));
+        member.path = path;
+        member.sizeBytes = memberSize;
+        member.sha256 = sha256;
         totalSizeBytes += memberSize;
-        return { path, sizeBytes: memberSize, sha256 };
-      });
-      return { id: key.slice(-36), key, sizeBytes, sha256: validateSha256(bundle.sha256), files: members };
-    });
-    for (const relativePath of paths) {
-      const parts = relativePath.split("/");
-      for (let index = 1; index < parts.length; index++) {
-        if (paths.has(parts.slice(0, index).join("/"))) fail("A pasta contém conflito entre arquivo e pasta.");
       }
     }
-    if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE) fail("A pasta precisa ter conteúdo e não pode ultrapassar 200 GiB.");
-    const objects = [...validated, ...validatedBundles];
-    const heads = await inspectFolderObjects(c.env.CUSTOM_GAMES, gameId, objects);
-    if (heads.some((head, index) => objects[index]!.sizeBytes !== 0 && (!head || head.size !== objects[index]!.sizeBytes))) {
-      fail("Um ou mais arquivos enviados estão incompletos.", 409);
+    validateSortedFolderPaths(paths, { duplicate: "A pasta contém caminhos duplicados.",
+      conflict: "A pasta contém conflito entre arquivo e pasta." });
+    const objects = [...files, ...bundles] as { key: string; sizeBytes: number; sha256?: string; etag?: string }[];
+    objects.sort((left, right) => left.key! < right.key! ? -1 : left.key! > right.key! ? 1 : 0);
+    for (let index = 1; index < objects.length; index++) {
+      if (objects[index - 1]!.key === objects[index]!.key) fail("A pasta contém um arquivo duplicado.");
     }
+    if (totalSizeBytes < 1 || totalSizeBytes > MAX_GAME_SIZE) fail("A pasta precisa ter conteúdo e não pode ultrapassar 200 GiB.");
+    await inspectFolderObjects(c.env.CUSTOM_GAMES, gameId, objects);
     const session = body.sessionId ? await beginGameUploadFinalization(c, body.sessionId,
       admin.session.admin_user_id, gameId, manifestId, objects) : null;
     const manifest: FolderManifest = {
       version: 3,
-      files: validated.map((file, index) => ({ ...file, etag: heads[index]?.etag })),
-      bundles: validatedBundles.map((bundle, index) => ({ ...bundle, etag: heads[validated.length + index]?.etag })),
+      files: files as FolderManifest["files"],
+      bundles: bundles as FolderManifest["bundles"],
       totalSizeBytes,
     };
     const key = `${gameId}/manifests/${manifestId}.json`;
-    await putImmutableFolderManifest(c.env, key, manifest);
+    await putImmutableFolderManifest(c.env, key, manifest, body.sessionId);
     if (session) await finishGameUploadFinalization(c, session, key);
-    return c.json({ success: true, key, sizeBytes: totalSizeBytes, fileCount: validated.length, packageType: "folder" }, 201);
+    return c.json({ success: true, key, sizeBytes: totalSizeBytes, fileCount: files.length, packageType: "folder" }, 201);
   });
 
   app.post("/panel-api/custom-games/upload/discard", async c => {
@@ -964,6 +1021,13 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     let game = await findGame(c, c.req.param("id"));
     if (game) game = await resolveGamePackage(c, game, license);
     if (!game || (!game.published && !c.req.query("downloadSessionId")) || (game.package_type || "zip") !== "folder") fail("Manifesto não encontrado.", 404);
+    const sharded = await readShardedFolderIndex(c.env, game.archive_key);
+    if (sharded) {
+      if (sharded.totalSizeBytes !== game.archive_size) fail("Manifesto não corresponde ao catálogo.", 409);
+      return new Response(streamShardedFolderManifest(c.env, sharded, game.id, game.archive_key), {
+        headers: { "content-type": "application/json; charset=UTF-8", "cache-control": "private, no-store" },
+      });
+    }
     const manifest = await loadFolderManifest(c, game.archive_key);
     if (manifest.totalSizeBytes !== game.archive_size) fail("Manifesto não corresponde ao catálogo.", 409);
     return c.json({ success: true, gameId: game.id, archiveKey: game.archive_key, totalSizeBytes: manifest.totalSizeBytes,
@@ -983,8 +1047,11 @@ export function registerCustomGamesRoutes(app: Hono<{ Bindings: AppBindings }>) 
     if (!game || (!game.published && !c.req.query("downloadSessionId")) || (game.package_type || "zip") !== "folder" || !/^[0-9a-f-]{36}$/i.test(fileId)) {
       fail("Arquivo não encontrado.", 404);
     }
-    const manifest = await loadFolderManifest(c, game.archive_key);
-    const file = [...manifest.files, ...(manifest.bundles || [])].find(entry => entry.id.toLowerCase() === fileId.toLowerCase());
+    const sharded = await readShardedFolderIndex(c.env, game.archive_key);
+    if (sharded && sharded.totalSizeBytes !== game.archive_size) fail("Manifesto não corresponde ao catálogo.", 409);
+    const oldManifest = sharded ? null : await loadFolderManifest(c, game.archive_key);
+    const file = sharded ? sharded.objects[fileId.toLowerCase()]
+      : [...oldManifest!.files, ...(oldManifest!.bundles || [])].find(entry => entry.id.toLowerCase() === fileId.toLowerCase());
     if (!file) fail("Arquivo não encontrado.", 404);
     const match = /^bytes=(\d+)-(\d+)$/.exec(c.req.header("range") || "");
     if (!match) return new Response(null, { status: 416, headers: { "content-range": `bytes */${file.sizeBytes}` } });
