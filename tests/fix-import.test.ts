@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { createHash } from 'node:crypto';
 import { Miniflare } from 'miniflare';
 import { readFileSync } from 'node:fs';
 import { Hono } from 'hono';
@@ -58,36 +57,26 @@ describe('fix import workflow with native D1 and R2',()=>{
     expect(jobs.find(job=>job.app_id==='10')?.tags).toEqual([]);
   });
 
-  test('the local queue keeps confirmed parts, protects finalization and publishes once',async()=>{
+  test('moves pending PC selections to the server queue after the old lease expires', async () => {
     await scan();
-    const post=(path:string,body:unknown)=>app.request('/panel-api/fix-import/'+path,{
-      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)
-    },env);
-    expect((await post('local/enqueue',{appIds:['20']})).status).toBe(200);
-    const {leaseToken}=await (await post('local/next',{})).json() as {leaseToken:string};
-    const archive=zip();
-    const metadata={leaseToken,bytes:archive.length,signature:Buffer.from(archive.subarray(0,8)).toString('hex'),
-      sha256:createHash('sha256').update(archive).digest('hex')};
-    expect((await post('local/20/downloaded',metadata)).status).toBe(200);
-    expect((await post('local/20/upload/start',{leaseToken})).status).toBe(200);
-    const part=await app.request('/panel-api/fix-import/local/20/upload/part',{
-      method:'POST',headers:{'X-Fix-Import-Lease':leaseToken,'X-Fix-Import-Part-Number':'1'},body:Buffer.from(archive)
-    },env);
-    expect(part.status).toBe(200);
-    const receipt=await part.json() as R2UploadedPart;
-    expect((await post('local/fail',{leaseToken,appId:'20'})).status).toBe(200);
-    await post('local/enqueue',{appIds:['20']});
-    await post('local/next',{leaseToken});
-    expect((await post('local/20/downloaded',metadata)).status).toBe(200);
-    expect(await (await post('local/20/upload/start',{leaseToken})).json()).toMatchObject({
-      parts:[{partNumber:1,etag:receipt.etag}]
-    });
-    await env.merlin_db.prepare("UPDATE fix_import_jobs SET phase='local_finalizing' WHERE app_id='20'").run();
-    expect(await (await post('reset',{appIds:['20']})).json()).toMatchObject({reset:0});
-    expect(await (await post('local/20/upload/complete',{leaseToken})).json()).toMatchObject({status:'migrated'});
-    expect((await readOverrides(env))['20']?.migrated).toBe(true);
-    expect((await env.MERLIN_FILES.list({prefix:'20/fixes/'})).objects).toHaveLength(1);
-  },15000);
+    await env.merlin_db.prepare("UPDATE fix_import_jobs SET status='queued',phase='local_queued' WHERE app_id IN ('10','20')").run();
+    await env.merlin_db.prepare("UPDATE fix_import_control SET lease_token='old-local-upload',lease_until=? WHERE id=1")
+      .bind(Date.now()+60_000).run();
+    const downloads = vi.fn(async (_input: RequestInfo | URL) => new Response(zip()));
+    vi.stubGlobal('fetch', downloads);
+    await processFixImportQueue(env);
+    expect(downloads).not.toHaveBeenCalled();
+    await env.merlin_db.prepare('UPDATE fix_import_control SET lease_until=0 WHERE id=1').run();
+    await processFixImportQueue(env);
+    expect(downloads.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(['/fixes/20.zip', '/fixes/10.zip']);
+    const entries = await readOverrides(env);
+    expect(entries['20']?.migrated).toBe(true);
+    expect(entries['10']?.migrated).toBe(true);
+    expect(entries['60']?.fixOverride?.file).toBe('60/fixes/manual.zip');
+    expect(await getFixImportDashboard(env)).toMatchObject({ summary: { queued: 0, processing: 0, migrated: 2 } });
+    const removedRoute = await app.request('/panel-api/fix-import/local/next', { method: 'POST' }, env);
+    expect(removedRoute.status).toBe(404);
+  }, 15000);
 
   test.each(['network','timeout','http','json','schema'])('catalog %s failure returns a useful upstream error, preserves jobs and releases the scan reservation',async failure=>{
     await scan();
