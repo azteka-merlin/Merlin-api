@@ -12,6 +12,7 @@ import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
+import { dispatchGameImageImport, getGameImageImportProgress } from "./lib/game-image-import";
 import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
@@ -4398,7 +4399,8 @@ app.post("/api/games/images/:appId", gameImageReportLimit, async (c) => {
 app.get("/panel-api/game-images/processing", async (c) => {
   await requireAdminSession(c);
   c.header("Cache-Control", "no-store");
-  return c.json(await listProcessingGameImages(c));
+  const [activity, bulkImport] = await Promise.all([listProcessingGameImages(c), getGameImageImportProgress(c.env).catch(() => null)]);
+  return c.json({ ...activity, bulkImport });
 });
 
 app.get("/panel-api/game-images", async (c) => {
@@ -4697,6 +4699,7 @@ export default {
     // notifications and all the previously disabled scheduled jobs off here.
     if (env.ENVIRONMENT === 'staging') return;
     const scheduledAt = new Date(controller.scheduledTime);
+    _ctx.waitUntil(dispatchGameImageImport(env).catch(() => console.error("[game-images] bulk-import-dispatch-failed")));
     _ctx.waitUntil(runPremiumNotificationCron(env,scheduledAt).catch(()=>console.error('[PremiumNotifications] dispatch-failed')));
     _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {
       console.error("[CustomGamesIntegrity] queue-dispatch-failed");

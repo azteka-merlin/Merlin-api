@@ -14,6 +14,7 @@ beforeAll(async () => {
     bundle: true, write: false, format: "esm", platform: "browser",
     stdin: { resolveDir: resolve("src/lib"), loader: "ts", contents: `
       import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, serveGameImage } from "./game-images";
+      import { dispatchGameImageImport, getGameImageImportProgress } from "./game-image-import";
       function context(request, env, ctx, appId) {
         return { env, executionCtx: ctx, req: { url: request.url, param() { return appId; } } };
       }
@@ -21,6 +22,10 @@ beforeAll(async () => {
         async fetch(request, env, ctx) {
           const [action, appId] = new URL(request.url).pathname.slice(1).split("/");
           if (action === "enqueue") return Response.json(await enqueueGameImage(env, appId, "launcher", await request.text()));
+          if (action === "dispatch-import") {
+            await dispatchGameImageImport(env);
+            return Response.json(await getGameImageImportProgress(env));
+          }
           if (action === "processing") return Response.json(await listProcessingGameImages(context(request, env, ctx)));
           if (action === "list") return Response.json(await listGameImages(env, appId, undefined, new URL(request.url).searchParams.get("appId") || undefined));
           return await serveGameImage(context(request, env, ctx, appId), request.method === "HEAD");
@@ -128,3 +133,25 @@ test("the processing view shows a live download independently of history and cle
   const data = await (await send("/processing")).json() as { rows: unknown[] };
   expect(data.rows).toEqual([]);
 }, 10000);
+
+test("bulk upload advances bounded R2 slices, counts existing assets and only uses Steam for imported images", async () => {
+  const bucket = await runtime.getR2Bucket("MERLIN_FILES");
+  const games = Array.from({ length: 61 }, (_, i) => ({ appId: String(200 + i) }));
+  const id = "synthetic-plan";
+  const key = "game-images/v1/staging/imports/";
+  await bucket.put(key + id + "/games.ndjson", games.map(game => JSON.stringify(game)).join("\n") + "\n");
+  await bucket.put(key + "current.json", JSON.stringify({
+    id, total: games.length, processed: 0, queued: 0, stored: 0, pending: 0,
+    offset: 0, leaseUntil: 0, status: "running", updatedAt: new Date().toISOString(),
+  }));
+  for (const game of games.slice(0, 60)) await bucket.put("game-images/v1/staging/header/" + game.appId, jpeg);
+  const first = await send("/dispatch-import", { method: "POST" });
+  expect(first.status).toBe(200);
+  expect(await first.json()).toMatchObject({ status: "running", processed: 60, stored: 60, queued: 0 });
+  const second = await send("/dispatch-import", { method: "POST" });
+  expect(second.status).toBe(200);
+  expect(await second.json()).toMatchObject({ status: "completed", processed: 61, stored: 60, queued: 1 });
+  await waitForJob("260", "missing");
+  expect(requests.some(url => url.includes("/260/header.jpg"))).toBe(true);
+  expect(requests.some(url => url.includes("generator.ryuu.lol/files/images/260.jpg"))).toBe(false);
+}, 12000);

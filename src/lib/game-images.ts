@@ -1,7 +1,7 @@
 import type { AppBindings, AppContext } from "../types";
 
 export type GameImageMessage = { appId: string; generation: string };
-type Trigger = "catalog" | "launcher" | "activation" | "admin";
+type Trigger = "catalog" | "launcher" | "activation" | "admin" | "import";
 type JobStatus = "queued" | "processing" | "stored" | "missing" | "failed";
 type AssetRow = { appId: string; status: "stored"; size: number; origin: string; trigger: string; updatedAt: string };
 type JobRow = Pick<Job, "appId" | "status" | "trigger" | "updatedAt" | "attempts" | "error">;
@@ -102,7 +102,7 @@ export async function enqueueGameImage(
     const newSource = gameImageSource(appId, source);
     const previousAge = Date.now() - Date.parse(previous.updatedAt);
     const cooldown = previous.status === "missing" ? 24 * 60 * 60 * 1000 : 10 * 60 * 1000;
-    if (trigger !== "admin" && (previous.status === "missing" || previous.status === "failed") &&
+    if (trigger !== "admin" && trigger !== "import" && (previous.status === "missing" || previous.status === "failed") &&
       previousAge < cooldown && (!newSource || newSource === previous.sourceUrl)) return "cooldown";
   }
 
@@ -191,7 +191,7 @@ async function readImage(response: Response) {
   return detectedImageType(bytes) === type ? { bytes, type } : null;
 }
 
-async function downloadGameImage(appId: string, sourceUrl: string) {
+async function downloadGameImage(appId: string, sourceUrl: string, steamOnly: boolean) {
   const steam = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/" + appId + "/header.jpg";
   const ryuu = "https://generator.ryuu.lol/files/images/" + appId + ".jpg";
   const tried = new Set<string>();
@@ -217,14 +217,15 @@ async function downloadGameImage(appId: string, sourceUrl: string) {
     return null;
   }
 
-  let image = await download(sourceUrl) || await download(steam);
+  const directUrl = steamOnly && sourceUrl.startsWith("https://generator.ryuu.lol/") ? "" : sourceUrl;
+  let image = await download(directUrl) || await download(steam);
   if (image) return image;
   try {
     image = await download(await resolveSteamGameImage(appId));
   } catch {
     transientFailure = true;
   }
-  image ||= await download(ryuu);
+  if (!steamOnly) image ||= await download(ryuu);
   if (image) return image;
   if (transientFailure) throw new Error("source_unavailable");
   return null;
@@ -253,7 +254,7 @@ async function processImageMessage(message: Message<GameImageMessage>, env: AppB
     try {
       const key = imageKey(env, appId);
       if (!(await env.MERLIN_FILES.head(key))) {
-        const found = await downloadGameImage(appId, job.sourceUrl);
+        const found = await downloadGameImage(appId, job.sourceUrl, job.trigger === "import");
         if (!found) status = "missing";
         else await env.MERLIN_FILES.put(key, found.bytes, {
           onlyIf: new Headers({ "If-None-Match": "*" }),
