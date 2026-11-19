@@ -1,6 +1,7 @@
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import type { AppContext } from "../types";
+import { gameImagePath, validImageAppId } from "./game-images";
 
 const interestSchema = z.object({
   email: z.string().trim().email().max(254),
@@ -44,8 +45,9 @@ export async function listPremiumWishes(c: AppContext, licenseId: number) {
     g.coming_soon AS comingSoon,w.email,w.phone,w.created_at AS createdAt
     FROM premium_wishlist w JOIN premium_games g ON g.app_id=w.app_id
     WHERE w.license_id=? AND w.removed_at IS NULL ORDER BY w.created_at DESC,w.id DESC`)
-    .bind(licenseId).all();
-  return result.results || [];
+    .bind(licenseId).all<{ appId: string }>();
+  return (result.results || []).map(wish => c.env.GAME_IMAGE_QUEUE && validImageAppId(wish.appId)
+    ? { ...wish, sharedCoverUrl: gameImagePath(wish.appId) } : wish);
 }
 
 /** Administrative view is deliberately separate from the customer's view. */

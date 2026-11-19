@@ -2,6 +2,7 @@ import { getHubcapCircuitStatus } from "./lib/hubcap-quota";
 export { MerlinStatus } from "./lib/service-status";
 import { fromHono } from "chanfana";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { adminIpGuard } from "./lib/admin-ip-guard";
 import { getCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
@@ -11,10 +12,11 @@ import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
+import { consumeGameImages, enqueueGameImage, listGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
-import { getCommunityVoting, postCommunityVote, removeCommunityVote } from "./lib/community-voting";
+import { communityVotingImage, getCommunityVoting, postCommunityVote, removeCommunityVote } from "./lib/community-voting";
 import { HealthRoute } from "./endpoints/health";
 import { LoginRoute } from "./endpoints/login";
 import { ManifestsRoute } from "./endpoints/manifests";
@@ -183,7 +185,7 @@ import {
 import { listBlockedIps, unblockBlockedIp } from "./lib/admin-blocked-ip-service";
 import { listUserActivityLogs, writeUserActivityLog } from "./lib/user-activity-service";
 import { getUsageAnalytics } from "./lib/usage-analytics";
-import { enforceLoginRateLimit, enforceManifestsRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
+import { enforceGameImageReportRateLimit, enforceLoginRateLimit, enforceManifestsRateLimit, enforcePublicAccessCredentialsRateLimit, enforcePublicAccessKeyRateLimit } from "./lib/rate-limit";
 import { assertRecentPublicEmailVerification } from "./lib/email-verification";
 import { getLauncherProfile, startLauncherProfileEmailChange, updateLauncherProfile } from "./lib/launcher-profile";
 import { setCheckoutProof } from "./lib/checkout-proof";
@@ -327,7 +329,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games", "/custom-game-indexing"] as const;
+const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games", "/custom-game-indexing", "/game-images"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -1626,14 +1628,29 @@ app.post("/panel-api/community-voting/reset", async (c) => {
   return c.json({ success: true, removedVotes, removedNetworkClaims }, 200);
 });
 
+const userActivityQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(250).optional(),
+  action: z.string().trim().max(80).optional(),
+  status: z.string().trim().max(20).optional(),
+  search: z.string().trim().max(160).optional(),
+  from: z.iso.datetime({ precision: 3 }).optional(),
+  to: z.iso.datetime({ precision: 3 }).optional(),
+  beforeAt: z.iso.datetime({ precision: 3 }).optional(),
+  beforeId: z.coerce.number().int().positive().optional(),
+}).superRefine(({ from, to, beforeAt, beforeId }, ctx) => {
+  if (Boolean(from) !== Boolean(to) || (from && to &&
+      (from >= to || Date.parse(to) - Date.parse(from) > 7 * 24 * 60 * 60 * 1000))) {
+    ctx.addIssue({ code: "custom", path: ["to"], message: "Selecione um período de até sete dias." });
+  }
+  if (Boolean(beforeAt) !== Boolean(beforeId)) {
+    ctx.addIssue({ code: "custom", path: ["beforeId"], message: "Cursor de paginação inválido." });
+  }
+});
+
 app.get("/panel-api/user-activity", async (c) => {
   await requireAdminSession(c);
-  const limit = Number(c.req.query("limit") || "100");
-  const action = c.req.query("action")?.trim() || undefined;
-  const status = c.req.query("status")?.trim() || undefined;
-  const search = c.req.query("search")?.trim() || undefined;
-  const logs = await listUserActivityLogs(c, { limit, action, status, search });
-  return c.json({ logs }, 200);
+  const query = parseBody(userActivityQuery, c.req.query());
+  return c.json(await listUserActivityLogs(c, query));
 });
 app.get("/panel-api/usage-analytics", async (c) => {
   await requireAdminSession(c);
@@ -4335,6 +4352,62 @@ app.get('/api/games/catalog-cache',async c=>{
 });
 openapi.get("/api/version", VersionRoute);
 openapi.post("/api/games/search", GamesSearchRoute);
+const gameImageReportLimit = bodyLimit({ maxSize: 2048 });
+const gameImageReportSchema = z.object({ sourceUrl: z.string().max(600).optional() });
+const gameImageAppIdSchema = z.string().refine(validImageAppId, "AppID inválido.");
+const gameImagesPanelQuery = z.object({
+  view: z.enum(["queue", "assets"]).default("queue"),
+  cursor: z.string().max(4096).optional(),
+  appId: gameImageAppIdSchema.optional(),
+});
+
+app.get("/api/public/game-images/:appId", (c) => serveGameImage(c, c.req.raw.method === "HEAD"));
+
+app.post("/api/public/game-images/:appId", gameImageReportLimit, async (c) => {
+  const appId = parseBody(gameImageAppIdSchema, c.req.param("appId"));
+  if (!c.env.GAME_IMAGE_QUEUE) return c.body(null, 503);
+  if (c.req.header("sec-fetch-site") === "cross-site") return c.body(null, 403);
+  await enforceGameImageReportRateLimit(c, "");
+  const body = parseBody(gameImageReportSchema, await c.req.json());
+  c.executionCtx.waitUntil((async () => {
+    const votingImage = communityVotingImage(appId);
+    if (votingImage) {
+      await enqueueGameImage(c.env, appId, "catalog", body.sourceUrl || votingImage);
+      return;
+    }
+    const game = await c.env.merlin_db.prepare(`
+      SELECT cover_url FROM catalog_games WHERE app_id = ?
+      UNION ALL SELECT cover_url FROM premium_games WHERE app_id = ? AND enabled = 1
+      LIMIT 1
+    `).bind(appId, appId).first<{ cover_url: string | null }>();
+    if (game) await enqueueGameImage(c.env, appId, "catalog", body.sourceUrl || game.cover_url);
+  })().catch(() => console.warn("[game-images] catalog-report-failed", { appId })));
+  return c.body(null, 202);
+});
+
+app.post("/api/games/images/:appId", gameImageReportLimit, async (c) => {
+  const license = await requireLauncherLicense(c);
+  const appId = parseBody(gameImageAppIdSchema, c.req.param("appId"));
+  if (!c.env.GAME_IMAGE_QUEUE) return c.body(null, 503);
+  await enforceGameImageReportRateLimit(c, "license:" + license.id);
+  const body = parseBody(gameImageReportSchema, await c.req.json());
+  queueGameImageInBackground(c, appId, "launcher", body.sourceUrl);
+  return c.body(null, 202);
+});
+
+app.get("/panel-api/game-images", async (c) => {
+  await requireAdminSession(c);
+  const { view, cursor, appId } = parseBody(gameImagesPanelQuery, c.req.query());
+  c.header("Cache-Control", "no-store");
+  return c.json(await listGameImages(c.env, view, cursor, appId));
+});
+
+app.post("/panel-api/game-images/:appId", async (c) => {
+  await requireAdminSession(c, { mutate: true });
+  const appId = parseBody(gameImageAppIdSchema, c.req.param("appId"));
+  return c.json({ status: await enqueueGameImage(c.env, appId, "admin") });
+});
+
 openapi.get("/api/public/catalog", PublicCatalogRoute);
 openapi.get("/api/public/catalog/:appId/cover", PublicCatalogCoverRoute);
 openapi.post("/api/public/catalog/consult", PublicCatalogConsultRoute);
@@ -4605,8 +4678,12 @@ app.notFound((c) => {
 
 export default {
   fetch: app.fetch,
-  async queue(batch: MessageBatch<IntegrityQueueMessage>, env: AppBindings, _ctx: ExecutionContext) {
-    await consumeCustomGameIndexQueue(batch, env);
+  async queue(batch: MessageBatch<IntegrityQueueMessage | GameImageMessage>, env: AppBindings, _ctx: ExecutionContext) {
+    if (batch.queue === "merlin-game-images" || batch.queue === "merlin-game-images-staging") {
+      await consumeGameImages(batch as MessageBatch<GameImageMessage>, env);
+      return;
+    }
+    await consumeCustomGameIndexQueue(batch as MessageBatch<IntegrityQueueMessage>, env);
   },
   async scheduled(controller: ScheduledController, env: AppBindings, _ctx: ExecutionContext) {
     _ctx.waitUntil(processFixImportQueue(env).catch(() => console.error('[FixImport] processing-failed')));

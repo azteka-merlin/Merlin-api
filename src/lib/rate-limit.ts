@@ -73,6 +73,12 @@ export async function enforceLoginRateLimit(c: AppContext, input: LoginRateLimit
 	}
 }
 
+export async function enforceGameImageReportRateLimit(c: AppContext, key: string) {
+	const env = c.env as typeof c.env & RateLimitBindings;
+	const client = key || getClientIp(c);
+	if (client) await enforceLimit(env.MANIFESTS_RATE_LIMITER, `game-images:${client}`, PUBLIC_ACCESS_LIMIT_MESSAGE, "game-images");
+}
+
 export async function enforceManifestsRateLimit(c: AppContext, licenseId: number) {
 	const env = c.env as typeof c.env & RateLimitBindings;
 	await enforceLimit(

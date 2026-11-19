@@ -2,6 +2,7 @@ import { OpenAPIRoute } from "chanfana";
 import { z } from "zod";
 import type { AppBindings, AppContext } from "../types";
 import { searchGamesForCatalog } from "./games-search";
+import { gameImagePath, validImageAppId } from "../lib/game-images";
 import { readOverrides } from "../lib/overrides";
 
 const CatalogQuery = z.object({
@@ -334,6 +335,7 @@ export class PublicCatalogRoute extends OpenAPIRoute {
       games: items.slice(0, limit).map((game) => ({
         appId: game.app_id,
         name: game.name,
+        ...(c.env.GAME_IMAGE_QUEUE && validImageAppId(game.app_id) ? { sharedCoverUrl: gameImagePath(game.app_id) } : {}),
         coverUrl: game.cover_url || `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${encodeURIComponent(game.app_id)}/header.jpg`,
         fallbackCoverUrls: [
           `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${encodeURIComponent(game.app_id)}/header.jpg`,

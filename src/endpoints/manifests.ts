@@ -1,5 +1,6 @@
 import { OpenAPIRoute } from "chanfana";
 import { HTTPException } from "hono/http-exception";
+import { queueGameImageInBackground } from "../lib/game-images";
 import { hubcapQuotaAllows } from "../lib/hubcap-quota";
 import { assertNormalActivationLimit, TEST_LICENSE_NORMAL_LIMIT_CODE } from "../lib/license-activation-limits";
 import { requireLauncherLicense } from "../lib/launcher-auth";
@@ -425,6 +426,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				metadata: { source: "r2-override" },
 			});
 			logSelectedManifestSource(appId, "r2-override");
+			queueGameImageInBackground(c, appId, "activation");
 			return buildZipResponse(override.bytes, appId, "r2-override");
 		}
 
@@ -452,6 +454,7 @@ export class ManifestsRoute extends OpenAPIRoute {
 				metadata: { source: source.name },
 			});
 			logSelectedManifestSource(appId, source.name);
+			queueGameImageInBackground(c, appId, "activation");
 
 			return buildZipResponse(observeManifestStream(c, response.body, appId, source.name === "ryu"), appId, source.name);
 		}

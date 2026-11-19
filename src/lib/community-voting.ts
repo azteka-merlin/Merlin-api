@@ -1,13 +1,18 @@
 import { getCookie, setCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import votingGames from "../data/community-voting-games.json";
+import { gameImagePath } from "./game-images";
 import type { AppContext } from "../types";
 
 const COOKIE_NAME = "merlin_community_voter";
 const COOKIE_AGE = 365 * 24 * 60 * 60;
 const DAILY_LIMIT = 3;
 const IP_DAILY_LIMIT = 3;
-const allowedAppIds = new Set(votingGames.map((game) => game.appid));
+const gamesByAppId = new Map(votingGames.map(game => [game.appid, game]));
+
+export function communityVotingImage(appId: string): string | undefined {
+  return gamesByAppId.get(appId)?.image;
+}
 const encoder = new TextEncoder();
 
 type VoteCount = { app_id: string; votes: number };
@@ -101,6 +106,7 @@ export async function getCommunityVoting(c: AppContext) {
   return c.json({
     games: votingGames.filter((game) => !premium.has(game.appid)).map((game) => ({
       ...game, votes: voteCounts.get(game.appid) || 0, voted: votedIds.has(game.appid),
+      ...(c.env.GAME_IMAGE_QUEUE ? { sharedCoverUrl: gameImagePath(game.appid) } : {}),
     })),
     remainingToday: Math.max(0, DAILY_LIMIT - votedIds.size),
     ipRemainingToday: ipLocked ? 0 : Math.max(0, IP_DAILY_LIMIT - (networkVotes?.value || 0)),
@@ -115,7 +121,7 @@ export async function postCommunityVote(c: AppContext) {
   assertVoteRequest(c);
   const body = await c.req.json().catch(() => null) as { appid?: unknown } | null;
   const appid = String(body?.appid || "");
-  if (!allowedAppIds.has(appid)) throw new HTTPException(400, { message: "Jogo inválido." });
+  if (!gamesByAppId.has(appid)) throw new HTTPException(400, { message: "Jogo inválido." });
   const premium = await premiumAppIds(c);
   if (premium.has(appid)) throw new HTTPException(409, { message: "Este jogo já está no Premium." });
   const [hash, networkHash] = await Promise.all([voterHash(c), ipHash(c)]);
@@ -170,7 +176,7 @@ export async function removeCommunityVote(c: AppContext) {
   assertVoteRequest(c);
   const body = await c.req.json().catch(() => null) as { appid?: unknown } | null;
   const appid = String(body?.appid || "");
-  if (!allowedAppIds.has(appid)) throw new HTTPException(400, { message: "Jogo inválido." });
+  if (!gamesByAppId.has(appid)) throw new HTTPException(400, { message: "Jogo inválido." });
   const [hash, networkHash] = await Promise.all([voterHash(c), ipHash(c)]);
   const day = voteDay();
   const result = await c.env.merlin_db.prepare(`

@@ -47,6 +47,7 @@ function parseMetadata(metadataJson: string | null) {
 }
 
 export function mapUserActivityLog(record: UserActivityLogRecord) {
+  const metadata = parseMetadata(record.metadata_json);
   return {
     id: record.id,
     licenseId: record.license_id,
@@ -59,12 +60,19 @@ export function mapUserActivityLog(record: UserActivityLogRecord) {
     ipAddress: record.ip_address,
     hwid: record.hwid,
     reason: record.reason,
-    metadata: parseMetadata(record.metadata_json),
+    metadata,
+    launcherVersion: normalizeLauncherVersion(metadata?.launcherVersion),
     createdAt: record.created_at,
   };
 }
 
+function normalizeLauncherVersion(value: unknown): string | null {
+  return typeof value === "string" && value.length <= 64 && /^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(value) ? value : null;
+}
+
 export async function writeUserActivityLog(c: AppContext, input: UserActivityInput) {
+  const launcherVersion = normalizeLauncherVersion(c.req.header("X-Merlin-Version"));
+  const metadata = launcherVersion ? { ...input.metadata, launcherVersion } : input.metadata;
   await c.env.merlin_db
     .prepare(
       `
@@ -96,7 +104,7 @@ export async function writeUserActivityLog(c: AppContext, input: UserActivityInp
       input.ipAddress ?? null,
       input.hwid ?? null,
       input.reason ?? null,
-      input.metadata ? JSON.stringify(input.metadata) : null,
+      metadata ? JSON.stringify(metadata) : null,
       new Date().toISOString(),
     )
     .run();
@@ -104,12 +112,23 @@ export async function writeUserActivityLog(c: AppContext, input: UserActivityInp
 
 export async function listUserActivityLogs(
   c: AppContext,
-  input: { limit?: number; action?: string; status?: string; search?: string } = {},
+  input: {
+    limit?: number; action?: string; status?: string; search?: string;
+    from?: string; to?: string; beforeAt?: string; beforeId?: number;
+  } = {},
 ) {
   const limit = Math.min(Math.max(input.limit ?? 100, 1), 250);
   const conditions: string[] = [];
   const bindings: Array<string | number> = [];
 
+  if (input.from && input.to) {
+    conditions.push("created_at >= ? AND created_at < ?");
+    bindings.push(input.from, input.to);
+  }
+  if (input.beforeAt && input.beforeId) {
+    conditions.push("(created_at, id) < (?, ?)");
+    bindings.push(input.beforeAt, input.beforeId);
+  }
   if (input.action) {
     conditions.push("action = ?");
     bindings.push(input.action);
@@ -148,6 +167,11 @@ export async function listUserActivityLogs(
     LIMIT ?
   `;
 
-  const result = await c.env.merlin_db.prepare(query).bind(...bindings, limit).all<UserActivityLogRecord>();
-  return result.results.map(mapUserActivityLog);
+  const result = await c.env.merlin_db.prepare(query).bind(...bindings, limit + 1).all<UserActivityLogRecord>();
+  const rows = result.results.slice(0, limit);
+  const last = rows.at(-1);
+  return {
+    logs: rows.map(mapUserActivityLog),
+    nextCursor: last && result.results.length > limit ? { beforeAt: last.created_at, beforeId: last.id } : null,
+  };
 }

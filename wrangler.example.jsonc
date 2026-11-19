@@ -54,6 +54,7 @@
 			"/login",
 			"/licenses",
 			"/activity",
+			"/game-images",
 			"/audit",
 			"/overrides",
 			"/premium",
@@ -116,7 +117,8 @@
 	],
 	"queues": {
 		"producers": [
-			{ "binding": "CUSTOM_GAME_INDEX_QUEUE", "queue": "merlin-game-integrity" }
+			{ "binding": "CUSTOM_GAME_INDEX_QUEUE", "queue": "merlin-game-integrity" },
+			{ "binding": "GAME_IMAGE_QUEUE", "queue": "merlin-game-images" }
 		],
 		"consumers": [
 			{
@@ -126,6 +128,13 @@
 				"max_concurrency": 2,
 				"max_retries": 3,
 				"dead_letter_queue": "merlin-game-integrity-dead"
+			},
+			{
+				"queue": "merlin-game-images",
+				"max_batch_size": 2,
+				"max_batch_timeout": 2,
+				"max_concurrency": 2,
+				"max_retries": 3
 			}
 		]
 	},
@@ -222,6 +231,7 @@
 					"/login",
 					"/licenses",
 					"/activity",
+					"/game-images",
 					"/audit",
 					"/overrides",
 					"/premium",
