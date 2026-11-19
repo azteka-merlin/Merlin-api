@@ -43,6 +43,10 @@ function jobKey(env: AppBindings, appId: string): string {
   return prefix(env) + "jobs/" + appId;
 }
 
+function processingPrefix(env: AppBindings): string {
+  return prefix(env) + "processing/";
+}
+
 export function gameImageSource(appId: string, value: unknown): string {
   if (typeof value !== "string" || value.length > 600 || !validImageAppId(appId)) return "";
   try {
@@ -239,26 +243,34 @@ async function processImageMessage(message: Message<GameImageMessage>, env: AppB
   const processing: Job = { ...job, status: "processing", updatedAt: new Date().toISOString(), attempts: message.attempts, error: "" };
   const lease = await putJob(env, processing, row);
   if (!lease) return message.retry({ delaySeconds: LEASE_SECONDS });
-  let status: JobStatus = "stored";
-  let error = "";
+  // Each delivery owns its marker. A late retry cannot clear a newer attempt.
+  const marker = processingPrefix(env) + appId + "/" + lease.etag;
+  await env.MERLIN_FILES.put(marker, "", { customMetadata: { appId, lease: lease.etag } })
+    .catch(() => console.warn("[game-images] processing-marker-write-failed", { appId }));
   try {
-    const key = imageKey(env, appId);
-    if (!(await env.MERLIN_FILES.head(key))) {
-      const found = await downloadGameImage(appId, job.sourceUrl);
-      if (!found) status = "missing";
-      else await env.MERLIN_FILES.put(key, found.bytes, {
-        onlyIf: new Headers({ "If-None-Match": "*" }),
-        httpMetadata: { contentType: found.type },
-        customMetadata: { appId, origin: found.origin, trigger: job.trigger },
-      });
+    let status: JobStatus = "stored";
+    let error = "";
+    try {
+      const key = imageKey(env, appId);
+      if (!(await env.MERLIN_FILES.head(key))) {
+        const found = await downloadGameImage(appId, job.sourceUrl);
+        if (!found) status = "missing";
+        else await env.MERLIN_FILES.put(key, found.bytes, {
+          onlyIf: new Headers({ "If-None-Match": "*" }),
+          httpMetadata: { contentType: found.type },
+          customMetadata: { appId, origin: found.origin, trigger: job.trigger },
+        });
+      }
+    } catch {
+      status = message.attempts < MAX_ATTEMPTS ? "queued" : "failed";
+      error = "download_failed";
     }
-  } catch {
-    status = message.attempts < MAX_ATTEMPTS ? "queued" : "failed";
-    error = "download_failed";
+    await putJob(env, { ...processing, status, updatedAt: new Date().toISOString(), error }, lease);
+    if (status === "queued") message.retry({ delaySeconds: 30 * message.attempts });
+    else message.ack();
+  } finally {
+    await env.MERLIN_FILES.delete(marker).catch(() => {});
   }
-  await putJob(env, { ...processing, status, updatedAt: new Date().toISOString(), error }, lease);
-  if (status === "queued") message.retry({ delaySeconds: 30 * message.attempts });
-  else message.ack();
 }
 
 export async function consumeGameImages(batch: MessageBatch<GameImageMessage>, env: AppBindings) {
@@ -316,13 +328,67 @@ export async function serveGameImage(c: AppContext, headOnly: boolean) {
   }
 }
 
+function readQueueMetrics(env: AppBindings) {
+  return env.GAME_IMAGE_QUEUE?.metrics().catch(() => null) ?? null;
+}
+
+export async function listProcessingGameImages(c: AppContext) {
+  const { env } = c;
+  const [page, metrics] = await Promise.all([
+    env.MERLIN_FILES.list({ prefix: processingPrefix(env), limit: 64, include: ["customMetadata"] }),
+    readQueueMetrics(env),
+  ]);
+  const now = Date.now();
+  const obsolete: string[] = [];
+  const jobs = (await Promise.all(page.objects.map(async (marker) => {
+    const { appId, lease } = marker.customMetadata ?? {};
+    if (!appId || !validImageAppId(appId) || !lease || now - marker.uploaded.getTime() >= LEASE_SECONDS * 1000) {
+      obsolete.push(marker.key);
+      return null;
+    }
+    const object = await env.MERLIN_FILES.head(jobKey(env, appId));
+    const job = readJob(object);
+    if (!job || job.status !== "processing" || object?.etag !== lease || inactiveJob(job, now)) {
+      obsolete.push(marker.key);
+      return null;
+    }
+    return job;
+  }))).filter(job => job !== null);
+  if (obsolete.length) c.executionCtx.waitUntil(env.MERLIN_FILES.delete(obsolete).catch(() => {}));
+
+  const names = new Map<string, string>();
+  if (jobs.length) {
+    const ids = jobs.map(job => job.appId);
+    const catalog = await env.merlin_db.prepare(`
+      SELECT requested.value AS app_id, COALESCE(
+        (SELECT name FROM games_catalog WHERE games_catalog.app_id = requested.value),
+        (SELECT name FROM catalog_games WHERE catalog_games.app_id = requested.value)
+      ) AS name
+      FROM json_each(?) requested
+    `).bind(JSON.stringify(ids)).all<{ app_id: string; name: string | null }>()
+      .catch(() => null);
+    for (const row of catalog?.results ?? []) {
+      if (row.name) names.set(row.app_id, row.name);
+    }
+  }
+  return {
+    enabled: Boolean(env.GAME_IMAGE_QUEUE),
+    backlog: metrics?.backlogCount ?? null,
+    oldestAt: metrics?.oldestMessageTimestamp ?? null,
+    rows: jobs.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).map(job => ({
+      appId: job.appId, name: names.get(job.appId) ?? null, trigger: job.trigger,
+      startedAt: job.updatedAt, attempts: job.attempts,
+    })),
+  };
+}
+
 export async function listGameImages(env: AppBindings, view: "queue" | "assets", cursor?: string, appId?: string) {
   const objectPrefix = prefix(env) + (view === "assets" ? "header/" : "jobs/");
   const [page, metrics] = await Promise.all([
     appId
       ? env.MERLIN_FILES.head(objectPrefix + appId).then(object => ({ objects: object ? [object] : [], truncated: false as const }))
       : env.MERLIN_FILES.list({ prefix: objectPrefix, cursor, limit: 40, include: ["customMetadata"] }),
-    env.GAME_IMAGE_QUEUE?.metrics().catch(() => null) ?? null,
+    readQueueMetrics(env),
   ]);
   return {
     enabled: Boolean(env.GAME_IMAGE_QUEUE),

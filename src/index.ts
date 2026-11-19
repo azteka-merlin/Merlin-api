@@ -12,7 +12,7 @@ import { FixesDownloadRoute } from "./endpoints/fixes-download";
 import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
-import { consumeGameImages, enqueueGameImage, listGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
+import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
@@ -4393,6 +4393,12 @@ app.post("/api/games/images/:appId", gameImageReportLimit, async (c) => {
   const body = parseBody(gameImageReportSchema, await c.req.json());
   queueGameImageInBackground(c, appId, "launcher", body.sourceUrl);
   return c.body(null, 202);
+});
+
+app.get("/panel-api/game-images/processing", async (c) => {
+  await requireAdminSession(c);
+  c.header("Cache-Control", "no-store");
+  return c.json(await listProcessingGameImages(c));
 });
 
 app.get("/panel-api/game-images", async (c) => {

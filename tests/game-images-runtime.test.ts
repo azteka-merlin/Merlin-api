@@ -7,12 +7,13 @@ import { gameImageSource } from "../src/lib/game-images";
 let runtime: Miniflare;
 const requests: string[] = [];
 const jpeg = new Uint8Array([255, 216, 255, 217]);
+let releaseSlowImage: (() => void) | undefined;
 
 beforeAll(async () => {
   const bundle = await build({
     bundle: true, write: false, format: "esm", platform: "browser",
     stdin: { resolveDir: resolve("src/lib"), loader: "ts", contents: `
-      import { consumeGameImages, enqueueGameImage, listGameImages, serveGameImage } from "./game-images";
+      import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, serveGameImage } from "./game-images";
       function context(request, env, ctx, appId) {
         return { env, executionCtx: ctx, req: { url: request.url, param() { return appId; } } };
       }
@@ -20,6 +21,7 @@ beforeAll(async () => {
         async fetch(request, env, ctx) {
           const [action, appId] = new URL(request.url).pathname.slice(1).split("/");
           if (action === "enqueue") return Response.json(await enqueueGameImage(env, appId, "launcher", await request.text()));
+          if (action === "processing") return Response.json(await listProcessingGameImages(context(request, env, ctx)));
           if (action === "list") return Response.json(await listGameImages(env, appId, undefined, new URL(request.url).searchParams.get("appId") || undefined));
           return await serveGameImage(context(request, env, ctx, appId), request.method === "HEAD");
         },
@@ -29,18 +31,26 @@ beforeAll(async () => {
   });
   runtime = new Miniflare({
     modules: true, script: bundle.outputFiles[0]!.text, compatibilityDate: "2026-06-20",
-    bindings: { ENVIRONMENT: "staging" }, r2Buckets: ["MERLIN_FILES"],
+    bindings: { ENVIRONMENT: "staging" }, r2Buckets: ["MERLIN_FILES"], d1Databases: ["merlin_db"],
     queueProducers: { GAME_IMAGE_QUEUE: "merlin-game-images-staging" },
     queueConsumers: { "merlin-game-images-staging": { maxBatchSize: 1, maxBatchTimeout: 0 } },
-    outboundService: request => {
+    outboundService: async request => {
       requests.push(request.url);
       const url = new URL(request.url);
+      if (url.pathname.endsWith("/30/header.jpg")) {
+        await new Promise<void>(resolve => { releaseSlowImage = resolve; });
+        return new EdgeResponse(jpeg, { headers: { "Content-Type": "image/jpeg" } });
+      }
       if (url.pathname.endsWith("/10/header.jpg")) return new EdgeResponse(jpeg, { headers: { "Content-Type": "image/jpeg" } });
       if (url.pathname.endsWith("/20/header.jpg")) return new EdgeResponse("HTML pretending to be a photo", { headers: { "Content-Type": "image/jpeg" } });
       if (url.hostname === "store.steampowered.com") return new EdgeResponse("{}", { headers: { "Content-Type": "application/json" } });
       return new EdgeResponse(null, { status: 404 });
     },
   });
+  const db = await runtime.getD1Database("merlin_db");
+  await db.prepare("CREATE TABLE games_catalog (app_id TEXT PRIMARY KEY, name TEXT)").run();
+  await db.prepare("CREATE TABLE catalog_games (app_id TEXT PRIMARY KEY, name TEXT)").run();
+  await db.prepare("INSERT INTO games_catalog VALUES ('30', 'Synthetic slow game')").run();
 });
 
 afterAll(async () => { await runtime?.dispose(); });
@@ -97,3 +107,24 @@ test("a response declared as JPEG with invalid bytes is never stored and repeate
   expect((await send("/image/20")).status).toBe(404);
   expect(await (await send("/enqueue/20", { method: "POST" })).json()).toBe("cooldown");
 }, 12000);
+
+test("the processing view shows a live download independently of history and clears completed tasks", async () => {
+  expect(await (await send("/enqueue/30", { method: "POST" })).json()).toBe("queued");
+  const deadline = Date.now() + 5000;
+  try {
+    while (!releaseSlowImage) {
+      if (Date.now() >= deadline) throw new Error("Image download did not start");
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    const response = await send("/processing");
+    expect(response.status).toBe(200);
+    const data = await response.json() as { rows: Array<{ appId: string; name: string; trigger: string; attempts: number }> };
+    expect(data.rows).toMatchObject([{ appId: "30", name: "Synthetic slow game", trigger: "launcher", attempts: 1 }]);
+    expect(data.rows).toHaveLength(1);
+  } finally {
+    releaseSlowImage?.();
+  }
+  await waitForJob("30", "stored");
+  const data = await (await send("/processing")).json() as { rows: unknown[] };
+  expect(data.rows).toEqual([]);
+}, 10000);
