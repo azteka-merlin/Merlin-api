@@ -13,7 +13,7 @@ beforeAll(async () => {
   const bundle = await build({
     bundle: true, write: false, format: "esm", platform: "browser",
     stdin: { resolveDir: resolve("src/lib"), loader: "ts", contents: `
-      import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, serveGameImage } from "./game-images";
+      import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, serveGameImage } from "./game-images";
       import { dispatchGameImageImport, getGameImageImportProgress } from "./game-image-import";
       function context(request, env, ctx, appId) {
         return { env, executionCtx: ctx, req: { url: request.url, param() { return appId; } } };
@@ -25,6 +25,10 @@ beforeAll(async () => {
           if (action === "dispatch-import") {
             await dispatchGameImageImport(env);
             return Response.json(await getGameImageImportProgress(env));
+          }
+          if (action === "dashboard") {
+            const params = new URL(request.url).searchParams;
+            return Response.json(await listGameImageDashboard(context(request, env, ctx), { view: appId, page: Number(params.get("page") || 1), appId: params.get("appId") || undefined }));
           }
           if (action === "processing") return Response.json(await listProcessingGameImages(context(request, env, ctx)));
           if (action === "list") return Response.json(await listGameImages(env, appId, undefined, new URL(request.url).searchParams.get("appId") || undefined));
@@ -154,4 +158,37 @@ test("bulk upload advances bounded R2 slices, counts existing assets and only us
   await waitForJob("260", "missing");
   expect(requests.some(url => url.includes("/260/header.jpg"))).toBe(true);
   expect(requests.some(url => url.includes("generator.ryuu.lol/files/images/260.jpg"))).toBe(false);
+}, 12000);
+
+test("dashboard isolates queued, processing and completed records and jumps directly to numbered pages", async () => {
+  const bucket = await runtime.getR2Bucket("MERLIN_FILES");
+  const prefix = "game-images/v1/staging/";
+  const now = new Date().toISOString();
+  function putJob(appId: string, status: string, updatedAt = now) {
+    return bucket.put(prefix + "jobs/" + appId, appId, { customMetadata: {
+      appId, generation: "seed-" + appId, trigger: "admin", status, updatedAt, attempts: "1",
+    } });
+  }
+  for (let id = 500; id < 545; id++) await putJob(String(id), "queued");
+  await putJob("555", "processing");
+  await putJob("556", "failed");
+  await putJob("557", "queued", "2025-01-01T00:00:00.000Z");
+  for (let id = 600; id < 735; id++) await bucket.put(prefix + "header/" + id, jpeg);
+
+  const first = await (await send("/dashboard/queued?page=1")).json() as { rows: Array<{ appId: string; status: string }>; total: number; page: number };
+  expect(first.total).toBe(45);
+  expect(first.rows).toHaveLength(20);
+  expect(first.rows.every(row => row.status === "queued")).toBe(true);
+  const last = await (await send("/dashboard/queued?page=3")).json() as typeof first;
+  expect(last.page).toBe(3);
+  expect(last.rows.map(row => row.appId)).toEqual(["540", "541", "542", "543", "544"]);
+  expect((await (await send("/dashboard/queued?appId=555")).json() as typeof first).total).toBe(0);
+  expect((await (await send("/dashboard/failed?appId=556")).json() as typeof first).rows[0]?.status).toBe("failed");
+  expect((await (await send("/dashboard/failed?appId=557")).json() as typeof first).rows[0]?.status).toBe("failed");
+
+  const complete = await (await send("/dashboard/completed?page=5")).json() as typeof first;
+  expect(complete.total).toBeGreaterThanOrEqual(135);
+  expect(complete.page).toBe(5);
+  expect(complete.rows).toHaveLength(20);
+  expect(complete.rows.every(row => row.status === "stored")).toBe(true);
 }, 12000);

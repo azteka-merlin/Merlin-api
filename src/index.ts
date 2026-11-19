@@ -13,7 +13,7 @@ import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
 import { dispatchGameImageImport, getGameImageImportProgress } from "./lib/game-image-import";
-import { consumeGameImages, enqueueGameImage, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
+import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
@@ -330,7 +330,7 @@ openapi.registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "API Token",
 });
 
-const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games", "/custom-game-indexing", "/game-images"] as const;
+const pageRoutes = ["/overview", "/alerts", "/licenses", "/usage", "/activity", "/audit", "/catalog-queue", "/catalog-queue/fixes", "/catalog-queue/images", "/overrides", "/premium", "/premium/activations", "/polls", "/payments", "/settings", "/public-signup", "/public-feedbacks", "/announcements", "/release-notes", "/partners", "/home", "/custom-games", "/custom-game-indexing", "/game-images"] as const;
 const adminLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
@@ -4401,6 +4401,19 @@ app.get("/panel-api/game-images/processing", async (c) => {
   c.header("Cache-Control", "no-store");
   const [activity, bulkImport] = await Promise.all([listProcessingGameImages(c), getGameImageImportProgress(c.env).catch(() => null)]);
   return c.json({ ...activity, bulkImport });
+});
+
+const gameImageDashboardQuery = z.object({
+  view: z.enum(["queued", "completed", "failed"]),
+  page: z.coerce.number().int().positive().max(100000).default(1),
+  appId: gameImageAppIdSchema.optional(),
+});
+
+app.get("/panel-api/game-images/dashboard", async (c) => {
+  await requireAdminSession(c);
+  const query = parseBody(gameImageDashboardQuery, c.req.query());
+  c.header("Cache-Control", "no-store");
+  return c.json(await listGameImageDashboard(c, query));
 });
 
 app.get("/panel-api/game-images", async (c) => {

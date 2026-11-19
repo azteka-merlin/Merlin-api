@@ -17,6 +17,9 @@ type Job = GameImageMessage & {
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_ATTEMPTS = 4;
 const LEASE_SECONDS = 60;
+const QUEUED_LIFETIME_MS = 60 * 60 * 1000;
+const DASHBOARD_PAGE_SIZE = 20;
+const HISTORY_CACHE_MS = 60 * 1000;
 const steamHosts = new Set([
   "shared.akamai.steamstatic.com", "shared.fastly.steamstatic.com",
   "cdn.cloudflare.steamstatic.com", "cdn.akamai.steamstatic.com",
@@ -45,6 +48,25 @@ function jobKey(env: AppBindings, appId: string): string {
 
 function processingPrefix(env: AppBindings): string {
   return prefix(env) + "processing/";
+}
+
+function waitingPrefix(env: AppBindings): string {
+  return prefix(env) + "waiting/";
+}
+
+function waitingKey(env: AppBindings, job: Job, etag: string): string {
+  return waitingPrefix(env) + job.updatedAt + "/" + job.appId + "/" + etag;
+}
+
+function trackWaitingJob(env: AppBindings, job: Job, etag: string) {
+  return env.MERLIN_FILES.put(waitingKey(env, job, etag), "", {
+    customMetadata: { ...job, attempts: String(job.attempts), sourceUrl: "", lease: etag },
+  }).catch(() => console.warn("[game-images] queue-marker-write-failed", { appId: job.appId }));
+}
+
+function clearWaitingJob(env: AppBindings, job: Job, etag: string) {
+  if (job.status !== "queued") return Promise.resolve();
+  return env.MERLIN_FILES.delete(waitingKey(env, job, etag)).catch(() => {});
 }
 
 export function gameImageSource(appId: string, value: unknown): string {
@@ -86,7 +108,7 @@ function putJob(env: AppBindings, job: Job, previous: R2Object | null) {
 function inactiveJob(job: Job, now = Date.now()): boolean {
   const age = now - Date.parse(job.updatedAt);
   return (job.status === "processing" && age >= LEASE_SECONDS * 1000) ||
-    (job.status === "queued" && age >= 60 * 60 * 1000);
+    (job.status === "queued" && age >= QUEUED_LIFETIME_MS);
 }
 
 export async function enqueueGameImage(
@@ -113,11 +135,14 @@ export async function enqueueGameImage(
   };
   const claimed = await putJob(env, job, current);
   if (!claimed) return "pending";
+  if (previous && current) await clearWaitingJob(env, previous, current.etag);
+  await trackWaitingJob(env, job, claimed.etag);
   try {
     await env.GAME_IMAGE_QUEUE.send({ appId, generation: job.generation });
     return "queued";
   } catch (error) {
     await putJob(env, { ...job, status: "failed", error: "dispatch_failed" }, claimed).catch(() => {});
+    await clearWaitingJob(env, job, claimed.etag);
     throw error;
   }
 }
@@ -244,6 +269,7 @@ async function processImageMessage(message: Message<GameImageMessage>, env: AppB
   const processing: Job = { ...job, status: "processing", updatedAt: new Date().toISOString(), attempts: message.attempts, error: "" };
   const lease = await putJob(env, processing, row);
   if (!lease) return message.retry({ delaySeconds: LEASE_SECONDS });
+  await clearWaitingJob(env, job, row.etag);
   // Each delivery owns its marker. A late retry cannot clear a newer attempt.
   const marker = processingPrefix(env) + appId + "/" + lease.etag;
   await env.MERLIN_FILES.put(marker, "", { customMetadata: { appId, lease: lease.etag } })
@@ -266,8 +292,12 @@ async function processImageMessage(message: Message<GameImageMessage>, env: AppB
       status = message.attempts < MAX_ATTEMPTS ? "queued" : "failed";
       error = "download_failed";
     }
-    await putJob(env, { ...processing, status, updatedAt: new Date().toISOString(), error }, lease);
-    if (status === "queued") message.retry({ delaySeconds: 30 * message.attempts });
+    const finalJob = { ...processing, status, updatedAt: new Date().toISOString(), error };
+    const updated = await putJob(env, finalJob, lease);
+    if (status === "queued" && updated) {
+      await trackWaitingJob(env, finalJob, updated.etag);
+      message.retry({ delaySeconds: 30 * message.attempts });
+    }
     else message.ack();
   } finally {
     await env.MERLIN_FILES.delete(marker).catch(() => {});
@@ -381,6 +411,130 @@ export async function listProcessingGameImages(c: AppContext) {
       startedAt: job.updatedAt, attempts: job.attempts,
     })),
   };
+}
+
+type DashboardView = "queued" | "completed" | "failed";
+type DashboardOptions = { view: DashboardView; page: number; appId?: string };
+
+async function* listImageObjects(env: AppBindings, objectPrefix: string, metadata = false) {
+  let cursor: string | undefined;
+  do {
+    const page: R2Objects = await env.MERLIN_FILES.list({
+      prefix: objectPrefix, cursor, limit: 1000, ...(metadata ? { include: ["customMetadata"] } : {}),
+    });
+    yield* page.objects;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}
+
+const initializedWaitingIndexes = new Set<string>();
+
+async function ensureWaitingIndex(env: AppBindings) {
+  const marker = prefix(env) + "indexes/waiting-v1";
+  if (initializedWaitingIndexes.has(marker)) return;
+  if (!(await env.MERLIN_FILES.head(marker))) {
+    for await (const object of listImageObjects(env, prefix(env) + "jobs/", true)) {
+      const job = readJob(object);
+      if (job?.status !== "queued" || inactiveJob(job)) continue;
+      await trackWaitingJob(env, job, object.etag);
+      const current = await env.MERLIN_FILES.head(object.key);
+      if (current?.etag !== object.etag) await clearWaitingJob(env, job, object.etag);
+    }
+    await env.MERLIN_FILES.put(marker, "");
+  }
+  initializedWaitingIndexes.add(marker);
+}
+
+function jobDashboardRow(job: Job): JobRow {
+  const overdue = inactiveJob(job);
+  return {
+    appId: job.appId, status: overdue ? "failed" : job.status, trigger: job.trigger,
+    updatedAt: job.updatedAt, attempts: job.attempts, error: overdue ? "job_expired" : job.error,
+  };
+}
+
+function isTerminalFailure(row: JobRow) {
+  return row.status === "failed" || row.status === "missing";
+}
+
+function assetDashboardRow(env: AppBindings, object: R2Object): AssetRow {
+  return {
+    appId: object.key.slice(imageKey(env, "").length), status: "stored", size: object.size,
+    origin: object.customMetadata?.origin || "", trigger: object.customMetadata?.trigger || "",
+    updatedAt: object.uploaded.toISOString(),
+  };
+}
+
+const historyCache = new Map<string, { until: number; rows: Array<string | JobRow> }>();
+
+async function cachedImageHistory(env: AppBindings, view: "completed" | "failed") {
+  const key = env.ENVIRONMENT + "/" + view;
+  const cached = historyCache.get(key);
+  if (cached && cached.until > Date.now()) return cached.rows;
+  const rows: Array<string | JobRow> = [];
+  if (view === "completed") {
+    for await (const object of listImageObjects(env, imageKey(env, ""))) rows.push(object.key);
+  } else {
+    for await (const object of listImageObjects(env, prefix(env) + "jobs/", true)) {
+      const job = readJob(object);
+      if (!job) continue;
+      const row = jobDashboardRow(job);
+      if (isTerminalFailure(row)) rows.push(row);
+    }
+  }
+  historyCache.set(key, { until: Date.now() + HISTORY_CACHE_MS, rows });
+  return rows;
+}
+
+function dashboardSlice<T>(records: T[], requested: number) {
+  const total = records.length;
+  const page = Math.min(requested, Math.max(1, Math.ceil(total / DASHBOARD_PAGE_SIZE)));
+  const offset = (page - 1) * DASHBOARD_PAGE_SIZE;
+  return { total, page, limit: DASHBOARD_PAGE_SIZE, rows: records.slice(offset, offset + DASHBOARD_PAGE_SIZE) };
+}
+
+export async function listGameImageDashboard(c: AppContext, { view, page, appId }: DashboardOptions) {
+  const { env } = c;
+  if (appId) {
+    if (view === "completed") {
+      const asset = await env.MERLIN_FILES.head(imageKey(env, appId));
+      return dashboardSlice(asset ? [assetDashboardRow(env, asset)] : [], 1);
+    }
+    const job = readJob(await env.MERLIN_FILES.head(jobKey(env, appId)));
+    const row = job && jobDashboardRow(job);
+    const matches = row && (view === "queued" ? row.status === "queued" : isTerminalFailure(row));
+    return dashboardSlice(matches ? [row] : [], 1);
+  }
+  if (view === "queued") {
+    await ensureWaitingIndex(env);
+    const records: Array<{ row: JobRow; key: string; lease: string }> = [];
+    const stale: string[] = [];
+    for await (const marker of listImageObjects(env, waitingPrefix(env), true)) {
+      const job = readJob(marker);
+      const lease = marker.customMetadata?.lease;
+      if (!job || !lease || inactiveJob(job)) {
+        stale.push(marker.key);
+        continue;
+      }
+      records.push({ row: jobDashboardRow(job), key: marker.key, lease });
+    }
+    const selected = dashboardSlice(records, page);
+    const rows = await Promise.all(selected.rows.map(async entry => {
+      const job = await env.MERLIN_FILES.head(jobKey(env, entry.row.appId));
+      if (job?.etag === entry.lease) return entry.row;
+      stale.push(entry.key);
+      return null;
+    }));
+    if (stale.length) c.executionCtx.waitUntil(env.MERLIN_FILES.delete(stale.slice(0, 1000)).catch(() => {}));
+    return { ...selected, rows: rows.filter(row => row !== null) };
+  }
+  const selected = dashboardSlice(await cachedImageHistory(env, view), page);
+  const rows = await Promise.all(selected.rows.map(async entry => {
+    if (typeof entry !== "string") return entry;
+    const object = await env.MERLIN_FILES.head(entry);
+    return object ? assetDashboardRow(env, object) : null;
+  }));
+  return { ...selected, rows: rows.filter(row => row !== null) };
 }
 
 export async function listGameImages(env: AppBindings, view: "queue" | "assets", cursor?: string, appId?: string) {
