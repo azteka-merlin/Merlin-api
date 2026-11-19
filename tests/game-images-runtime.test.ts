@@ -13,7 +13,7 @@ beforeAll(async () => {
   const bundle = await build({
     bundle: true, write: false, format: "esm", platform: "browser",
     stdin: { resolveDir: resolve("src/lib"), loader: "ts", contents: `
-      import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, serveGameImage } from "./game-images";
+      import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, serveGameImage, syncLegacyWaitingIndex } from "./game-images";
       import { dispatchGameImageImport, getGameImageImportProgress } from "./game-image-import";
       function context(request, env, ctx, appId) {
         return { env, executionCtx: ctx, req: { url: request.url, param() { return appId; } } };
@@ -26,9 +26,23 @@ beforeAll(async () => {
             await dispatchGameImageImport(env);
             return Response.json(await getGameImageImportProgress(env));
           }
+          if (action === "sync-waiting") {
+            await syncLegacyWaitingIndex(env);
+            return Response.json({ success: true });
+          }
           if (action === "dashboard") {
             const params = new URL(request.url).searchParams;
-            return Response.json(await listGameImageDashboard(context(request, env, ctx), { view: appId, page: Number(params.get("page") || 1), appId: params.get("appId") || undefined }));
+            let listAttempts = 0;
+            const viewEnv = params.has("throttle") ? { ...env, MERLIN_FILES: {
+              list(options) {
+                if (!options.prefix.endsWith("/waiting/")) throw new Error("Unexpected reconstruction during dashboard request");
+                if (++listAttempts <= 2) throw new Error("list: Reduce your concurrent request rate for the same object. (10058)");
+                return env.MERLIN_FILES.list(options);
+              },
+              head(key) { return env.MERLIN_FILES.head(key); },
+            } } : env;
+            const data = await listGameImageDashboard(context(request, viewEnv, ctx), { view: appId, page: Number(params.get("page") || 1), appId: params.get("appId") || undefined });
+            return Response.json(data, { headers: { "test-list-attempts": String(listAttempts) } });
           }
           if (action === "processing") return Response.json(await listProcessingGameImages(context(request, env, ctx)));
           if (action === "list") return Response.json(await listGameImages(env, appId, undefined, new URL(request.url).searchParams.get("appId") || undefined));
@@ -175,7 +189,11 @@ test("dashboard isolates queued, processing and completed records and jumps dire
   await putJob("557", "queued", "2025-01-01T00:00:00.000Z");
   for (let id = 600; id < 735; id++) await bucket.put(prefix + "header/" + id, jpeg);
 
-  const first = await (await send("/dashboard/queued?page=1")).json() as { rows: Array<{ appId: string; status: string }>; total: number; page: number };
+  expect((await send("/sync-waiting")).status).toBe(200);
+  const firstResponse = await send("/dashboard/queued?page=1&throttle=1");
+  expect(firstResponse.status).toBe(200);
+  expect(firstResponse.headers.get("test-list-attempts")).toBe("3");
+  const first = await firstResponse.json() as { rows: Array<{ appId: string; status: string }>; total: number; page: number };
   expect(first.total).toBe(45);
   expect(first.rows).toHaveLength(20);
   expect(first.rows.every(row => row.status === "queued")).toBe(true);

@@ -20,6 +20,7 @@ const LEASE_SECONDS = 60;
 const QUEUED_LIFETIME_MS = 60 * 60 * 1000;
 const DASHBOARD_PAGE_SIZE = 20;
 const HISTORY_CACHE_MS = 60 * 1000;
+const WAITING_CACHE_MS = 5 * 1000;
 const steamHosts = new Set([
   "shared.akamai.steamstatic.com", "shared.fastly.steamstatic.com",
   "cdn.cloudflare.steamstatic.com", "cdn.akamai.steamstatic.com",
@@ -419,7 +420,7 @@ type DashboardOptions = { view: DashboardView; page: number; appId?: string };
 async function* listImageObjects(env: AppBindings, objectPrefix: string, metadata = false) {
   let cursor: string | undefined;
   do {
-    const page: R2Objects = await env.MERLIN_FILES.list({
+    const page = await listImagePage(env, {
       prefix: objectPrefix, cursor, limit: 1000, ...(metadata ? { include: ["customMetadata"] } : {}),
     });
     yield* page.objects;
@@ -427,22 +428,45 @@ async function* listImageObjects(env: AppBindings, objectPrefix: string, metadat
   } while (cursor);
 }
 
-const initializedWaitingIndexes = new Set<string>();
-
-async function ensureWaitingIndex(env: AppBindings) {
-  const marker = prefix(env) + "indexes/waiting-v1";
-  if (initializedWaitingIndexes.has(marker)) return;
-  if (!(await env.MERLIN_FILES.head(marker))) {
-    for await (const object of listImageObjects(env, prefix(env) + "jobs/", true)) {
-      const job = readJob(object);
-      if (job?.status !== "queued" || inactiveJob(job)) continue;
-      await trackWaitingJob(env, job, object.etag);
-      const current = await env.MERLIN_FILES.head(object.key);
-      if (current?.etag !== object.etag) await clearWaitingJob(env, job, object.etag);
+async function listImagePage(env: AppBindings, options: R2ListOptions): Promise<R2Objects> {
+  for (const delay of [250, 750]) {
+    try {
+      return await env.MERLIN_FILES.list(options);
+    } catch (error) {
+      if (!isGameImageStorageThrottled(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, delay + Math.random() * 150));
     }
-    await env.MERLIN_FILES.put(marker, "");
   }
-  initializedWaitingIndexes.add(marker);
+  return env.MERLIN_FILES.list(options);
+}
+
+export function isGameImageStorageThrottled(error: unknown) {
+  return error instanceof Error && /\((10058|10043)\)$/.test(error.message);
+}
+
+export async function syncLegacyWaitingIndex(env: AppBindings) {
+  if (!env.GAME_IMAGE_QUEUE || !env.MERLIN_FILES) return;
+  const marker = prefix(env) + "indexes/waiting-v1";
+  const checkpoint = await env.MERLIN_FILES.get(marker);
+  if (checkpoint?.size === 0) return;
+  const startAfter = checkpoint ? await checkpoint.text() : undefined;
+  const page = await listImagePage(env, {
+    prefix: prefix(env) + "jobs/", limit: 500, startAfter, include: ["customMetadata"],
+  });
+  for (const object of page.objects) {
+    const job = readJob(object);
+    if (job?.status !== "queued" || inactiveJob(job)) continue;
+    const key = waitingKey(env, job, object.etag);
+    if (await env.MERLIN_FILES.head(key)) continue;
+    if (!(await trackWaitingJob(env, job, object.etag))) throw new Error("game_images_waiting_marker_write_failed");
+    const current = await env.MERLIN_FILES.head(object.key);
+    if (current?.etag !== object.etag) await clearWaitingJob(env, job, object.etag);
+  }
+  const next = page.truncated ? page.objects.at(-1)?.key : "";
+  if (next === undefined) throw new Error("game_images_waiting_index_page_empty");
+  await env.MERLIN_FILES.put(marker, next, {
+    onlyIf: checkpoint ? { etagMatches: checkpoint.etag } : { etagDoesNotMatch: "*" },
+  });
 }
 
 function jobDashboardRow(job: Job): JobRow {
@@ -493,6 +517,31 @@ function dashboardSlice<T>(records: T[], requested: number) {
   return { total, page, limit: DASHBOARD_PAGE_SIZE, rows: records.slice(offset, offset + DASHBOARD_PAGE_SIZE) };
 }
 
+type WaitingEntry = { row: JobRow; key: string; lease: string };
+const waitingCache = new Map<string, { until: number; entries: WaitingEntry[] }>();
+
+async function listWaitingEntries(c: AppContext) {
+  const { env } = c;
+  const key = prefix(env);
+  const cached = waitingCache.get(key);
+  if (cached && cached.until > Date.now()) return cached.entries;
+
+  const entries: WaitingEntry[] = [];
+  const stale: string[] = [];
+  for await (const marker of listImageObjects(env, waitingPrefix(env), true)) {
+    const job = readJob(marker);
+    const lease = marker.customMetadata?.lease;
+    if (!job || !lease || inactiveJob(job)) {
+      stale.push(marker.key);
+      continue;
+    }
+    entries.push({ row: jobDashboardRow(job), key: marker.key, lease });
+  }
+  waitingCache.set(key, { until: Date.now() + WAITING_CACHE_MS, entries });
+  if (stale.length) c.executionCtx.waitUntil(env.MERLIN_FILES.delete(stale.slice(0, 1000)).catch(() => {}));
+  return entries;
+}
+
 export async function listGameImageDashboard(c: AppContext, { view, page, appId }: DashboardOptions) {
   const { env } = c;
   if (appId) {
@@ -506,19 +555,8 @@ export async function listGameImageDashboard(c: AppContext, { view, page, appId 
     return dashboardSlice(matches ? [row] : [], 1);
   }
   if (view === "queued") {
-    await ensureWaitingIndex(env);
-    const records: Array<{ row: JobRow; key: string; lease: string }> = [];
     const stale: string[] = [];
-    for await (const marker of listImageObjects(env, waitingPrefix(env), true)) {
-      const job = readJob(marker);
-      const lease = marker.customMetadata?.lease;
-      if (!job || !lease || inactiveJob(job)) {
-        stale.push(marker.key);
-        continue;
-      }
-      records.push({ row: jobDashboardRow(job), key: marker.key, lease });
-    }
-    const selected = dashboardSlice(records, page);
+    const selected = dashboardSlice(await listWaitingEntries(c), page);
     const rows = await Promise.all(selected.rows.map(async entry => {
       const job = await env.MERLIN_FILES.head(jobKey(env, entry.row.appId));
       if (job?.etag === entry.lease) return entry.row;

@@ -13,7 +13,7 @@ import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
 import { dispatchGameImageImport, getGameImageImportProgress } from "./lib/game-image-import";
-import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, validImageAppId, type GameImageMessage } from "./lib/game-images";
+import { consumeGameImages, enqueueGameImage, isGameImageStorageThrottled, listGameImageDashboard, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, syncLegacyWaitingIndex, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
@@ -4413,7 +4413,13 @@ app.get("/panel-api/game-images/dashboard", async (c) => {
   await requireAdminSession(c);
   const query = parseBody(gameImageDashboardQuery, c.req.query());
   c.header("Cache-Control", "no-store");
-  return c.json(await listGameImageDashboard(c, query));
+  try {
+    return c.json(await listGameImageDashboard(c, query));
+  } catch (error) {
+    if (!isGameImageStorageThrottled(error)) throw error;
+    c.header("Retry-After", "10");
+    return c.json({ success: false, error: "A lista de imagens está temporariamente ocupada. Tente atualizar em instantes." }, 503);
+  }
 });
 
 app.get("/panel-api/game-images", async (c) => {
@@ -4712,7 +4718,10 @@ export default {
     // notifications and all the previously disabled scheduled jobs off here.
     if (env.ENVIRONMENT === 'staging') return;
     const scheduledAt = new Date(controller.scheduledTime);
-    _ctx.waitUntil(dispatchGameImageImport(env).catch(() => console.error("[game-images] bulk-import-dispatch-failed")));
+    _ctx.waitUntil(dispatchGameImageImport(env)
+      .catch(() => console.error("[game-images] bulk-import-dispatch-failed"))
+      .then(() => syncLegacyWaitingIndex(env))
+      .catch(error => console.warn("[game-images] waiting-index-sync-failed", error)));
     _ctx.waitUntil(runPremiumNotificationCron(env,scheduledAt).catch(()=>console.error('[PremiumNotifications] dispatch-failed')));
     _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {
       console.error("[CustomGamesIntegrity] queue-dispatch-failed");
