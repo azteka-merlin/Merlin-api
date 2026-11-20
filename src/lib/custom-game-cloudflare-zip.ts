@@ -5,13 +5,7 @@ const GiB = 1024 ** 3;
 const MAX_ARCHIVE = 100 * GiB;
 const MAX_GAME = 200 * GiB;
 const MAX_FILE = 30 * GiB;
-const MAX_FILES = 100_000;
-const MAX_ENTRIES = 300_000;
-const MAX_CENTRAL_BYTES = 64 * 1024 ** 2;
-const MAX_PLAN_BYTES = 128 * 1024 ** 2;
-const MAX_PATH_INDEX_BYTES = 64 * 1024 ** 2;
 const WINDOW_BYTES = 1024 ** 2;
-const encoder = new TextEncoder();
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 // The first 128 CP437 characters agree with ASCII. Keep the upper half explicit;
 // TextDecoder does not offer CP437 in the Workers runtime.
@@ -30,6 +24,37 @@ export type CloudflareZipEntry = {
   /** Base64 preserves byte-for-byte local/central name equality across JSON. */
   rawName: string;
 };
+
+type PathNode = { original: string; kind: "implicit" | "directory"; children?: Map<string, PathNode | "file"> };
+
+/** Keep only unique path components. A full-prefix map duplicates every folder
+ * string for every file and grows far faster than the ZIP's own directory. */
+function registerPath(root: Map<string, PathNode | "file">, name: string, directory: boolean) {
+  const parts = name.split("/");
+  let siblings = root;
+  let node: PathNode | "file" | undefined;
+  for (let index = 0; index < parts.length; index++) {
+    const original = parts[index]!;
+    const normalized = original.normalize("NFC").toLocaleLowerCase("en-US");
+    node = siblings.get(normalized);
+    if (node && node !== "file" && node.original !== original) invalid("O ZIP contém caminhos ambíguos por caixa ou Unicode.");
+    const leaf = index === parts.length - 1;
+    if (!node) {
+      node = leaf && !directory ? "file" : { original, kind: leaf ? "directory" : "implicit" };
+      siblings.set(normalized, node);
+    } else if (leaf) {
+      if (directory && node !== "file" && node.kind === "implicit") node.kind = "directory";
+      else invalid(node === "file" ? "O ZIP contém caminhos duplicados ou conflito entre arquivo e pasta." : "O ZIP contém caminhos duplicados.");
+    } else if (node === "file") {
+      invalid("O ZIP contém conflito entre arquivo e pasta.");
+    }
+    if (!leaf) {
+      if (node === "file") invalid("O ZIP contém conflito entre arquivo e pasta.");
+      node.children ||= new Map<string, PathNode | "file">();
+      siblings = node.children;
+    }
+  }
+}
 
 function invalid(message: string): never { throw new Error(message); }
 function integer(value: number, maximum: number, label: string) {
@@ -126,8 +151,8 @@ function validateMethod(flags: number, method: number) {
 }
 
 /**
- * Reads the central directory in cached 1 MiB windows. A 100k-entry archive
- * therefore makes tens of metadata requests rather than 100k R2 requests.
+ * Reads the central directory in cached 1 MiB windows, rather than issuing one
+ * R2 request per entry. Entry counts are derived from the ZIP directory itself.
  * Local headers are checked lazily by hashCloudflareZipEntry.
  */
 export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: string, archiveSize: number): Promise<{ files: CloudflareZipEntry[]; totalSizeBytes: number }> {
@@ -166,8 +191,8 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
       (centralOffset !== 0xffffffff && centralOffset !== zip64Central)) invalid("Diretórios ZIP e ZIP64 divergentes.");
     count = zip64Count; centralSize = zip64Size; centralOffset = zip64Central; metadataBoundary = zip64Offset;
   }
-  integer(count, MAX_ENTRIES, "Quantidade de entradas ZIP");
-  integer(centralSize, MAX_CENTRAL_BYTES, "Tamanho do diretório central ZIP");
+  integer(count, Number.MAX_SAFE_INTEGER, "Quantidade de entradas ZIP");
+  integer(centralSize, archiveSize, "Tamanho do diretório central ZIP");
   integer(centralOffset, archiveSize, "Posição do diretório central ZIP");
   if (!count || centralOffset + centralSize > metadataBoundary || centralSize < count * 46) invalid("Diretório central ZIP inválido.");
   const centralEnd = centralOffset + centralSize;
@@ -181,9 +206,14 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
     return window.subarray(offset - windowOffset, offset - windowOffset + length);
   }
   const files: CloudflareZipEntry[] = [];
-  const localRecords: { offset: number; minimumEnd: number; entry?: CloudflareZipEntry }[] = [];
-  const paths = new Map<string, { path: string; kind: "implicit" | "directory" | "file" }>();
-  let totalSizeBytes = 0; let planBytes = 64; let pathIndexBytes = 0; let offset = centralOffset;
+  // Typed arrays keep the local-record overlap index compact even for very
+  // large ZIP central directories (three numeric arrays + sorted indexes).
+  const localOffsets = new Float64Array(count);
+  const localMinimumEnds = new Float64Array(count);
+  const localFileIndexes = new Int32Array(count).fill(-1);
+  const localOrder = new Uint32Array(count);
+  const paths = new Map<string, PathNode | "file">();
+  let totalSizeBytes = 0; let offset = centralOffset;
   for (let index = 0; index < count; index++) {
     const header = await centralRead(offset, 46);
     if (u32(header, 0) !== 0x02014b50) invalid("Entrada do diretório central ZIP inválida.");
@@ -214,40 +244,20 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
     if (sizeBytes > Math.max(1, compressedSize) * 10_000) invalid("A taxa de compressão do ZIP ultrapassa o limite.");
     if (directory && (sizeBytes || checksum || compressedSize > 65_536)) invalid("Diretório ZIP contém dados.");
     if (localOffset + 30 + nameLength + compressedSize > centralOffset) invalid("Dados do ZIP ultrapassam o diretório central.");
-    const parts = name.split("/"); let prefix = "";
-    for (let part = 0; part < parts.length; part++) {
-      prefix += `${part ? "/" : ""}${parts[part]}`;
-      const normalized = prefix.normalize("NFC").toLocaleLowerCase("en-US");
-      const prior = paths.get(normalized);
-      if (prior && prior.path !== prefix) invalid("O ZIP contém caminhos ambíguos por caixa ou Unicode.");
-      if (!prior) {
-        pathIndexBytes += normalized.length * 2 + prefix.length * 2 + 64;
-        if (pathIndexBytes > MAX_PATH_INDEX_BYTES) invalid("O índice de caminhos ZIP ultrapassa o limite de memória.");
-      }
-      if (part < parts.length - 1 && prior?.kind === "file") invalid("O ZIP contém conflito entre arquivo e pasta.");
-      if (part === parts.length - 1) {
-        if (directory) {
-          if (prior?.kind === "directory" || prior?.kind === "file") invalid("O ZIP contém caminhos duplicados.");
-          paths.set(normalized, { path: prefix, kind: "directory" });
-        } else {
-          if (prior) invalid("O ZIP contém conflito entre arquivo e pasta.");
-          paths.set(normalized, { path: prefix, kind: "file" });
-        }
-      } else if (!prior) {
-        paths.set(normalized, { path: prefix, kind: "implicit" });
-      }
-    }
+    registerPath(paths, name, directory);
     let entry: CloudflareZipEntry | undefined;
+    let fileIndex = -1;
     if (!directory) {
-      if (files.length >= MAX_FILES) invalid("O ZIP excede o limite de arquivos.");
       totalSizeBytes = integer(totalSizeBytes + sizeBytes, MAX_GAME, "Tamanho descompactado ZIP");
       entry = { path: name, sizeBytes, compressedSize, method: method as 0 | 8 | 9, crc32: checksum,
         flags, localHeaderOffset: localOffset, dataBoundary: centralOffset, rawName: toBase64(rawName) };
-      planBytes += encoder.encode(JSON.stringify(entry)).length + 1;
-      if (planBytes > MAX_PLAN_BYTES) invalid("O plano de indexação ZIP ultrapassa o limite de 128 MiB.");
+      fileIndex = files.length;
       files.push(entry);
     }
-    localRecords.push({ offset: localOffset, minimumEnd: localOffset + 30 + nameLength + compressedSize, ...(entry ? { entry } : {}) });
+    localOffsets[index] = localOffset;
+    localMinimumEnds[index] = localOffset + 30 + nameLength + compressedSize;
+    localFileIndexes[index] = fileIndex;
+    localOrder[index] = index;
     offset += recordLength;
   }
   if (offset < centralEnd) {
@@ -255,12 +265,13 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
     if (u32(signature, 0) !== 0x05054b50 || offset + 6 + u16(signature, 4) !== centralEnd) invalid("Dados inesperados após o diretório central ZIP.");
   }
   if (!files.length || !totalSizeBytes) invalid("O ZIP não contém arquivos de jogo.");
-  localRecords.sort((left, right) => left.offset - right.offset);
-  for (let index = 0; index < localRecords.length; index++) {
-    const record = localRecords[index]!;
-    const boundary = localRecords[index + 1]?.offset ?? centralOffset;
-    if (record.offset === boundary || record.minimumEnd > boundary) invalid("O ZIP contém cabeçalhos ou conteúdos sobrepostos.");
-    if (record.entry) record.entry.dataBoundary = boundary;
+  localOrder.sort((left, right) => localOffsets[left]! - localOffsets[right]!);
+  for (let index = 0; index < localOrder.length; index++) {
+    const record = localOrder[index]!;
+    const boundary = localOffsets[localOrder[index + 1]!] ?? centralOffset;
+    if (localOffsets[record] === boundary || localMinimumEnds[record]! > boundary) invalid("O ZIP contém cabeçalhos ou conteúdos sobrepostos.");
+    const fileIndex = localFileIndexes[record]!;
+    if (fileIndex >= 0) files[fileIndex]!.dataBoundary = boundary;
   }
   return { files, totalSizeBytes };
 }

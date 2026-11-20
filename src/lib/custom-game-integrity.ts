@@ -230,12 +230,12 @@ export async function sourceVersion(c: AppContext, job: IntegrityJob) {
 export function validateIntegrityManifest(value: unknown, game: IntegrityGame, deps: Pick<IntegrityDependencies, "validateGameFilePath" | "validateSha256">): IntegrityManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("Manifesto de integridade inválido.");
   const input = value as IntegrityManifest;
+  const zip = (game.package_type || "zip") === "zip";
   if (input.version !== 1 || input.gameId !== game.id || input.archiveKey !== game.archive_key || !Array.isArray(input.files) ||
-    !input.files.length || input.files.length > MAX_FILES) fail("Manifesto de integridade não corresponde ao jogo.");
+    !input.files.length || (!zip && input.files.length > MAX_FILES)) fail("Manifesto de integridade não corresponde ao jogo.");
   const paths = new Set<string>();
   const canonical = new Map<string, string>();
   let totalSizeBytes = 0;
-  const zip = (game.package_type || "zip") === "zip";
   const files = input.files.map(file => {
     if (!file || typeof file !== "object") fail("Arquivo de integridade inválido.");
     const path = deps.validateGameFilePath(file.path);
@@ -604,8 +604,9 @@ export function registerCustomGameIntegrityRoutes(app: Hono<{ Bindings: AppBindi
       (record.job.packageType === "folder" && phase !== "indexing")) fail("A fase da indexação não pode retroceder.", 409);
     const processedBytes = count(body.processedBytes, MAX_GAME_BYTES);
     const totalBytes = count(body.totalBytes, phase === "downloading" ? MAX_ARCHIVE_BYTES : MAX_GAME_BYTES);
-    const processedFiles = count(body.processedFiles, MAX_FILES);
-    const totalFiles = count(body.totalFiles, MAX_FILES);
+    const fileLimit = record.job.packageType === "zip" ? Number.MAX_SAFE_INTEGER : MAX_FILES;
+    const processedFiles = count(body.processedFiles, fileLimit);
+    const totalFiles = count(body.totalFiles, fileLimit);
     if (processedBytes > totalBytes || processedFiles > totalFiles ||
       (phase === "downloading" && totalBytes !== record.job.sourceSize) ||
       (phase === record.job.phase && (processedBytes < record.job.processedBytes || processedFiles < record.job.processedFiles || totalBytes !== record.job.totalBytes))) {

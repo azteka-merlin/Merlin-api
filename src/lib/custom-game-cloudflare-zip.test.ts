@@ -201,6 +201,14 @@ describe("Cloudflare ZIP planning and streaming", () => {
     expect(bucket.maximumChunk).toBeLessThanOrEqual(65_536);
   });
 
+  it("plans a package at the reported 277,422-file scale", async () => {
+    const fixture = zip(Array.from({ length: 277_422 }, (_, index) => ({ name: `game/data/${index}.bin`, data: "x" })), true);
+    const bucket = new Bucket(fixture.bytes);
+    const plan = await planCloudflareZip(bucket.binding(), "zip", bucket.etag, fixture.bytes.length);
+    expect(plan.files).toHaveLength(277_422);
+    expect(plan.files.at(-1)?.path).toBe("game/data/277421.bin");
+  }, 120_000);
+
   it("rejects overlapping local records and central directory truncation", async () => {
     const fixture = zip([{ name: "a.exe", data: "x" }, { name: "b.exe", data: "x" }]);
     fixture.bytes.writeUInt32LE(0, fixture.locations[1]!.central + 42);

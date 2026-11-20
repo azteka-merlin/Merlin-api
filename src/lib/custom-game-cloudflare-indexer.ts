@@ -98,7 +98,9 @@ export async function processCloudflareIntegrityMessage(env: AppBindings, body: 
     await env.CUSTOM_GAMES.put(key, json, { httpMetadata: { contentType: "application/json" } });
     await save({ queuePlanKey: key, totalFiles: plan.files.length, totalBytes: plan.totalSizeBytes });
   }
-  if (plan.version !== 1 || !plan.files.length || plan.files.length > MAX_FOLDER_GAME_FILES) throw new Error("Plano de indexação inválido.");
+  if (plan.version !== 1 || !plan.files.length || (record.job.packageType === "folder" && plan.files.length > MAX_FOLDER_GAME_FILES)) {
+    throw new Error("Plano de indexação inválido.");
+  }
   const from = record.job.queueCursor || 0;
   if (!Number.isSafeInteger(from) || from < 0 || from > plan.files.length) throw new Error("Checkpoint de arquivo inválido.");
   let cursor = from;
