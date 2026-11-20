@@ -7,6 +7,7 @@ type Snapshot = { format: 2; createdAt: string; state: SaveState };
 
 const MAX_VISIBLE = 10;
 const SHA = /^[a-f0-9]{40}$/;
+const MIN_SAVE_TIMESTAMP = Date.UTC(2000, 0, 1);
 
 export function historyEnabled(c: AppContext): boolean {
   const environment = (c.env as AppContext["env"] & { ENVIRONMENT?: string }).ENVIRONMENT;
@@ -54,6 +55,23 @@ async function loadSnapshot(bucket: R2Bucket, key: string): Promise<Snapshot | n
   } catch { return null; }
 }
 
+export function visibleSnapshotDates(snapshot: Snapshot, uploaded: Date) {
+  const declaredCapture = Date.parse(snapshot.createdAt);
+  const captureTime = Number.isFinite(declaredCapture) ? declaredCapture : uploaded.getTime();
+  let lastModified = 0;
+  for (const file of Object.values(snapshot.state.files || {})) {
+    // CloudRedirect stores per-file modification times as Unix seconds.
+    if (typeof file?.ts !== "number" || !Number.isSafeInteger(file.ts)) continue;
+    const milliseconds = file.ts * 1000;
+    if (milliseconds >= MIN_SAVE_TIMESTAMP && milliseconds <= captureTime) {
+      lastModified = Math.max(lastModified, milliseconds);
+    }
+  }
+  const capturedAt = new Date(captureTime).toISOString();
+  const savedAt = lastModified ? new Date(lastModified).toISOString() : null;
+  return { capturedAt, savedAt, createdAt: savedAt ?? capturedAt };
+}
+
 export async function loadCurrentExportSnapshot(c: AppContext, scope: SaveScope, state: SaveState): Promise<Snapshot | null> {
   const snapshot = await loadSnapshot(c.env.MERLIN_FILES, `${root(scope)}current.json`);
   return snapshot && sameSaveFiles(snapshot.state, state) ? snapshot : null;
@@ -67,19 +85,35 @@ export async function captureCurrentExportSnapshot(c: AppContext, scope: SaveSco
   } satisfies Snapshot), { httpMetadata: { contentType: "application/json" } });
 }
 
-export async function getExportSource(c: AppContext, scope: SaveScope, state: SaveState, name: string): Promise<string | null> {
+export async function getExportBlob(c: AppContext, scope: SaveScope, state: SaveState, name: string): Promise<R2ObjectBody | null> {
   if (!validFiles(state) || !Object.prototype.hasOwnProperty.call(state.files, name)) return null;
-  return sourceFor(c, scope, saveBlobKey(scope, name, String(state.files[name]!.sha)));
+  const bucket = c.env.MERLIN_FILES;
+  const key = saveBlobKey(scope, name, String(state.files[name]!.sha));
+  return (await bucket.get(key)) ?? bucket.get(archiveKey(scope, key));
 }
 
-export async function listVisibleSnapshots(c: AppContext, scope: SaveScope): Promise<Array<{ key: string; object: R2Object; snapshot: Snapshot; id: string }>> {
+async function visibleSnapshotObjects(c: AppContext, scope: SaveScope) {
   const objects = await listAll(c.env.MERLIN_FILES, `${root(scope)}visible/`);
-  const sorted = objects.sort((a, b) => b.key.localeCompare(a.key)).slice(0, MAX_VISIBLE);
-  const result = await Promise.all(sorted.map(async (object) => {
-    const snapshot = await loadSnapshot(c.env.MERLIN_FILES, object.key);
-    if (!snapshot) return null;
-    const id = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(object.key)))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    return { key: object.key, object, snapshot, id };
+  const visible = objects.sort((a, b) => b.key.localeCompare(a.key)).slice(0, MAX_VISIBLE);
+  return Promise.all(visible.map(async (object) => {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(object.key));
+    const id = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    return { key: object.key, object, id };
+  }));
+}
+
+export async function findVisibleSnapshot(c: AppContext, scope: SaveScope, id: string) {
+  const item = (await visibleSnapshotObjects(c, scope)).find((candidate) => candidate.id === id);
+  if (!item) return null;
+  const snapshot = await loadSnapshot(c.env.MERLIN_FILES, item.key);
+  return snapshot ? { ...item, snapshot } : null;
+}
+
+export async function listVisibleSnapshots(c: AppContext, scope: SaveScope) {
+  const visible = await visibleSnapshotObjects(c, scope);
+  const result = await Promise.all(visible.map(async (item) => {
+    const snapshot = await loadSnapshot(c.env.MERLIN_FILES, item.key);
+    return snapshot ? { ...item, snapshot } : null;
   }));
   return result.filter((item): item is NonNullable<typeof item> => item !== null);
 }

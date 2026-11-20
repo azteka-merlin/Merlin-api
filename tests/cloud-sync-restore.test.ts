@@ -19,7 +19,8 @@ const capturedAt = new Date("2026-10-09T08:59:37Z");
 function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, omitListMetadata = false,
   catalogRows = {} as Record<string, { name: string; cover_url: string | null }> } = {}) {
   const objects = new Map<string, { bytes: Uint8Array; metadata: Record<string, string>; uploaded: Date }>();
-  const calls = { lists: [] as { prefix: string; delimiter?: string; include?: string[] }[], heads: 0, catalog: [] as string[][] };
+  const calls = { lists: [] as { prefix: string; delimiter?: string; include?: string[] }[],
+    gets: [] as string[], heads: 0, catalog: [] as string[][] };
   const put = (key: string, value: string, metadata: Record<string, string> = {}, uploaded = new Date()) => {
     objects.set(key, { bytes: new TextEncoder().encode(value), metadata, uploaded });
   };
@@ -47,6 +48,7 @@ function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, 
   const recoveryId = createHash("sha256").update(`123456/730/5:${minute}`).digest("hex");
   const bucket = {
     async get(key: string) {
+      calls.gets.push(key);
       const object = objects.get(key);
       if (!object) return null;
       return {
@@ -112,6 +114,53 @@ function fixture({ active = false, missingCurrentBlob = false, pageSize = 1000, 
 }
 
 describe("cloud save restoration", () => {
+  it("labels a full backup by the saved files and preserves its export identity", async () => {
+    const { context, put, calls, objects } = fixture();
+    const savedAt = "2026-11-17T18:58:06.000Z";
+    const capturedAt = "2026-11-18T03:36:38.385Z";
+    const key = "cloud-sync/stage/history-v2/steam/123456/730/visible/previous.json";
+    const id = createHash("sha256").update(key).digest("hex");
+    const snapshot = JSON.stringify({ format: 2, createdAt: capturedAt, state: { cn: 5, files: {
+      "save.dat": { sha: oldSaveSha, size: 8, ts: Date.parse(savedAt) / 1000 },
+      "settings.dat": { sha: unchangedSha, size: 8, ts: Date.parse("2099-01-01") / 1000 },
+    } } });
+    put(key, snapshot, new Date(capturedAt));
+    put(key.replace("previous.json", "earlier.json"), snapshot, new Date(capturedAt));
+    const liveBlob = prefix + "blobs/save.dat/" + oldSaveSha;
+    put(liveBlob, "old-save");
+
+    const details = await (await getCloudGame(context)).json();
+    expect(details.game.backups[0]).toMatchObject({ id, version: 2, createdAt: savedAt, savedAt, capturedAt });
+    const exportContext = {
+      ...context,
+      req: { ...context.req, param: (name: string) => name === "appId" ? "730" : id,
+        query: (name: string) => name === "accountId" ? "123456" : "save.dat" },
+    } as AppContext;
+    const exported = await (await getCloudExport(exportContext)).json();
+    expect(exported.createdAt).toBe(savedAt);
+    expect(exported.files).toContainEqual({ name: "save.dat", sha: oldSaveSha, size: 8 });
+    calls.gets.length = 0;
+    expect(await (await getCloudExportFile(exportContext)).text()).toBe("old-save");
+    expect(calls.gets).toEqual([key, liveBlob]);
+    expect(calls.heads).toBe(0);
+
+    objects.delete(liveBlob);
+    const archive = "cloud-sync/stage/history-v2/steam/123456/730/blobs/blobs/save.dat/" + oldSaveSha;
+    put(archive, "old-save");
+    calls.gets.length = 0;
+    expect(await (await getCloudExportFile(exportContext)).text()).toBe("old-save");
+    expect(calls.gets).toEqual([key, liveBlob, archive]);
+  });
+
+  it("retains the capture date for a complete backup without file timestamps", async () => {
+    const { context, put, current } = fixture();
+    const historyKey = "cloud-sync/stage/history-v2/steam/123456/730/visible/old-metadata.json";
+    const capture = "2026-11-18T03:36:38.385Z";
+    put(historyKey, JSON.stringify({ format: 2, createdAt: capture, state: current }), new Date(capture));
+    const details = await (await getCloudGame(context)).json();
+    expect(details.game.backups[0]).toMatchObject({ version: 2, createdAt: capture, savedAt: null, capturedAt: capture });
+  });
+
   it("exports only explicitly captured complete V2 versions, never legacy recovery groups", async () => {
     const { context, current } = fixture();
     const req = { ...context.req, param: (name: string) => name === "appId" ? "730" : "current",

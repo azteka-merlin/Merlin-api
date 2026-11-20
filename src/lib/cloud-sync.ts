@@ -1,8 +1,8 @@
 import type { AppContext } from "../types";
 import { requireLauncherLicense } from "./launcher-auth";
-import { historyEnabled, listVisibleSnapshots, captureVisibleSnapshot, captureHiddenSnapshot,
+import { historyEnabled, listVisibleSnapshots, findVisibleSnapshot, captureVisibleSnapshot, captureHiddenSnapshot,
   capturePendingSnapshot, clearPendingSnapshot, pruneHistory, protectBlob, prepareRestore,
-  sameSaveFiles, loadCurrentExportSnapshot, captureCurrentExportSnapshot, getExportSource,
+  sameSaveFiles, loadCurrentExportSnapshot, captureCurrentExportSnapshot, getExportBlob, visibleSnapshotDates,
   type SaveState } from "./cloud-save-history-v2";
 
 // CloudRedirect speaks path-style S3. This facade never exposes R2 credentials
@@ -494,11 +494,15 @@ export async function getCloudGame(c: AppContext): Promise<Response> {
         ...(currentExport ? { version: 2 } : {}) },
       localSaveHints: localSaveHints(current.state),
       ...(historyEnabled(c) ? { historyVersion: 2 } : {}),
-      backups: [...versions.map((version) => ({
-        id: version.id,
-        version: 2,
-        ...stateSummary(version.snapshot.state, new Date(version.snapshot.createdAt)),
-      })), ...backups.map((backup) => ({
+      backups: [...versions.map((version) => {
+        const dates = visibleSnapshotDates(version.snapshot, version.object.uploaded);
+        return {
+          id: version.id,
+          version: 2,
+          ...stateSummary(version.snapshot.state, version.object.uploaded),
+          ...dates,
+        };
+      }).sort((a, b) => b.createdAt.localeCompare(a.createdAt)), ...backups.map((backup) => ({
         id: backup.id,
         createdAt: backup.createdAt.toISOString(),
         fileCount: backup.fileCount,
@@ -520,8 +524,12 @@ async function selectedExport(c: AppContext): Promise<{ scope: NonNullable<Retur
     const snapshot = await loadCurrentExportSnapshot(c, scope, current.state);
     return snapshot ? { scope, state: snapshot.state, createdAt: snapshot.createdAt } : null;
   }
-  const version = (await listVisibleSnapshots(c, scope)).find((item) => item.id === versionId);
-  return version ? { scope, state: version.snapshot.state, createdAt: version.snapshot.createdAt } : null;
+  const version = await findVisibleSnapshot(c, scope, versionId);
+  return version ? {
+    scope,
+    state: version.snapshot.state,
+    createdAt: visibleSnapshotDates(version.snapshot, version.object.uploaded).createdAt,
+  } : null;
 }
 
 export async function getCloudExport(c: AppContext): Promise<Response> {
@@ -542,10 +550,9 @@ export async function getCloudExportFile(c: AppContext): Promise<Response> {
   if (!name || name.length > 2048 || !Object.prototype.hasOwnProperty.call(selected.state.files, name)) {
     return c.json({ success: false, code: "export_file_not_found" }, 404);
   }
-  const source = await getExportSource(c, selected.scope, selected.state, name);
-  if (!source) return c.json({ success: false, code: "recovery_incomplete" }, 409);
-  const file = await c.env.MERLIN_FILES.get(source);
+  const file = await getExportBlob(c, selected.scope, selected.state, name);
   if (!file || file.size !== selected.state.files![name]!.size) {
+    if (file) await file.body.cancel().catch(() => {});
     return c.json({ success: false, code: "recovery_incomplete" }, 409);
   }
   return new Response(file.body, { status: 200, headers: {
