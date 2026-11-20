@@ -8,7 +8,7 @@ const MAX_FILE = 30 * GiB;
 const MAX_FILES = 100_000;
 const MAX_ENTRIES = 300_000;
 const MAX_CENTRAL_BYTES = 64 * 1024 ** 2;
-const MAX_PLAN_BYTES = 16 * 1024 ** 2;
+const MAX_PLAN_BYTES = 128 * 1024 ** 2;
 const MAX_PATH_INDEX_BYTES = 32 * 1024 ** 2;
 const WINDOW_BYTES = 1024 ** 2;
 const encoder = new TextEncoder();
@@ -246,7 +246,7 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
       entry = { path: name, sizeBytes, compressedSize, method: method as 0 | 8 | 9, crc32: checksum,
         flags, localHeaderOffset: localOffset, dataBoundary: centralOffset, rawName: toBase64(rawName) };
       planBytes += encoder.encode(JSON.stringify(entry)).length + 1;
-      if (planBytes > MAX_PLAN_BYTES) invalid("O plano de indexação ZIP ultrapassa 16 MiB.");
+      if (planBytes > MAX_PLAN_BYTES) invalid("O plano de indexação ZIP ultrapassa o limite de 128 MiB.");
       files.push(entry);
     }
     localRecords.push({ offset: localOffset, minimumEnd: localOffset + 30 + nameLength + compressedSize, ...(entry ? { entry } : {}) });
