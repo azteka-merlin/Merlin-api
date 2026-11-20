@@ -9,7 +9,7 @@ const MAX_FILES = 100_000;
 const MAX_ENTRIES = 300_000;
 const MAX_CENTRAL_BYTES = 64 * 1024 ** 2;
 const MAX_PLAN_BYTES = 128 * 1024 ** 2;
-const MAX_PATH_INDEX_BYTES = 32 * 1024 ** 2;
+const MAX_PATH_INDEX_BYTES = 64 * 1024 ** 2;
 const WINDOW_BYTES = 1024 ** 2;
 const encoder = new TextEncoder();
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -221,9 +221,7 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
       const prior = paths.get(normalized);
       if (prior && prior.path !== prefix) invalid("O ZIP contém caminhos ambíguos por caixa ou Unicode.");
       if (!prior) {
-        // Deep, disjoint directory trees can otherwise consume much more RAM
-        // than the serialized plan. Bound their expanded path registry too.
-        pathIndexBytes += normalized.length * 2 + prefix.length * 2 + 192;
+        pathIndexBytes += normalized.length * 2 + prefix.length * 2 + 64;
         if (pathIndexBytes > MAX_PATH_INDEX_BYTES) invalid("O índice de caminhos ZIP ultrapassa o limite de memória.");
       }
       if (part < parts.length - 1 && prior?.kind === "file") invalid("O ZIP contém conflito entre arquivo e pasta.");
