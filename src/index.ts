@@ -14,7 +14,7 @@ import { FixesVoteRoute } from "./endpoints/fixes-vote";
 import { registerFixImportRoutes, processFixImportQueue } from './lib/fix-import';
 import { GamesSearchRoute } from "./endpoints/games-search";
 import { dispatchGameImageImport, getGameImageImportProgress } from "./lib/game-image-import";
-import { consumeGameImages, enqueueGameImage, isGameImageStorageThrottled, listGameImageDashboard, listGameImages, listProcessingGameImages, queueGameImageInBackground, serveGameImage, syncLegacyWaitingIndex, validImageAppId, type GameImageMessage } from "./lib/game-images";
+import { consumeGameImages, enqueueGameImage, isGameImageStorageThrottled, listGameImageDashboard, listGameImages, listProcessingGameImages, queueGameImageInBackground, refreshGameImageDashboardHistory, serveGameImage, syncLegacyWaitingIndex, validImageAppId, type GameImageMessage } from "./lib/game-images";
 import { PublicCatalogConsultRoute } from "./endpoints/public-catalog-consult";
 import { refreshConfirmedDenuvo, runCatalogEnrichment } from "./lib/catalog-enrichment";
 import { PublicCatalogCoverRoute, PublicCatalogRoute, runCatalogAvailabilitySync } from "./endpoints/public-catalog";
@@ -4727,6 +4727,7 @@ export default {
       .catch(() => console.error("[game-images] bulk-import-dispatch-failed"))
       .then(() => syncLegacyWaitingIndex(env))
       .catch(error => console.warn("[game-images] waiting-index-sync-failed", error)));
+    _ctx.waitUntil(refreshGameImageDashboardHistory(env));
     _ctx.waitUntil(runPremiumNotificationCron(env,scheduledAt).catch(()=>console.error('[PremiumNotifications] dispatch-failed')));
     _ctx.waitUntil(dispatchPendingIntegrityQueue(env).catch(() => {
       console.error("[CustomGamesIntegrity] queue-dispatch-failed");

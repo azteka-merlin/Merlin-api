@@ -20,6 +20,8 @@ const LEASE_SECONDS = 60;
 const QUEUED_LIFETIME_MS = 60 * 60 * 1000;
 const DASHBOARD_PAGE_SIZE = 20;
 const HISTORY_CACHE_MS = 60 * 1000;
+const HISTORY_REFRESH_MS = 10 * 60 * 1000;
+const HISTORY_LEASE_MS = 5 * 60 * 1000;
 const WAITING_CACHE_MS = 5 * 1000;
 const steamHosts = new Set([
   "shared.akamai.steamstatic.com", "shared.fastly.steamstatic.com",
@@ -489,15 +491,45 @@ function assetDashboardRow(env: AppBindings, object: R2Object): AssetRow {
   };
 }
 
-const historyCache = new Map<string, { until: number; rows: Array<string | JobRow> }>();
+type HistoryView = "completed" | "failed";
+type ImageHistory = { updatedAt: string; rows: Array<string | JobRow> };
+const historyCache = new Map<string, { until: number; data: ImageHistory }>();
 
-async function cachedImageHistory(env: AppBindings, view: "completed" | "failed") {
-  const key = env.ENVIRONMENT + "/" + view;
+function historyKey(env: AppBindings, view: HistoryView) {
+  return prefix(env) + "indexes/history-v1/" + view + ".json";
+}
+
+async function readImageHistory(env: AppBindings, view: HistoryView) {
+  const key = historyKey(env, view);
   const cached = historyCache.get(key);
-  if (cached && cached.until > Date.now()) return cached.rows;
+  if (cached && cached.until > Date.now()) return cached.data;
+  const object = await env.MERLIN_FILES.get(key);
+  if (!object) return null;
+  const data = await object.json<ImageHistory>();
+  historyCache.set(key, { until: Date.now() + HISTORY_CACHE_MS, data });
+  return data;
+}
+
+async function rebuildImageHistory(env: AppBindings, view: HistoryView) {
+  const bucket = env.MERLIN_FILES;
+  const key = historyKey(env, view);
+  const previous = await bucket.head(key);
+  const now = Date.now();
+  if (previous && now - previous.uploaded.getTime() < HISTORY_REFRESH_MS) return;
+
+  // Scheduled invocations can overlap. Keep the scan outside the HTTP request.
+  const lockKey = key + ".lease";
+  const lock = await bucket.head(lockKey);
+  if (lock && Number(lock.customMetadata?.until) > now) return;
+  const lease = await bucket.put(lockKey, crypto.randomUUID(), {
+    onlyIf: lock ? { etagMatches: lock.etag } : { etagDoesNotMatch: "*" },
+    customMetadata: { until: String(now + HISTORY_LEASE_MS) },
+  });
+  if (!lease) return;
   const rows: Array<string | JobRow> = [];
   if (view === "completed") {
-    for await (const object of listImageObjects(env, imageKey(env, ""))) rows.push(object.key);
+    const imagePrefix = imageKey(env, "");
+    for await (const object of listImageObjects(env, imagePrefix)) rows.push(object.key.slice(imagePrefix.length));
   } else {
     for await (const object of listImageObjects(env, prefix(env) + "jobs/", true)) {
       const job = readJob(object);
@@ -506,8 +538,22 @@ async function cachedImageHistory(env: AppBindings, view: "completed" | "failed"
       if (isTerminalFailure(row)) rows.push(row);
     }
   }
-  historyCache.set(key, { until: Date.now() + HISTORY_CACHE_MS, rows });
-  return rows;
+  const latestLease = await bucket.head(lockKey);
+  if (latestLease?.etag !== lease.etag) return;
+  const data: ImageHistory = { updatedAt: new Date().toISOString(), rows };
+  const published = await bucket.put(key, JSON.stringify(data), {
+    onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: "*" },
+    httpMetadata: { contentType: "application/json" },
+  });
+  if (published) historyCache.delete(key);
+}
+
+export async function refreshGameImageDashboardHistory(env: AppBindings) {
+  if (!env.GAME_IMAGE_QUEUE || !env.MERLIN_FILES) return;
+  const views: HistoryView[] = ["failed", "completed"];
+  await Promise.all(views.map(view => rebuildImageHistory(env, view).catch(error => {
+    console.warn("[game-images] history-index-refresh-failed", { view, message: error instanceof Error ? error.message : "unknown" });
+  })));
 }
 
 function dashboardSlice<T>(records: T[], requested: number) {
@@ -566,13 +612,15 @@ export async function listGameImageDashboard(c: AppContext, { view, page, appId 
     if (stale.length) c.executionCtx.waitUntil(env.MERLIN_FILES.delete(stale.slice(0, 1000)).catch(() => {}));
     return { ...selected, rows: rows.filter(row => row !== null) };
   }
-  const selected = dashboardSlice(await cachedImageHistory(env, view), page);
+  const history = await readImageHistory(env, view);
+  if (!history) return { ...dashboardSlice([], page), preparing: Boolean(env.GAME_IMAGE_QUEUE) };
+  const selected = dashboardSlice(history.rows, page);
   const rows = await Promise.all(selected.rows.map(async entry => {
     if (typeof entry !== "string") return entry;
-    const object = await env.MERLIN_FILES.head(entry);
+    const object = await env.MERLIN_FILES.head(imageKey(env, entry));
     return object ? assetDashboardRow(env, object) : null;
   }));
-  return { ...selected, rows: rows.filter(row => row !== null) };
+  return { ...selected, rows: rows.filter(row => row !== null), updatedAt: history.updatedAt };
 }
 
 export async function listGameImages(env: AppBindings, view: "queue" | "assets", cursor?: string, appId?: string) {

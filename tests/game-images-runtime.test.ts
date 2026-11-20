@@ -13,14 +13,17 @@ beforeAll(async () => {
   const bundle = await build({
     bundle: true, write: false, format: "esm", platform: "browser",
     stdin: { resolveDir: resolve("src/lib"), loader: "ts", contents: `
-      import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, serveGameImage, syncLegacyWaitingIndex } from "./game-images";
+      import { consumeGameImages, enqueueGameImage, listGameImageDashboard, listGameImages, listProcessingGameImages, refreshGameImageDashboardHistory, serveGameImage, syncLegacyWaitingIndex } from "./game-images";
       import { dispatchGameImageImport, getGameImageImportProgress } from "./game-image-import";
       function context(request, env, ctx, appId) {
         return { env, executionCtx: ctx, req: { url: request.url, param() { return appId; } } };
       }
       export default {
         async fetch(request, env, ctx) {
-          const [action, appId] = new URL(request.url).pathname.slice(1).split("/");
+          const url = new URL(request.url);
+          const [action, appId] = url.pathname.slice(1).split("/");
+          const params = url.searchParams;
+          if (params.has("scale")) env = { ...env, ENVIRONMENT: "history-scale-fixture" };
           if (action === "enqueue") return Response.json(await enqueueGameImage(env, appId, "launcher", await request.text()));
           if (action === "dispatch-import") {
             await dispatchGameImageImport(env);
@@ -30,19 +33,50 @@ beforeAll(async () => {
             await syncLegacyWaitingIndex(env);
             return Response.json({ success: true });
           }
+          if (action === "refresh-history") {
+            let lists = 0;
+            if (params.has("scale")) {
+              const bucket = env.MERLIN_FILES;
+              env = { ...env, MERLIN_FILES: {
+                head: key => bucket.head(key),
+                put: (key, body, options) => bucket.put(key, body, options),
+                list(options) {
+                  lists++;
+                  const start = Number(options.cursor || 0);
+                  const end = Math.min(start + options.limit, 64145);
+                  const objects = Array.from({ length: end - start }, (_, index) => {
+                    const appId = String(100000 + start + index);
+                    return { key: options.prefix + appId, customMetadata: {
+                      appId, trigger: "import", generation: "fixture", attempts: "1", updatedAt: new Date().toISOString(),
+                      status: (start + index) % 500 === 0 ? "missing" : "stored",
+                    } };
+                  });
+                  return { objects, truncated: end < 64145, cursor: String(end) };
+                },
+              } };
+            }
+            await refreshGameImageDashboardHistory(env);
+            return Response.json({ success: true, lists });
+          }
           if (action === "dashboard") {
-            const params = new URL(request.url).searchParams;
             let listAttempts = 0;
-            const viewEnv = params.has("throttle") ? { ...env, MERLIN_FILES: {
+            let reads = 0;
+            let heads = 0;
+            const viewEnv = { ...env, MERLIN_FILES: {
               list(options) {
+                listAttempts++;
                 if (!options.prefix.endsWith("/waiting/")) throw new Error("Unexpected reconstruction during dashboard request");
-                if (++listAttempts <= 2) throw new Error("list: Reduce your concurrent request rate for the same object. (10058)");
+                if (params.has("throttle") && listAttempts <= 2) throw new Error("list: Reduce your concurrent request rate for the same object. (10058)");
                 return env.MERLIN_FILES.list(options);
               },
-              head(key) { return env.MERLIN_FILES.head(key); },
-            } } : env;
+              get(key) { reads++; return env.MERLIN_FILES.get(key); },
+              head(key) { heads++; return env.MERLIN_FILES.head(key); },
+              delete(keys) { return env.MERLIN_FILES.delete(keys); },
+            } };
             const data = await listGameImageDashboard(context(request, viewEnv, ctx), { view: appId, page: Number(params.get("page") || 1), appId: params.get("appId") || undefined });
-            return Response.json(data, { headers: { "test-list-attempts": String(listAttempts) } });
+            return Response.json(data, { headers: {
+              "test-list-attempts": String(listAttempts), "test-history-reads": String(reads), "test-heads": String(heads),
+            } });
           }
           if (action === "processing") return Response.json(await listProcessingGameImages(context(request, env, ctx)));
           if (action === "list") return Response.json(await listGameImages(env, appId, undefined, new URL(request.url).searchParams.get("appId") || undefined));
@@ -131,6 +165,28 @@ test("a response declared as JPEG with invalid bytes is never stored and repeate
   expect(await (await send("/enqueue/20", { method: "POST" })).json()).toBe("cooldown");
 }, 12000);
 
+test("history queries stay bounded after indexing 64,145 synthetic AppIDs", async () => {
+  const bucket = await runtime.getR2Bucket("MERLIN_FILES");
+  const prefix = "game-images/v1/history-scale-fixture/";
+  await Promise.all(Array.from({ length: 5 }, (_, index) => bucket.put(prefix + "header/" + (164140 + index), jpeg)));
+
+  expect(await (await send("/refresh-history?scale=1")).json()).toMatchObject({ lists: 130 });
+  const assetHistory = await bucket.head(prefix + "indexes/history-v1/completed.json");
+  expect(assetHistory?.size).toBeLessThan(600_000);
+
+  const failures = await send("/dashboard/failed?scale=1&page=7");
+  expect(failures.headers.get("test-list-attempts")).toBe("0");
+  expect(failures.headers.get("test-history-reads")).toBe("1");
+  expect(failures.headers.get("test-heads")).toBe("0");
+  expect(await failures.json()).toMatchObject({ total: 129, page: 7, rows: Array(9).fill(expect.objectContaining({ status: "missing" })) });
+
+  const images = await send("/dashboard/completed?scale=1&page=3208");
+  expect(images.headers.get("test-list-attempts")).toBe("0");
+  expect(images.headers.get("test-history-reads")).toBe("1");
+  expect(images.headers.get("test-heads")).toBe("5");
+  expect(await images.json()).toMatchObject({ total: 64145, page: 3208, rows: Array(5).fill(expect.objectContaining({ status: "stored" })) });
+});
+
 test("the processing view shows a live download independently of history and clears completed tasks", async () => {
   expect(await (await send("/enqueue/30", { method: "POST" })).json()).toBe("queued");
   const deadline = Date.now() + 5000;
@@ -204,9 +260,30 @@ test("dashboard isolates queued, processing and completed records and jumps dire
   expect((await (await send("/dashboard/failed?appId=556")).json() as typeof first).rows[0]?.status).toBe("failed");
   expect((await (await send("/dashboard/failed?appId=557")).json() as typeof first).rows[0]?.status).toBe("failed");
 
-  const complete = await (await send("/dashboard/completed?page=5")).json() as typeof first;
+  expect(await (await send("/dashboard/failed")).json()).toMatchObject({ preparing: true });
+  expect(await (await send("/dashboard/completed")).json()).toMatchObject({ preparing: true });
+  await Promise.all([send("/refresh-history"), send("/refresh-history")]);
+  const failedResponse = await send("/dashboard/failed");
+  expect(failedResponse.headers.get("test-list-attempts")).toBe("0");
+  expect(failedResponse.headers.get("test-history-reads")).toBe("1");
+  expect(failedResponse.headers.get("test-heads")).toBe("0");
+  const failed = await failedResponse.json() as typeof first & { updatedAt: string };
+  expect(failed.updatedAt).toBeTruthy();
+  expect(failed.rows).toEqual(expect.arrayContaining([
+    expect.objectContaining({ appId: "556", status: "failed" }),
+    expect.objectContaining({ appId: "557", status: "failed", error: "job_expired" }),
+  ]));
+  const completeResponse = await send("/dashboard/completed?page=5");
+  expect(completeResponse.headers.get("test-list-attempts")).toBe("0");
+  expect(completeResponse.headers.get("test-history-reads")).toBe("1");
+  expect(completeResponse.headers.get("test-heads")).toBe("20");
+  const complete = await completeResponse.json() as typeof first;
   expect(complete.total).toBeGreaterThanOrEqual(135);
   expect(complete.page).toBe(5);
   expect(complete.rows).toHaveLength(20);
   expect(complete.rows.every(row => row.status === "stored")).toBe(true);
+  const historyKey = prefix + "indexes/history-v1/completed.json";
+  const snapshot = await bucket.head(historyKey);
+  await send("/refresh-history");
+  expect(await bucket.head(historyKey)).toMatchObject({ etag: snapshot?.etag, uploaded: snapshot?.uploaded });
 }, 12000);
