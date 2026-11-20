@@ -9,7 +9,7 @@ const MAX_FILES = 100_000;
 const MAX_ENTRIES = 300_000;
 const MAX_CENTRAL_BYTES = 64 * 1024 ** 2;
 const MAX_PLAN_BYTES = 16 * 1024 ** 2;
-const MAX_PATH_INDEX_BYTES = 16 * 1024 ** 2;
+const MAX_PATH_INDEX_BYTES = 32 * 1024 ** 2;
 const WINDOW_BYTES = 1024 ** 2;
 const encoder = new TextEncoder();
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -182,7 +182,7 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
   }
   const files: CloudflareZipEntry[] = [];
   const localRecords: { offset: number; minimumEnd: number; entry?: CloudflareZipEntry }[] = [];
-  const declared = new Set<string>(); const regular = new Set<string>(); const canonical = new Map<string, string>();
+  const paths = new Map<string, { path: string; kind: "implicit" | "directory" | "file" }>();
   let totalSizeBytes = 0; let planBytes = 64; let pathIndexBytes = 0; let offset = centralOffset;
   for (let index = 0; index < count; index++) {
     const header = await centralRead(offset, 46);
@@ -218,21 +218,26 @@ export async function planCloudflareZip(bucket: R2Bucket, key: string, etag: str
     for (let part = 0; part < parts.length; part++) {
       prefix += `${part ? "/" : ""}${parts[part]}`;
       const normalized = prefix.normalize("NFC").toLocaleLowerCase("en-US");
-      const prior = canonical.get(normalized);
-      if (prior && prior !== prefix) invalid("O ZIP contém caminhos ambíguos por caixa ou Unicode.");
+      const prior = paths.get(normalized);
+      if (prior && prior.path !== prefix) invalid("O ZIP contém caminhos ambíguos por caixa ou Unicode.");
       if (!prior) {
         // Deep, disjoint directory trees can otherwise consume much more RAM
         // than the serialized plan. Bound their expanded path registry too.
         pathIndexBytes += normalized.length * 2 + prefix.length * 2 + 192;
         if (pathIndexBytes > MAX_PATH_INDEX_BYTES) invalid("O índice de caminhos ZIP ultrapassa o limite de memória.");
       }
-      if (part < parts.length - 1 && regular.has(normalized)) invalid("O ZIP contém conflito entre arquivo e pasta.");
+      if (part < parts.length - 1 && prior?.kind === "file") invalid("O ZIP contém conflito entre arquivo e pasta.");
       if (part === parts.length - 1) {
-        if (declared.has(normalized)) invalid("O ZIP contém caminhos duplicados.");
-        if (!directory && canonical.has(normalized)) invalid("O ZIP contém conflito entre arquivo e pasta.");
-        declared.add(normalized); if (!directory) regular.add(normalized);
+        if (directory) {
+          if (prior?.kind === "directory" || prior?.kind === "file") invalid("O ZIP contém caminhos duplicados.");
+          paths.set(normalized, { path: prefix, kind: "directory" });
+        } else {
+          if (prior) invalid("O ZIP contém conflito entre arquivo e pasta.");
+          paths.set(normalized, { path: prefix, kind: "file" });
+        }
+      } else if (!prior) {
+        paths.set(normalized, { path: prefix, kind: "implicit" });
       }
-      if (!prior) canonical.set(normalized, prefix);
     }
     let entry: CloudflareZipEntry | undefined;
     if (!directory) {
