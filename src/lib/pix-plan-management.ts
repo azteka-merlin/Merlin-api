@@ -249,7 +249,10 @@ async function stripePost<T>(c: AppContext, path: string, params: URLSearchParam
   });
   const payload = await response.json().catch(() => null) as (T & { error?: { message?: string } }) | null;
   if (!response.ok || !payload) {
-    throw new HTTPException(502, { message: payload?.error?.message || "Nao foi possivel abrir o checkout na Stripe." });
+    throw new HTTPException(502, {
+      message: "Nao foi possivel abrir o checkout na Stripe.",
+      cause: payload?.error?.message ? new Error(payload.error.message) : undefined,
+    });
   }
   return payload;
 }

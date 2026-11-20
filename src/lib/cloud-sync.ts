@@ -74,7 +74,7 @@ function randomKeyId(): string {
 
 export async function issueCloudCredentials(c: AppContext): Promise<Response> {
   if (!storagePrefix(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
-  const license = await requireLauncherLicense(c);
+  const license = await requireLauncherLicense(c, { retryCloudLookup: true });
   const payload: { accessKeyId?: unknown } = await c.req.json<{ accessKeyId?: unknown }>().catch(() => ({}));
   const previousId = typeof payload.accessKeyId === "string" && /^MCL[a-f0-9]{40}$/.test(payload.accessKeyId)
     ? payload.accessKeyId : null;
@@ -114,7 +114,7 @@ export async function issueCloudCredentials(c: AppContext): Promise<Response> {
 
 export async function revokeCloudCredentials(c: AppContext): Promise<Response> {
   if (!storagePrefix(c)) return s3Error(404, "NotFound", "Cloud sync is not enabled here");
-  const license = await requireLauncherLicense(c);
+  const license = await requireLauncherLicense(c, { retryCloudLookup: true });
   const payload: { accessKeyId?: unknown } = await c.req.json<{ accessKeyId?: unknown }>().catch(() => ({}));
   if (typeof payload.accessKeyId !== "string" || !/^MCL[a-f0-9]{40}$/.test(payload.accessKeyId)) {
     return c.json({ success: false, error: "Invalid access key" }, 400);
@@ -416,7 +416,7 @@ function localSaveHints(state: CloudState): string[] {
 export async function listCloudGames(c: AppContext): Promise<Response> {
   const storage = storagePrefix(c);
   if (!storage) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
-  await requireLauncherLicense(c);
+  await requireLauncherLicense(c, { retryCloudLookup: true });
   const accountId = c.req.query("accountId") || "";
   if (!/^[1-9]\d{0,9}$/.test(accountId)) return c.json({ success: false, error: "Invalid Steam account" }, 400);
   const prefix = `${storage}steam/${accountId}/`;
@@ -470,7 +470,7 @@ export async function listCloudGames(c: AppContext): Promise<Response> {
 
 export async function getCloudGame(c: AppContext): Promise<Response> {
   if (!storagePrefix(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
-  await requireLauncherLicense(c);
+  await requireLauncherLicense(c, { retryCloudLookup: true });
   const accountId = c.req.query("accountId") || "";
   const appId = c.req.param("appId") || "";
   const scope = parseCloudScope(c, accountId, appId);
@@ -525,7 +525,7 @@ async function selectedExport(c: AppContext): Promise<{ scope: NonNullable<Retur
 }
 
 export async function getCloudExport(c: AppContext): Promise<Response> {
-  await requireLauncherLicense(c);
+  await requireLauncherLicense(c, { retryCloudLookup: true });
   const selected = await selectedExport(c);
   if (!selected) return c.json({ success: false, code: "export_not_found" }, 404);
   return c.json({ success: true, format: 2, appId: selected.scope.appId, createdAt: selected.createdAt,
@@ -535,7 +535,7 @@ export async function getCloudExport(c: AppContext): Promise<Response> {
 }
 
 export async function getCloudExportFile(c: AppContext): Promise<Response> {
-  await requireLauncherLicense(c);
+  await requireLauncherLicense(c, { retryCloudLookup: true });
   const selected = await selectedExport(c);
   if (!selected) return c.json({ success: false, code: "export_not_found" }, 404);
   const name = c.req.query("name") || "";
@@ -556,7 +556,7 @@ export async function getCloudExportFile(c: AppContext): Promise<Response> {
 
 export async function restoreCloudGame(c: AppContext): Promise<Response> {
   if (!storagePrefix(c)) return c.json({ success: false, error: "Cloud sync is not enabled here" }, 404);
-  await requireLauncherLicense(c);
+  await requireLauncherLicense(c, { retryCloudLookup: true });
   const body: { accountId?: unknown; appId?: unknown; recoveryId?: unknown } = await c.req.json().catch(() => ({}));
   const accountId = typeof body.accountId === "string" ? body.accountId : "";
   const appId = typeof body.appId === "string" ? body.appId : "";

@@ -83,7 +83,7 @@ async function stripePost<T>(c: AppContext, path: string, params: URLSearchParam
     if (lowerMessage.includes("portal") && lowerMessage.includes("configuration")) {
       throw new HTTPException(409, { message: "O portal da Stripe ainda nao esta configurado neste ambiente." });
     }
-    throw new HTTPException(502, { message });
+    throw new HTTPException(502, { message: "Nao foi possivel abrir o portal da Stripe.", cause: new Error(message) });
   }
   return payload;
 }
@@ -96,7 +96,8 @@ async function stripeGet<T>(c: AppContext, path: string) {
   });
   const payload = await response.json().catch(() => null) as T & { error?: { message?: string } } | null;
   if (!response.ok || !payload) {
-    throw new HTTPException(502, { message: stripeApiMessage(payload, "Nao foi possivel consultar o plano na Stripe.") });
+    const message = "Nao foi possivel consultar o plano na Stripe.";
+    throw new HTTPException(502, { message, cause: new Error(stripeApiMessage(payload, message)) });
   }
   return payload;
 }

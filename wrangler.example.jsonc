@@ -20,7 +20,8 @@
 	"migrations": [{ "tag": "merlin-status-v1", "new_sqlite_classes": ["MerlinStatus"] }],
 	"compatibility_date": "2026-06-20",
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"traces": { "enabled": true, "head_sampling_rate": 0.05 }
 	},
 	"limits": {
 		"subrequests": 25000,

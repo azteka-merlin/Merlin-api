@@ -4,6 +4,7 @@ import { fromHono } from "chanfana";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { adminIpGuard } from "./lib/admin-ip-guard";
+import { logApiError } from "./lib/api-error-log";
 import { getCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
@@ -872,7 +873,8 @@ async function callMerlinWorker(c: any, appId: string, steamAccountId: string) {
     });
   } catch (error) {
     throw new HTTPException(502, {
-      message: `Could not reach Merlin worker: ${error instanceof Error ? error.message : "Unknown error"}`,
+      message: "Could not reach Merlin worker",
+      cause: error,
     });
   }
 
@@ -929,7 +931,8 @@ async function callMerlinWorkerThirdPartyToken(c: any, tokenReq: string) {
     });
   } catch (error) {
     throw new HTTPException(502, {
-      message: `Could not reach Merlin worker: ${error instanceof Error ? error.message : "Unknown error"}`,
+      message: "Could not reach Merlin worker",
+      cause: error,
     });
   }
 
@@ -4659,17 +4662,19 @@ app.onError((error, c) => {
       ...(Number.isInteger(diagnosticError.licenseId) ? { licenseId: diagnosticError.licenseId } : {}),
     };
     if (errorStatus >= 500) {
-      console.error("[merlin-api:error]", logPayload, error);
+      logApiError(c, error, errorStatus);
     } else {
       console.warn("[merlin-api:client-error]", logPayload);
     }
     const codedError = error as unknown as { code?: unknown; minimumVersion?: unknown };
-    const code = typeof codedError.code === "string"
+    const code = typeof codedError.code === "string" && (errorStatus < 500 || error instanceof HTTPException)
       ? codedError.code
       : undefined;
     return c.json({
       success: false,
-      error: message,
+      error: errorStatus === 500 || (errorStatus >= 500 && !(error instanceof HTTPException))
+        ? "Internal Server Error"
+        : message,
       ...(code ? { code } : {}),
       ...(typeof codedError.minimumVersion === "string"
         ? { minimumVersion: codedError.minimumVersion }
@@ -4677,7 +4682,7 @@ app.onError((error, c) => {
     }, errorStatus as 400 | 401 | 403 | 404 | 409 | 426 | 429 | 500 | 502 | 503);
   }
 
-  console.error("[merlin-api:error]", error);
+  logApiError(c, error, 500);
   return c.json({ success: false, error: "Internal Server Error" }, 500);
 });
 
